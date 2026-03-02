@@ -1,8 +1,15 @@
 package com.callvpn.app
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.os.ParcelFileDescriptor
+import androidx.core.app.NotificationCompat
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import bind.Tunnel
 import bind.TunnelConfig
 import java.io.FileInputStream
@@ -15,6 +22,11 @@ class CallVpnService : VpnService() {
     @Volatile
     private var running = false
 
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> startVpn(intent)
@@ -23,10 +35,61 @@ class CallVpnService : VpnService() {
         return START_STICKY
     }
 
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "CallVPN",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "VPN connection status"
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val stopIntent = Intent(this, CallVpnService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPending = PendingIntent.getService(
+            this, 0, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        val openPending = PendingIntent.getActivity(
+            this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("CallVPN")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setContentIntent(openPending)
+            .addAction(android.R.drawable.ic_delete, "Отключить", stopPending)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun broadcastState(state: String) {
+        val intent = Intent(ACTION_STATE_CHANGED).apply {
+            putExtra(EXTRA_STATE, state)
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+    }
+
     private fun startVpn(intent: Intent) {
         val callLink = intent.getStringExtra(EXTRA_CALL_LINK) ?: return
         val serverAddr = intent.getStringExtra(EXTRA_SERVER_ADDR) ?: return
         val numConns = intent.getIntExtra(EXTRA_NUM_CONNS, 4)
+
+        startForeground(NOTIFICATION_ID, buildNotification("Подключение..."))
+        broadcastState("connecting")
 
         // Configure VPN interface
         val builder = Builder()
@@ -38,7 +101,12 @@ class CallVpnService : VpnService() {
             .setMtu(1280)
             .setBlocking(true)
 
-        vpnInterface = builder.establish() ?: return
+        vpnInterface = builder.establish()
+        if (vpnInterface == null) {
+            broadcastState("disconnected")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            return
+        }
 
         // Start Go tunnel
         val config = TunnelConfig().apply {
@@ -53,13 +121,19 @@ class CallVpnService : VpnService() {
                 t.start(config)
             } catch (e: Exception) {
                 vpnInterface?.close()
+                broadcastState("disconnected")
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 return
             }
         }
 
         running = true
+        broadcastState("connected")
 
-        // Read from TUN → write to tunnel
+        val mgr = getSystemService(NotificationManager::class.java)
+        mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
+
+        // Read from TUN -> write to tunnel
         Thread {
             val input = FileInputStream(vpnInterface!!.fileDescriptor)
             val buf = ByteArray(1500)
@@ -75,7 +149,7 @@ class CallVpnService : VpnService() {
             }
         }.start()
 
-        // Read from tunnel → write to TUN
+        // Read from tunnel -> write to TUN
         Thread {
             val output = FileOutputStream(vpnInterface!!.fileDescriptor)
             val buf = ByteArray(1500)
@@ -96,6 +170,8 @@ class CallVpnService : VpnService() {
         running = false
         tunnel?.stop()
         vpnInterface?.close()
+        broadcastState("disconnected")
+        stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
@@ -107,8 +183,12 @@ class CallVpnService : VpnService() {
     companion object {
         const val ACTION_START = "com.callvpn.START"
         const val ACTION_STOP = "com.callvpn.STOP"
+        const val ACTION_STATE_CHANGED = "com.callvpn.STATE_CHANGED"
         const val EXTRA_CALL_LINK = "call_link"
         const val EXTRA_SERVER_ADDR = "server_addr"
         const val EXTRA_NUM_CONNS = "num_conns"
+        const val EXTRA_STATE = "state"
+        const val CHANNEL_ID = "callvpn_channel"
+        const val NOTIFICATION_ID = 1
     }
 }
