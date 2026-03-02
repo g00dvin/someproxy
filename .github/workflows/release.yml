@@ -82,7 +82,7 @@ jobs:
       - name: Inject version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          VERSION_CODE=$(echo "$VERSION" | awk -F. '{printf "%d%03d%03d", $1, $2, $3}')
+          VERSION_CODE=$(echo "$VERSION" | awk -F. '{code = $1 * 1000000 + $2 * 1000 + $3; printf "%d", code}')
           # Ensure versionCode is at least 1
           if [ "$VERSION_CODE" -eq 0 ]; then VERSION_CODE=1; fi
           sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/" mobile/android/app/build.gradle.kts
