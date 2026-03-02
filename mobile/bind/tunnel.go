@@ -69,6 +69,14 @@ func (lb *LogBuffer) Clear() {
 	lb.lines = lb.lines[:0]
 }
 
+// tunnelState holds the result of a connection attempt.
+// Returned by connectDirect/connectRelay for applyState to install.
+type tunnelState struct {
+	mgr      *turn.Manager
+	m        *mux.Mux
+	cleanups []context.CancelFunc
+}
+
 // Tunnel is the main gomobile-exported type for mobile platforms.
 type Tunnel struct {
 	mu         sync.Mutex
@@ -76,10 +84,16 @@ type Tunnel struct {
 	m          *mux.Mux
 	logger     *slog.Logger
 	logBuf     *LogBuffer
-	cancel     context.CancelFunc
 	cleanups   []context.CancelFunc
 	nextStream atomic.Uint32
 	running    bool
+
+	// reconnect infrastructure
+	cfg        *TunnelConfig
+	rootCtx    context.Context
+	rootCancel context.CancelFunc
+	muxReady   chan struct{}        // closed when mux is available; recreated on teardown
+	muxCancel  context.CancelFunc  // cancels DispatchLoop/PingLoop for current mux
 }
 
 // TunnelConfig holds configuration for starting the tunnel.
@@ -112,60 +126,66 @@ func (t *Tunnel) ClearLogs() {
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
 // If ServerAddr is empty, uses relay-to-relay mode via VK signaling.
+// A background reconnect loop monitors connection health and re-establishes
+// the tunnel automatically when all DTLS connections die.
 func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if t.running {
+		t.mu.Unlock()
 		return fmt.Errorf("tunnel already running")
 	}
+	t.cfg = cfg
+	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
+	t.muxReady = make(chan struct{})
+	t.running = true
+	t.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.cancel = cancel
-
+	var state *tunnelState
 	var err error
 	if cfg.ServerAddr != "" {
-		err = t.startDirect(ctx, cfg)
+		state, err = t.connectDirect(t.rootCtx, cfg)
 	} else {
-		err = t.startRelay(ctx, cfg)
+		state, err = t.connectRelay(t.rootCtx, cfg)
 	}
-
 	if err != nil {
-		cancel()
+		t.rootCancel()
+		t.mu.Lock()
+		t.running = false
+		t.mu.Unlock()
 		return err
 	}
 
-	t.running = true
+	t.applyState(state)
+	go t.reconnectLoop()
 	return nil
 }
 
-// startDirect connects through TURN to a server listening on a direct address.
-func (t *Tunnel) startDirect(ctx context.Context, cfg *TunnelConfig) error {
+// connectDirect creates TURN allocations and DTLS connections to a server
+// listening on a direct UDP address. Returns a tunnelState without mutating t.
+func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
 	serverAddr, err := net.ResolveUDPAddr("udp", cfg.ServerAddr)
 	if err != nil {
-		return fmt.Errorf("resolve server: %w", err)
+		return nil, fmt.Errorf("resolve server: %w", err)
 	}
 
 	sessionID := uuid.New()
 
-	// 1. Create TURN allocations.
-	t.mgr = turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
-
-	allocs, err := t.mgr.Allocate(ctx, cfg.NumConns)
+	mgr := turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
+	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 	if err != nil {
-		t.mgr.CloseAll()
-		return fmt.Errorf("allocate TURN: %w", err)
+		mgr.CloseAll()
+		return nil, fmt.Errorf("allocate TURN: %w", err)
 	}
 
-	// 2. Establish DTLS-over-TURN connections.
 	var muxConns []io.ReadWriteCloser
+	var cleanups []context.CancelFunc
 	for i, alloc := range allocs {
 		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverAddr)
 		if err != nil {
 			t.logger.Warn("DTLS-over-TURN failed", "index", i, "err", err)
 			continue
 		}
-		t.cleanups = append(t.cleanups, cleanup)
+		cleanups = append(cleanups, cleanup)
 
 		if cfg.Token != "" {
 			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
@@ -187,50 +207,43 @@ func (t *Tunnel) startDirect(ctx context.Context, cfg *TunnelConfig) error {
 	}
 
 	if len(muxConns) == 0 {
-		t.mgr.CloseAll()
-		for _, c := range t.cleanups {
+		mgr.CloseAll()
+		for _, c := range cleanups {
 			c()
 		}
-		t.cleanups = nil
-		return fmt.Errorf("no DTLS connections established")
+		return nil, fmt.Errorf("no DTLS connections established")
 	}
 
-	// 3. Create multiplexer.
-	t.m = mux.New(t.logger, muxConns...)
-	go t.m.DispatchLoop(ctx)
-	go t.m.StartPingLoop(ctx, 30*time.Second)
-
-	t.logger.Info("tunnel started (direct)", "connections", len(muxConns), "session_id", sessionID.String())
-	return nil
+	m := mux.New(t.logger, muxConns...)
+	t.logger.Info("tunnel connected (direct)", "connections", len(muxConns), "session_id", sessionID.String())
+	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups}, nil
 }
 
-// startRelay connects through VK TURN relays to a server that also
-// joins the same VK call. Uses VK WebSocket signaling for address exchange.
-func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
-	// 1. Join VK conference.
+// connectRelay creates TURN allocations, exchanges relay addresses via VK
+// signaling, and establishes DTLS connections to the server's relay addresses.
+// Returns a tunnelState without mutating t.
+func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
 	jr, err := turn.FetchJoinResponse(ctx, cfg.CallLink)
 	if err != nil {
-		return fmt.Errorf("join VK conference: %w", err)
+		return nil, fmt.Errorf("join VK conference: %w", err)
 	}
 	t.logger.Info("joined VK conference", "conv_id", jr.ConvID)
 
-	// 2. Connect to VK signaling.
 	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, t.logger.With("component", "signaling"))
 	if err != nil {
-		return fmt.Errorf("signaling connect: %w", err)
+		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
 	if err := sigClient.SetKey(cfg.Token); err != nil {
 		sigClient.Close()
-		return fmt.Errorf("set signaling key: %w", err)
+		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
-	// 3. Create TURN allocations.
-	t.mgr = turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
-	allocs, err := t.mgr.Allocate(ctx, cfg.NumConns)
+	mgr := turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
+	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 	if err != nil {
 		sigClient.Close()
-		t.mgr.CloseAll()
-		return fmt.Errorf("allocate TURN: %w", err)
+		mgr.CloseAll()
+		return nil, fmt.Errorf("allocate TURN: %w", err)
 	}
 
 	ourAddrs := make([]string, len(allocs))
@@ -238,7 +251,6 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 		ourAddrs[i] = a.RelayAddr.String()
 	}
 
-	// 4. Exchange relay addresses with retry.
 	sendDone := make(chan struct{})
 	sendCtx, sendCancel := context.WithCancel(ctx)
 	go func() {
@@ -260,11 +272,10 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 		sendCancel()
 		<-sendDone
 		sigClient.Close()
-		t.mgr.CloseAll()
-		return fmt.Errorf("recv relay addrs: %w", err)
+		mgr.CloseAll()
+		return nil, fmt.Errorf("recv relay addrs: %w", err)
 	}
 
-	// Keep sending our addrs for a few more seconds so the peer receives them.
 	go func() {
 		time.Sleep(5 * time.Second)
 		sendCancel()
@@ -277,7 +288,6 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 		pairCount = len(serverAddrs)
 	}
 
-	// 6. Punch relay.
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
 		if err != nil {
@@ -289,8 +299,8 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 
 	sessionID := uuid.New()
 
-	// 7. DTLS-over-TURN to server relay addresses.
 	var muxConns []io.ReadWriteCloser
+	var cleanups []context.CancelFunc
 	for i := 0; i < pairCount; i++ {
 		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
 		if err != nil {
@@ -302,7 +312,7 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 			t.logger.Warn("relay DTLS failed", "index", i, "err", err)
 			continue
 		}
-		t.cleanups = append(t.cleanups, cleanup)
+		cleanups = append(cleanups, cleanup)
 
 		if cfg.Token != "" {
 			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
@@ -324,31 +334,160 @@ func (t *Tunnel) startRelay(ctx context.Context, cfg *TunnelConfig) error {
 	}
 
 	if len(muxConns) == 0 {
-		t.mgr.CloseAll()
-		for _, c := range t.cleanups {
+		mgr.CloseAll()
+		for _, c := range cleanups {
 			c()
 		}
-		t.cleanups = nil
-		return fmt.Errorf("no relay DTLS connections established")
+		return nil, fmt.Errorf("no relay DTLS connections established")
 	}
 
-	// 8. Create multiplexer.
-	t.m = mux.New(t.logger, muxConns...)
-	go t.m.DispatchLoop(ctx)
-	go t.m.StartPingLoop(ctx, 30*time.Second)
+	m := mux.New(t.logger, muxConns...)
+	t.logger.Info("tunnel connected (relay-to-relay)", "connections", len(muxConns), "session_id", sessionID.String())
+	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups}, nil
+}
 
-	t.logger.Info("tunnel started (relay-to-relay)", "connections", len(muxConns), "session_id", sessionID.String())
-	return nil
+// applyState installs a new tunnelState into the tunnel, starting
+// DispatchLoop and PingLoop, and signals muxReady.
+func (t *Tunnel) applyState(state *tunnelState) {
+	t.mu.Lock()
+	t.m = state.m
+	t.mgr = state.mgr
+	t.cleanups = state.cleanups
+	muxCtx, muxCancel := context.WithCancel(t.rootCtx)
+	t.muxCancel = muxCancel
+	ready := t.muxReady
+	t.mu.Unlock()
+
+	go state.m.DispatchLoop(muxCtx)
+	go state.m.StartPingLoop(muxCtx, 30*time.Second)
+
+	close(ready)
+}
+
+// teardownMux idempotently tears down the current mux, TURN manager, and
+// all DTLS cleanups. A new muxReady channel is created for the next connection.
+func (t *Tunnel) teardownMux() {
+	t.mu.Lock()
+	muxCancel := t.muxCancel
+	m := t.m
+	cleanups := t.cleanups
+	mgr := t.mgr
+
+	t.muxCancel = nil
+	t.m = nil
+	t.cleanups = nil
+	t.mgr = nil
+	t.muxReady = make(chan struct{})
+	t.mu.Unlock()
+
+	if muxCancel != nil {
+		muxCancel()
+	}
+	if m != nil {
+		m.Close()
+	}
+	for _, c := range cleanups {
+		c()
+	}
+	if mgr != nil {
+		mgr.CloseAll()
+	}
+}
+
+// reconnectLoop watches the current mux for death and re-establishes
+// the tunnel with exponential backoff (1s → 60s).
+func (t *Tunnel) reconnectLoop() {
+	const maxBackoff = 60 * time.Second
+	const attemptTimeout = 30 * time.Second
+	backoff := time.Second
+
+	for {
+		t.mu.Lock()
+		m := t.m
+		t.mu.Unlock()
+
+		if m == nil {
+			select {
+			case <-t.rootCtx.Done():
+				return
+			case <-time.After(backoff):
+				continue
+			}
+		}
+
+		select {
+		case <-m.Dead():
+			t.logger.Info("all connections dead, starting reconnect")
+		case <-t.rootCtx.Done():
+			return
+		}
+
+		t.teardownMux()
+
+		for {
+			select {
+			case <-t.rootCtx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			attemptCtx, attemptCancel := context.WithTimeout(t.rootCtx, attemptTimeout)
+			var state *tunnelState
+			var err error
+			if t.cfg.ServerAddr != "" {
+				state, err = t.connectDirect(attemptCtx, t.cfg)
+			} else {
+				state, err = t.connectRelay(attemptCtx, t.cfg)
+			}
+			attemptCancel()
+
+			if err != nil {
+				t.logger.Warn("reconnect attempt failed", "err", err, "backoff", backoff)
+				backoff = min(backoff*2, maxBackoff)
+				continue
+			}
+
+			t.applyState(state)
+			t.logger.Info("reconnected successfully")
+			backoff = time.Second
+			break
+		}
+	}
+}
+
+// getMux returns the current mux, blocking until one is available
+// if a reconnect is in progress.
+func (t *Tunnel) getMux() (*mux.Mux, error) {
+	t.mu.Lock()
+	m := t.m
+	ready := t.muxReady
+	t.mu.Unlock()
+
+	if m != nil {
+		return m, nil
+	}
+
+	select {
+	case <-ready:
+	case <-t.rootCtx.Done():
+		return nil, fmt.Errorf("tunnel stopped")
+	}
+
+	t.mu.Lock()
+	m = t.m
+	t.mu.Unlock()
+	if m == nil {
+		return nil, fmt.Errorf("tunnel not available")
+	}
+	return m, nil
 }
 
 // DialStream opens a new mux stream to the given target address (host:port).
+// Blocks during reconnect until the mux is available.
 func (t *Tunnel) DialStream(addr string) (io.ReadWriteCloser, error) {
-	t.mu.Lock()
-	m := t.m
-	t.mu.Unlock()
-
-	if m == nil {
-		return nil, fmt.Errorf("tunnel not running")
+	m, err := t.getMux()
+	if err != nil {
+		return nil, err
 	}
 
 	id := t.nextStream.Add(1)
@@ -364,13 +503,14 @@ func (t *Tunnel) DialStream(addr string) (io.ReadWriteCloser, error) {
 }
 
 // WritePacket sends a raw IP packet through the tunnel (for VpnService / NEPacketTunnelProvider).
+// Returns error immediately during reconnect (packets are dropped; native code retries).
 func (t *Tunnel) WritePacket(data []byte) error {
 	t.mu.Lock()
 	m := t.m
 	t.mu.Unlock()
 
 	if m == nil {
-		return fmt.Errorf("tunnel not running")
+		return fmt.Errorf("tunnel reconnecting")
 	}
 
 	return m.SendFrame(&mux.Frame{
@@ -383,46 +523,46 @@ func (t *Tunnel) WritePacket(data []byte) error {
 }
 
 // ReadPacket reads a raw IP packet from the tunnel.
+// Blocks during reconnect until the mux is re-established.
 func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
-	t.mu.Lock()
-	m := t.m
-	t.mu.Unlock()
+	for {
+		m, err := t.getMux()
+		if err != nil {
+			return 0, err
+		}
 
-	if m == nil {
-		return 0, fmt.Errorf("tunnel not running")
+		frame, ok := <-m.RecvFrames()
+		if !ok {
+			// Mux died (inFrames closed). Wait briefly for reconnect loop
+			// to call teardownMux (sets t.m=nil), then loop back —
+			// getMux will block on the new muxReady channel.
+			select {
+			case <-t.rootCtx.Done():
+				return 0, fmt.Errorf("tunnel stopped")
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+		n := copy(buf, frame.Payload)
+		return n, nil
 	}
-
-	frame, ok := <-m.RecvFrames()
-	if !ok {
-		return 0, fmt.Errorf("tunnel closed")
-	}
-	n := copy(buf, frame.Payload)
-	return n, nil
 }
 
-// Stop tears down all connections.
+// Stop tears down all connections and stops the reconnect loop.
 func (t *Tunnel) Stop() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	if !t.running {
+		t.mu.Unlock()
 		return
 	}
-
-	if t.cancel != nil {
-		t.cancel()
-	}
-	if t.m != nil {
-		t.m.Close()
-	}
-	for _, c := range t.cleanups {
-		c()
-	}
-	t.cleanups = nil
-	if t.mgr != nil {
-		t.mgr.CloseAll()
-	}
 	t.running = false
+	rootCancel := t.rootCancel
+	t.mu.Unlock()
+
+	if rootCancel != nil {
+		rootCancel()
+	}
+	t.teardownMux()
 	t.logger.Info("tunnel stopped")
 }
 

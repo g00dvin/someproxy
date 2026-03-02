@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// ErrMuxClosed is returned when the mux has been closed.
+var ErrMuxClosed = errors.New("mux closed")
+
 // StartPingLoop sends periodic ping frames through the mux to keep
 // TURN allocations alive. TURN allocations have a 5-minute TTL,
 // so we ping every 30 seconds by default. Call in a goroutine.
@@ -53,9 +56,10 @@ type Mux struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	activeReaders atomic.Int32
-	allDead       chan struct{}
-	allDeadOnce   sync.Once
-	idleTimeout   time.Duration // 0 = no idle timeout
+	allDead        chan struct{}
+	allDeadOnce    sync.Once
+	closeInFrames  sync.Once
+	idleTimeout    time.Duration // 0 = no idle timeout
 }
 
 type muxConn struct {
@@ -102,6 +106,7 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 	defer func() {
 		if m.activeReaders.Add(-1) == 0 {
 			m.allDeadOnce.Do(func() { close(m.allDead) })
+			m.closeInFrames.Do(func() { close(m.inFrames) })
 		}
 	}()
 	br := bufio.NewReaderSize(mc.conn, 16384)
@@ -244,6 +249,7 @@ func (m *Mux) Dead() <-chan struct{} {
 // Close shuts down the multiplexer and all underlying connections.
 func (m *Mux) Close() error {
 	m.cancel()
+	m.closeInFrames.Do(func() { close(m.inFrames) })
 	m.mu.Lock()
 	conns := m.conns
 	m.mu.Unlock()
@@ -286,7 +292,10 @@ func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 	for {
 		select {
-		case f := <-m.inFrames:
+		case f, ok := <-m.inFrames:
+			if !ok {
+				return nil, ErrMuxClosed
+			}
 			if f.Type == FrameOpen {
 				s := &Stream{
 					ID:   f.StreamID,
