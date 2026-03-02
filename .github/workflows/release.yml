@@ -109,7 +109,8 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleRelease
           echo "$KEYSTORE_FILE" | base64 -d > ../../keystore.jks
-          apksigner sign \
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)
+          "$APKSIGNER" sign \
             --ks ../../keystore.jks \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass "pass:$STORE_PASSWORD" \
