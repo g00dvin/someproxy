@@ -34,8 +34,13 @@ var (
 
 func main() {
 	listenAddr := flag.String("listen", "0.0.0.0:9000", "DTLS UDP listen address")
-	authToken := flag.String("token", "", "client auth token (empty = no auth)")
+	authToken := flag.String("token", "", "client auth token (env: VPN_TOKEN, empty = no auth)")
 	flag.Parse()
+
+	// Fall back to environment variable if flag not set.
+	if *authToken == "" {
+		*authToken = os.Getenv("VPN_TOKEN")
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	siren := monitoring.New(logger)
