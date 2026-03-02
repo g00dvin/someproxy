@@ -11,6 +11,86 @@ import (
 	"time"
 )
 
+// DatagramConn adapts a net.PacketConn + peer address into an io.ReadWriteCloser
+// with internal buffering so that stream-oriented ReadFrame (io.ReadFull) works
+// correctly over datagram transport.
+//
+// Each call to the underlying PacketConn.ReadFrom returns a complete datagram.
+// DatagramConn stores it in an internal buffer and serves successive Read calls
+// from that buffer until it's exhausted, then reads the next datagram.
+type DatagramConn struct {
+	relay    net.PacketConn
+	peerAddr net.Addr
+	buf      []byte // current datagram buffer
+	pos      int    // read position within buf
+}
+
+// NewDatagramConn creates a DatagramConn that reads datagrams from relay
+// and writes datagrams to peerAddr.
+func NewDatagramConn(relay net.PacketConn, peerAddr net.Addr) *DatagramConn {
+	return &DatagramConn{relay: relay, peerAddr: peerAddr}
+}
+
+func (d *DatagramConn) Read(b []byte) (int, error) {
+	for {
+		// Serve from internal buffer if available.
+		if d.pos < len(d.buf) {
+			n := copy(b, d.buf[d.pos:])
+			d.pos += n
+			return n, nil
+		}
+
+		// Read next datagram into fresh buffer.
+		tmp := make([]byte, 65535+headerSize)
+		n, _, err := d.relay.ReadFrom(tmp)
+		if err != nil {
+			return 0, err
+		}
+		// Skip permission probes (single 0x00 byte).
+		if n == 1 && tmp[0] == 0x00 {
+			continue
+		}
+		d.buf = tmp[:n]
+		d.pos = 0
+	}
+}
+
+func (d *DatagramConn) Write(b []byte) (int, error) {
+	return d.relay.WriteTo(b, d.peerAddr)
+}
+
+func (d *DatagramConn) Close() error {
+	return d.relay.Close()
+}
+
+// SendProbe sends a permission probe (single 0x00 byte) to the peer.
+// Both sides must send probes to establish TURN permissions before data exchange.
+func (d *DatagramConn) SendProbe() error {
+	_, err := d.relay.WriteTo([]byte{0x00}, d.peerAddr)
+	return err
+}
+
+// StartPingLoop sends periodic ping frames through the mux to keep
+// TURN permissions alive. TURN permissions have a 5-minute TTL,
+// so we ping every 30 seconds by default. Call in a goroutine.
+func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			_ = m.SendFrame(&Frame{
+				StreamID: 0,
+				Type:     FramePing,
+				Sequence: m.NextSeq(),
+			})
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Conn wraps a TURN relay connection (net.PacketConn) into a stream-oriented
 // connection suitable for mux framing. The peerAddr is the remote server
 // address that the TURN relay forwards packets to.

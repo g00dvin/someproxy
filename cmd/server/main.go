@@ -15,10 +15,18 @@ import (
 
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
+	sig "github.com/call-vpn/call-vpn/internal/signal"
 )
 
 func main() {
-	listenAddr := flag.String("listen", "0.0.0.0:9000", "Address to listen for mux client connections")
+	// Relay mode flags (default)
+	signalAddr := flag.String("signal", "0.0.0.0:9443", "Signal server listen address")
+	psk := flag.String("psk", "", "Pre-shared key for client authentication")
+
+	// Direct mode flags (legacy)
+	directMode := flag.Bool("direct", false, "Use direct TCP mode (legacy)")
+	listenAddr := flag.String("listen", "0.0.0.0:9000", "Direct mode: TCP listen address")
+
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -35,14 +43,60 @@ func main() {
 		cancel()
 	}()
 
-	ln, err := net.Listen("tcp", *listenAddr)
+	if *directMode {
+		runDirectMode(ctx, logger, siren, *listenAddr)
+	} else {
+		if *psk == "" {
+			fmt.Fprintln(os.Stderr, "Error: --psk is required in relay mode")
+			fmt.Fprintln(os.Stderr, "Usage: server --psk=<secret> [--signal=0.0.0.0:9443]")
+			fmt.Fprintln(os.Stderr, "       server --direct [--listen=0.0.0.0:9000]")
+			os.Exit(1)
+		}
+		runRelayMode(ctx, logger, siren, *signalAddr, *psk)
+	}
+}
+
+// runRelayMode starts the signaling server for TURN relay-based VPN sessions.
+func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, signalAddr, psk string) {
+	srv := &sig.Server{
+		Addr:   signalAddr,
+		PSK:    psk,
+		Logger: logger.With("component", "signal"),
+		OnSession: func(ctx context.Context, sessionID string, m *mux.Mux) {
+			sessionLogger := logger.With("session_id", sessionID)
+			sessionLogger.Info("relay session started")
+
+			for {
+				stream, err := m.AcceptStream(ctx)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					sessionLogger.Warn("accept stream error", "err", err)
+					siren.AlertDisconnect(ctx, fmt.Sprintf("session-%s", sessionID))
+					return
+				}
+				go handleStream(ctx, sessionLogger, stream)
+			}
+		},
+	}
+
+	if err := srv.ListenAndServe(ctx); err != nil {
+		logger.Error("signal server error", "err", err)
+		os.Exit(1)
+	}
+}
+
+// runDirectMode starts the legacy direct TCP server.
+func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, listenAddr string) {
+	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		logger.Error("failed to listen", "err", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
 
-	logger.Info("server listening", "addr", *listenAddr)
+	logger.Info("server listening (direct mode)", "addr", listenAddr)
 
 	go func() {
 		<-ctx.Done()
@@ -71,8 +125,6 @@ func handleClient(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 
 	clientLogger := logger.With("client_id", clientID)
 
-	// The client sends mux frames over a single TCP connection.
-	// Each mux stream maps to one outbound connection to the real internet.
 	m := mux.New(clientLogger, conn)
 	defer m.Close()
 
@@ -93,7 +145,6 @@ func handleClient(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) {
 	defer stream.Close()
 
-	// Read the first frame which contains the target address (host:port).
 	addrBuf := make([]byte, 512)
 	n, err := stream.Read(addrBuf)
 	if err != nil {
@@ -104,7 +155,6 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 
 	logger.Debug("connecting to target", "stream_id", stream.ID, "target", target)
 
-	// Dial the actual target on the internet.
 	dialer := net.Dialer{}
 	outConn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
@@ -113,7 +163,6 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 	}
 	defer outConn.Close()
 
-	// Bidirectional relay: stream <-> target.
 	var wg sync.WaitGroup
 	wg.Add(2)
 

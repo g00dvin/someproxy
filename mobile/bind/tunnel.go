@@ -12,28 +12,33 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/call-vpn/call-vpn/internal/mux"
+	sig "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 )
 
 // Tunnel is the main gomobile-exported type for mobile platforms.
 type Tunnel struct {
-	mu          sync.Mutex
-	mgr         *turn.Manager
-	m           *mux.Mux
-	logger      *slog.Logger
-	cancel      context.CancelFunc
-	nextStream  atomic.Uint32
-	running     bool
+	mu         sync.Mutex
+	mgr        *turn.Manager
+	m          *mux.Mux
+	logger     *slog.Logger
+	cancel     context.CancelFunc
+	nextStream atomic.Uint32
+	running    bool
 }
 
 // TunnelConfig holds configuration for starting the tunnel.
 type TunnelConfig struct {
-	CallLink   string
-	ServerAddr string
-	NumConns   int
-	UseTCP     bool
+	CallLink   string // VK call-link ID
+	ServerAddr string // legacy direct mode: host:port
+	SignalURL  string // relay mode: signaling server URL
+	PSK        string // relay mode: pre-shared key
+	NumConns   int    // parallel TURN connections
+	UseTCP     bool   // TCP vs UDP for TURN
+	DirectMode bool   // true = legacy direct TCP mode
 }
 
 // NewTunnel creates a new tunnel instance.
@@ -53,6 +58,79 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 		return fmt.Errorf("tunnel already running")
 	}
 
+	if cfg.DirectMode {
+		return t.startDirect(cfg)
+	}
+	return t.startRelay(cfg)
+}
+
+// startRelay establishes a relay-to-relay session via signaling.
+func (t *Tunnel) startRelay(cfg *TunnelConfig) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.cancel = cancel
+
+	t.mgr = turn.NewManager(cfg.CallLink, cfg.UseTCP, t.logger)
+
+	allocs, err := t.mgr.Allocate(ctx, cfg.NumConns)
+	if err != nil {
+		cancel()
+		return fmt.Errorf("allocate TURN: %w", err)
+	}
+
+	// Collect client relay addresses
+	clientRelayAddrs := make([]string, len(allocs))
+	for i, a := range allocs {
+		clientRelayAddrs[i] = a.RelayAddr.String()
+	}
+
+	// Signal server
+	resp, err := sig.Connect(ctx, cfg.SignalURL, sig.ConnectRequest{
+		CallLink:         cfg.CallLink,
+		ClientRelayAddrs: clientRelayAddrs,
+		PSK:              cfg.PSK,
+		UseTCP:           cfg.UseTCP,
+	})
+	if err != nil {
+		t.mgr.CloseAll()
+		cancel()
+		return fmt.Errorf("signal connect: %w", err)
+	}
+
+	// Build DatagramConn pairs
+	n := len(resp.ServerRelayAddrs)
+	if n > len(allocs) {
+		n = len(allocs)
+	}
+
+	conns := make([]io.ReadWriteCloser, n)
+	for i := 0; i < n; i++ {
+		serverRelayAddr, err := net.ResolveUDPAddr("udp", resp.ServerRelayAddrs[i])
+		if err != nil {
+			t.mgr.CloseAll()
+			cancel()
+			return fmt.Errorf("resolve server relay %d: %w", i, err)
+		}
+		dc := mux.NewDatagramConn(allocs[i].RelayConn, serverRelayAddr)
+		if err := dc.SendProbe(); err != nil {
+			t.logger.Warn("permission probe failed", "index", i, "err", err)
+		}
+		conns[i] = dc
+	}
+
+	// Brief wait for permission probes
+	time.Sleep(500 * time.Millisecond)
+
+	t.m = mux.New(t.logger, conns...)
+	go t.m.DispatchLoop(ctx)
+	go t.m.StartPingLoop(ctx, 30*time.Second)
+
+	t.running = true
+	t.logger.Info("tunnel started (relay mode)", "connections", n, "session_id", resp.SessionID)
+	return nil
+}
+
+// startDirect establishes a direct connection to the VPN server (legacy mode).
+func (t *Tunnel) startDirect(cfg *TunnelConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.cancel = cancel
 
@@ -80,7 +158,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	go t.m.DispatchLoop(ctx)
 
 	t.running = true
-	t.logger.Info("tunnel started", "connections", len(allocs))
+	t.logger.Info("tunnel started (direct mode)", "connections", len(allocs))
 	return nil
 }
 
