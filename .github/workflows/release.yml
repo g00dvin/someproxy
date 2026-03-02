@@ -90,7 +90,7 @@ jobs:
           echo "Set versionName=$VERSION versionCode=$VERSION_CODE"
 
       - name: Build Go AAR
-        run: gomobile bind -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
+        run: gomobile bind -ldflags="-checklinkname=0" -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
 
       - name: Build and sign APK
         env:
