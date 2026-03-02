@@ -100,33 +100,61 @@ func runDirectMode(ctx context.Context, logger *slog.Logger, siren *monitoring.S
 	}
 }
 
-// runRelayMode starts the server in relay-to-relay mode. Both peers
-// join a VK call, exchange relay addresses via WebSocket signaling,
-// and establish DTLS connections through TURN relays.
+// runRelayMode starts the server in relay-to-relay mode, looping to
+// accept successive client sessions. Each iteration creates a fresh
+// VK session with new signaling and TURN allocations.
 func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
 	callLink string, numConns int, useTCP bool, authToken string) {
 
 	logger.Info("starting relay-to-relay mode", "link", callLink, "conns", numConns)
 
-	// 1. Join VK conference to get TURN creds and WS endpoint.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		logger.Info("waiting for client session...")
+		err := runOneRelaySession(ctx, logger, siren, callLink, numConns, useTCP, authToken)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			logger.Warn("relay session failed", "err", err)
+		} else {
+			logger.Info("relay session ended")
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+// runOneRelaySession handles a single relay-to-relay client session.
+// It creates fresh VK credentials, signaling, TURN allocations, and
+// a local MUX. Returns when the session ends (all connections die)
+// or an error occurs.
+func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
+	callLink string, numConns int, useTCP bool, authToken string) error {
+
+	// 1. Join VK conference to get fresh TURN creds and WS endpoint.
 	jr, err := turn.FetchJoinResponse(ctx, callLink)
 	if err != nil {
-		logger.Error("failed to join VK conference", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("join VK conference: %w", err)
 	}
 	logger.Info("joined VK conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
 	// 2. Connect to VK WebSocket signaling.
 	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, logger.With("component", "signaling"))
 	if err != nil {
-		logger.Error("signaling connect failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("signaling connect: %w", err)
 	}
 	defer sigClient.Close()
 
 	if err := sigClient.SetKey(authToken); err != nil {
-		logger.Error("set signaling key failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("set signaling key: %w", err)
 	}
 
 	// 3. Create TURN allocations.
@@ -136,8 +164,7 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	allocs, err := mgr.Allocate(ctx, numConns)
 	if err != nil {
 		siren.AlertTURNAuthFailure(ctx, err)
-		logger.Error("failed to allocate TURN connections", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("allocate TURN connections: %w", err)
 	}
 	logger.Info("TURN allocations created", "count", len(allocs))
 
@@ -148,7 +175,6 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	}
 
 	// 4. Exchange relay addresses with retry.
-	// Send our addresses periodically until the peer receives them.
 	sendDone := make(chan struct{})
 	sendCtx, sendCancel := context.WithCancel(ctx)
 	go func() {
@@ -169,8 +195,7 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	if err != nil {
 		sendCancel()
 		<-sendDone
-		logger.Error("recv relay addrs failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("recv relay addrs: %w", err)
 	}
 
 	// Keep sending our addrs for a few more seconds so the peer receives them.
@@ -186,7 +211,7 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		pairCount = len(clientAddrs)
 	}
 
-	// 6. Punch relay for each pair.
+	// 5. Punch relay for each pair.
 	for i := 0; i < pairCount; i++ {
 		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
 		if err != nil {
@@ -201,7 +226,8 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 	// Short delay for permissions to propagate.
 	time.Sleep(500 * time.Millisecond)
 
-	// 7. Accept DTLS connections over TURN relays.
+	// 6. Accept DTLS connections over TURN relays.
+	var dtlsConns []net.Conn
 	var cleanups []context.CancelFunc
 	defer func() {
 		for _, c := range cleanups {
@@ -221,20 +247,72 @@ func runRelayMode(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 			continue
 		}
 		cleanups = append(cleanups, cleanup)
-
+		dtlsConns = append(dtlsConns, dtlsConn)
 		logger.Info("relay DTLS connection accepted", "index", i)
-		go handleConnection(ctx, logger, siren, dtlsConn, authToken)
 	}
 
-	if len(cleanups) == 0 {
-		logger.Error("no relay DTLS connections established")
-		os.Exit(1)
+	if len(dtlsConns) == 0 {
+		return fmt.Errorf("no relay DTLS connections established")
 	}
 
-	logger.Info("relay-to-relay mode active", "connections", len(cleanups))
+	logger.Info("relay-to-relay mode active", "connections", len(dtlsConns))
 
-	// Block until shutdown.
-	<-ctx.Done()
+	// 7. Process auth and session protocol on each connection,
+	// then create a local MUX for this relay session.
+	m := mux.New(logger)
+	defer m.Close()
+
+	added := 0
+	for i, conn := range dtlsConns {
+		if authToken != "" {
+			if err := mux.ValidateAuthToken(conn, authToken); err != nil {
+				logger.Warn("auth failed on relay conn", "index", i, "err", err)
+				conn.Close()
+				continue
+			}
+		}
+		sessionID, err := mux.ReadSessionID(conn)
+		if err != nil {
+			logger.Warn("read session id failed on relay conn", "index", i, "err", err)
+			conn.Close()
+			continue
+		}
+		logger.Info("connection received",
+			"index", i,
+			"session_id", fmt.Sprintf("%x", sessionID),
+		)
+		m.AddConn(conn)
+		added++
+	}
+
+	if added == 0 {
+		return fmt.Errorf("no connections passed auth/session handshake")
+	}
+
+	// 8. Serve streams until all connections die.
+	// Idle timeout detects client disconnect: if no frames arrive
+	// for 2 min (client pings every 30s), readLoop exits → Dead() fires.
+	m.SetIdleTimeout(2 * time.Minute)
+
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+
+	// Cancel session context when all MUX connections are dead.
+	go func() {
+		select {
+		case <-m.Dead():
+			sessCancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	for {
+		stream, err := m.AcceptStream(sessCtx)
+		if err != nil {
+			return nil // session over
+		}
+		go handleStream(sessCtx, logger, stream)
+	}
 }
 
 func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn, authToken string) {

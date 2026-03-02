@@ -374,6 +374,35 @@ func (c *Client) RecvRelayAddrs(ctx context.Context) (addrs []string, role strin
 	}
 }
 
+// Drain discards all buffered notifications from the incoming channel.
+func (c *Client) Drain() {
+	for {
+		select {
+		case <-c.incoming:
+		default:
+			return
+		}
+	}
+}
+
+// WaitForHungup blocks until a "hungup" notification is received,
+// the signaling connection closes, or ctx is cancelled. It drains
+// other notifications to prevent buffer overflow.
+func (c *Client) WaitForHungup(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case notif := <-c.incoming:
+			if notif.Name == "hungup" {
+				return
+			}
+		}
+	}
+}
+
 // PeerID returns our peer ID assigned by the signaling server.
 func (c *Client) PeerID() string {
 	return c.myPeerID

@@ -49,9 +49,13 @@ type Mux struct {
 	nextSeq atomic.Uint32
 	logger  *slog.Logger
 
-	inFrames chan *Frame
-	ctx      context.Context
-	cancel   context.CancelFunc
+	inFrames      chan *Frame
+	ctx           context.Context
+	cancel        context.CancelFunc
+	activeReaders atomic.Int32
+	allDead       chan struct{}
+	allDeadOnce   sync.Once
+	idleTimeout   time.Duration // 0 = no idle timeout
 }
 
 type muxConn struct {
@@ -69,6 +73,7 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 		inFrames: make(chan *Frame, 256),
 		ctx:      ctx,
 		cancel:   cancel,
+		allDead:  make(chan struct{}),
 	}
 	for _, c := range conns {
 		mc := &muxConn{conn: c}
@@ -77,17 +82,35 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 	}
 	// Start reader goroutines for each connection.
 	for i, mc := range m.conns {
+		m.activeReaders.Add(1)
 		go m.readLoop(i, mc)
 	}
 	return m
+}
+
+// SetIdleTimeout configures a read deadline on connections.
+// If no data arrives within the timeout, the readLoop closes.
+// The peer's ping loop (default 30s) prevents false triggers.
+func (m *Mux) SetIdleTimeout(d time.Duration) {
+	m.idleTimeout = d
 }
 
 // readLoop reads frames from a single underlying connection.
 // DTLS is message-oriented, so we wrap the connection in a bufio.Reader
 // to provide stream semantics for ReadFrame's io.ReadFull calls.
 func (m *Mux) readLoop(idx int, mc *muxConn) {
+	defer func() {
+		if m.activeReaders.Add(-1) == 0 {
+			m.allDeadOnce.Do(func() { close(m.allDead) })
+		}
+	}()
 	br := bufio.NewReaderSize(mc.conn, 16384)
 	for {
+		if m.idleTimeout > 0 {
+			if d, ok := mc.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+				d.SetReadDeadline(time.Now().Add(m.idleTimeout))
+			}
+		}
 		f, err := ReadFrame(br)
 		if err != nil {
 			if m.ctx.Err() != nil {
@@ -208,7 +231,14 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 	m.conns = append(m.conns, mc)
 	m.mu.Unlock()
 
+	m.activeReaders.Add(1)
 	go m.readLoop(idx, mc)
+}
+
+// Dead returns a channel that is closed when all readLoop goroutines
+// have exited (all underlying connections are dead).
+func (m *Mux) Dead() <-chan struct{} {
+	return m.allDead
 }
 
 // Close shuts down the multiplexer and all underlying connections.
