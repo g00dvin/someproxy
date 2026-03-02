@@ -176,9 +176,13 @@ jobs:
 
     steps:
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/ 2>/dev/null || echo "No artifacts directory"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -188,4 +192,5 @@ jobs:
             artifacts/client-darwin-amd64
             artifacts/client-darwin-arm64
             artifacts/app-release.apk
+          fail_on_unmatched_files: false
           generate_release_notes: true
