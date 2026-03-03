@@ -72,7 +72,7 @@ App → MUX → DTLS → TURN(client) ↔ TURN(server) → DTLS → MUX → Inte
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 VPN_TOKEN=your-secret-token
 ```
@@ -85,7 +85,7 @@ docker compose up -d
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 VK_CALL_LINK=AbCdEf123456
 VPN_TOKEN=your-secret-token
 TURN_CONNS=4

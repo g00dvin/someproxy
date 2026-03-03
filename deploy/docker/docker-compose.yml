@@ -1,6 +1,6 @@
 services:
   server:
-    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-main}
+    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-latest}
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:

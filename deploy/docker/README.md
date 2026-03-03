@@ -42,7 +42,7 @@ mkdir call-vpn && cd call-vpn
 ```yaml
 services:
   server:
-    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-main}
+    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-latest}
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
@@ -66,7 +66,7 @@ services:
 **3. Создайте `.env` и запустите**
 
 ```env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 VPN_TOKEN=
 SIREN_SLACK_WEBHOOK=
@@ -121,7 +121,7 @@ docker compose up -d
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 VPN_TOKEN=your-secret-token
 ```
@@ -138,7 +138,7 @@ VPN_TOKEN=your-secret-token
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 VK_CALL_LINK=AbCdEf123456
 VPN_TOKEN=your-secret-token
 TURN_CONNS=4
@@ -172,7 +172,7 @@ TURN_CONNS=4
 
 | Переменная | По умолчанию | Описание |
 |:-----------|:-------------|:---------|
-| `IMAGE_TAG` | `main` | Версия Docker-образа. `main` — последняя сборка, `1.0.0` — конкретная версия |
+| `IMAGE_TAG` | `latest` | Версия Docker-образа. `latest` — последняя сборка, `1.0.0` — конкретная версия |
 | `LISTEN_PORT` | `9000` | UDP-порт, открытый на хост-машине (только direct mode) |
 | `VPN_TOKEN` | *(пусто)* | Токен аутентификации клиентов (рекомендуется) |
 | `VK_CALL_LINK` | *(пусто)* | ID ссылки VK-звонка. Если задан — включается relay-to-relay mode |
@@ -184,14 +184,14 @@ TURN_CONNS=4
 ### Минимальный .env (direct mode)
 
 ```env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 ```
 
 ### Минимальный .env (relay-to-relay mode)
 
 ```env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 VK_CALL_LINK=AbCdEf123456
 VPN_TOKEN=your-secret-token
 ```
@@ -200,7 +200,7 @@ VPN_TOKEN=your-secret-token
 
 ```env
 # Версия образа
-IMAGE_TAG=main
+IMAGE_TAG=latest
 
 # Порт (UDP) — только для direct mode, должен быть открыт в firewall
 LISTEN_PORT=9000
@@ -233,7 +233,7 @@ CPU_LIMIT=2.0
 ```yaml
 services:
   server:
-    image: ghcr.io/fokir/vk-call-proxy:main
+    image: ghcr.io/fokir/vk-call-proxy:latest
     ports:
       - "9000:9000/udp"
     restart: unless-stopped
@@ -247,7 +247,7 @@ services:
 # docker-compose.yml
 services:
   server:
-    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-main}
+    image: ghcr.io/fokir/vk-call-proxy:${IMAGE_TAG:-latest}
     ports:
       - "${LISTEN_PORT:-9000}:9000/udp"
     environment:
@@ -270,7 +270,7 @@ services:
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 VPN_TOKEN=your-secret-token
 SIREN_SLACK_WEBHOOK=
@@ -284,7 +284,7 @@ CPU_LIMIT=1.0
 
 ```env
 # .env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 VK_CALL_LINK=AbCdEf123456
 VPN_TOKEN=your-secret-token
 TURN_CONNS=4
@@ -312,7 +312,7 @@ LISTEN_PORT=51820
 ### С мониторингом в Slack
 
 ```env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 SIREN_SLACK_WEBHOOK=<your-slack-webhook-url>
 ```
@@ -328,7 +328,7 @@ SIREN_SLACK_WEBHOOK=<your-slack-webhook-url>
 Для сервера с большим количеством клиентов:
 
 ```env
-IMAGE_TAG=main
+IMAGE_TAG=latest
 LISTEN_PORT=9000
 MEMORY_LIMIT=1G
 CPU_LIMIT=4.0
@@ -336,14 +336,14 @@ CPU_LIMIT=4.0
 
 ### Фиксированная версия (production)
 
-Для стабильности лучше зафиксировать версию вместо `main`:
+Для стабильности лучше зафиксировать версию вместо `latest`:
 
 ```env
 IMAGE_TAG=1.0.0
 ```
 
 Доступные теги:
-- `main` — последняя сборка из ветки main (может быть нестабильной)
+- `latest` — последняя сборка из ветки main (может быть нестабильной)
 - `1.0.0`, `1.0` — конкретная версия (рекомендуется для production)
 - `sha-abc1234` — привязка к конкретному коммиту
 
