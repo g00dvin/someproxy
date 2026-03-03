@@ -36,7 +36,10 @@ mobile/ios/*.xcarchive
 *.apk
 
 # References
-refs/calls-sdk/
+refs/
+
+# Crash dumps
+*.stackdump
 
 # Environment
 .env

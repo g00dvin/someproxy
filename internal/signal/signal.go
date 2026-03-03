@@ -408,6 +408,93 @@ func (c *Client) WaitForHungup(ctx context.Context) {
 	}
 }
 
+// SendPayload sends arbitrary data with a given tag via custom-data command.
+// Tag distinguishes payload types ("sdp-offer", "sdp-answer", "ice", "sync", etc.).
+func (c *Client) SendPayload(ctx context.Context, tag string, data []byte) error {
+	c.mu.Lock()
+	c.seq++
+	seq := c.seq
+	c.mu.Unlock()
+
+	inner := relayData{
+		Type:    tag,
+		Payload: base64.StdEncoding.EncodeToString(data),
+		Mode:    "",
+	}
+	innerJSON, err := json.Marshal(inner)
+	if err != nil {
+		return fmt.Errorf("marshal inner: %w", err)
+	}
+	blob := c.seal(innerJSON)
+
+	cmd := command{
+		Command:  "custom-data",
+		Sequence: seq,
+		Data:     blob,
+	}
+
+	msg, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal command: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		return fmt.Errorf("write command: %w", err)
+	}
+
+	c.logger.Debug("sent payload", "tag", tag, "size", len(data))
+	return nil
+}
+
+// RecvPayload waits for a custom-data notification with the given tag
+// and returns the decoded payload. Non-matching custom-data messages are skipped.
+func (c *Client) RecvPayload(ctx context.Context, tag string) ([]byte, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, fmt.Errorf("signaling connection closed")
+		case notif := <-c.incoming:
+			if notif.Name != "custom-data" {
+				continue
+			}
+			dataField := notif.Data
+			if len(dataField) == 0 || string(dataField) == "null" {
+				var raw struct {
+					Data json.RawMessage `json:"data"`
+				}
+				if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
+					dataField = raw.Data
+				}
+			}
+			var blob string
+			if err := json.Unmarshal(dataField, &blob); err != nil {
+				continue
+			}
+			innerJSON, err := c.open(blob)
+			if err != nil {
+				continue
+			}
+			var data relayData
+			if err := json.Unmarshal(innerJSON, &data); err != nil {
+				continue
+			}
+			if data.Type != tag {
+				continue
+			}
+			payload, err := base64.StdEncoding.DecodeString(data.Payload)
+			if err != nil {
+				c.logger.Warn("decode payload", "tag", tag, "err", err)
+				continue
+			}
+			return payload, nil
+		}
+	}
+}
+
 // PeerID returns our peer ID assigned by the signaling server.
 func (c *Client) PeerID() string {
 	return c.myPeerID
