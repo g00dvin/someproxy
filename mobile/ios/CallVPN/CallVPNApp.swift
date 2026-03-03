@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NetworkExtension
 
 @main
@@ -125,6 +126,11 @@ struct ContentView: View {
                 }
                 .disabled(vpnState == .connecting)
 
+                // App version
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+
                 Spacer().frame(height: 24)
 
                 // VK link input
@@ -204,6 +210,9 @@ struct ContentView: View {
                             .frame(height: 150)
                             .background(Color(.systemGray6))
                             .cornerRadius(8)
+                            .onTapGesture {
+                                UIPasteboard.general.string = logLines.joined(separator: "\n")
+                            }
                             .onChange(of: logLines.count) { _ in
                                 if let last = logLines.indices.last {
                                     proxy.scrollTo(last, anchor: .bottom)

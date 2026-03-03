@@ -13,6 +13,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -22,6 +23,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ClipboardManager
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -220,6 +224,9 @@ fun CallVpnScreen(
         logScrollState.animateScrollTo(logScrollState.maxValue)
     }
 
+    // Clipboard
+    val clipboardManager: ClipboardManager = LocalClipboardManager.current
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -305,6 +312,13 @@ fun CallVpnScreen(
             )
         }
 
+        // App version
+        Text(
+            text = "v${BuildConfig.VERSION_NAME}",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
         Spacer(modifier = Modifier.height(24.dp))
 
         // VK link input
@@ -364,7 +378,11 @@ fun CallVpnScreen(
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(150.dp),
+                    .height(150.dp)
+                    .clickable {
+                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
+                        Toast.makeText(context, "Логи скопированы", Toast.LENGTH_SHORT).show()
+                    },
                 color = MaterialTheme.colorScheme.surfaceVariant,
                 shape = MaterialTheme.shapes.small
             ) {
