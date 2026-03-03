@@ -98,11 +98,12 @@ type Tunnel struct {
 	running    bool
 
 	// reconnect infrastructure
-	cfg        *TunnelConfig
-	rootCtx    context.Context
-	rootCancel context.CancelFunc
-	muxReady   chan struct{}        // closed when mux is available; recreated on teardown
-	muxCancel  context.CancelFunc  // cancels DispatchLoop/PingLoop for current mux
+	cfg            *TunnelConfig
+	rootCtx        context.Context
+	rootCancel     context.CancelFunc
+	muxReady       chan struct{}       // closed when mux is available; recreated on teardown
+	muxCancel      context.CancelFunc // cancels DispatchLoop/PingLoop for current mux
+	forceReconnect chan struct{}       // buffered(1), signals network change
 }
 
 // TunnelConfig holds configuration for starting the tunnel.
@@ -150,6 +151,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	t.cfg = cfg
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
+	t.forceReconnect = make(chan struct{}, 1)
 	t.running = true
 	t.mu.Unlock()
 
@@ -393,9 +395,9 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	t.mu.Unlock()
 
 	state.m.EnableRawPackets(256)
-	state.m.SetIdleTimeout(90 * time.Second)
+	state.m.SetIdleTimeout(15 * time.Second)
 	go state.m.DispatchLoop(muxCtx)
-	go state.m.StartPingLoop(muxCtx, 30*time.Second)
+	go state.m.StartPingLoop(muxCtx, 5*time.Second)
 
 	close(ready)
 }
@@ -430,8 +432,9 @@ func (t *Tunnel) teardownMux() {
 	}
 }
 
-// reconnectLoop watches the current mux for death and re-establishes
-// the tunnel with exponential backoff (1s → 60s).
+// reconnectLoop watches the current mux for death (or a forced network change
+// signal) and re-establishes the tunnel with exponential backoff (1s → 60s).
+// On forceReconnect the first attempt is made immediately (no backoff delay).
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
 	const attemptTimeout = 30 * time.Second
@@ -446,26 +449,45 @@ func (t *Tunnel) reconnectLoop() {
 			select {
 			case <-t.rootCtx.Done():
 				return
+			case <-t.forceReconnect:
+				continue
 			case <-time.After(backoff):
 				continue
 			}
 		}
 
+		forced := false
 		select {
 		case <-m.Dead():
 			t.logger.Info("all connections dead, starting reconnect")
+		case <-t.forceReconnect:
+			t.logger.Info("network changed, forcing reconnect")
+			forced = true
 		case <-t.rootCtx.Done():
 			return
 		}
 
 		t.teardownMux()
 
+		// Drain any pending forceReconnect signal so it doesn't fire again
+		// immediately after we reconnect.
+		select {
+		case <-t.forceReconnect:
+		default:
+		}
+
 		for {
-			select {
-			case <-t.rootCtx.Done():
-				return
-			case <-time.After(backoff):
+			// On forced reconnect the first attempt is immediate (no delay).
+			if !forced {
+				select {
+				case <-t.rootCtx.Done():
+					return
+				case <-t.forceReconnect:
+					// Network changed again — skip remaining backoff.
+				case <-time.After(backoff):
+				}
 			}
+			forced = false
 
 			attemptCtx, attemptCancel := context.WithTimeout(t.rootCtx, attemptTimeout)
 			var state *tunnelState
@@ -630,7 +652,31 @@ func (t *Tunnel) Stop() {
 		rootCancel()
 	}
 	t.teardownMux()
+	// Drain pending forceReconnect signal for clean state.
+	select {
+	case <-t.forceReconnect:
+	default:
+	}
 	t.logger.Info("tunnel stopped")
+}
+
+// OnNetworkChanged should be called by the mobile platform when the network
+// connectivity changes (e.g. WiFi→cellular, 4G→H+). It triggers an immediate
+// reconnect attempt without waiting for the idle timeout to expire.
+// Safe to call from any goroutine; no-op if the tunnel is not running.
+func (t *Tunnel) OnNetworkChanged() {
+	t.mu.Lock()
+	running := t.running
+	t.mu.Unlock()
+	if !running {
+		return
+	}
+	select {
+	case t.forceReconnect <- struct{}{}:
+		t.logger.Info("network change signalled, will reconnect")
+	default:
+		// Already pending — no need to signal again.
+	}
 }
 
 // IsRunning returns whether the tunnel is active.

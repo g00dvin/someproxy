@@ -5,6 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -19,6 +23,7 @@ class CallVpnService : VpnService() {
 
     private var tunnel: Tunnel? = null
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile
     private var running = false
     @Volatile
@@ -151,6 +156,9 @@ class CallVpnService : VpnService() {
             running = true
             broadcastState("connected")
 
+            // Register network change callback for fast reconnect.
+            registerNetworkCallback()
+
             val mgr = getSystemService(NotificationManager::class.java)
             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
 
@@ -234,6 +242,7 @@ class CallVpnService : VpnService() {
 
     private fun stopVpn() {
         running = false
+        unregisterNetworkCallback()
         tunnel?.stop()
         vpnInterface?.close()
         broadcastState("disconnected")
@@ -244,6 +253,35 @@ class CallVpnService : VpnService() {
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
+    }
+
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                tunnel?.onNetworkChanged()
+            }
+            override fun onLost(network: Network) {
+                tunnel?.onNetworkChanged()
+            }
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                tunnel?.onNetworkChanged()
+            }
+        }
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        cm.registerNetworkCallback(request, cb)
+        networkCallback = cb
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            cm?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) { /* already unregistered */ }
     }
 
     companion object {

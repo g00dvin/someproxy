@@ -1,10 +1,12 @@
 import NetworkExtension
+import Network
 import Bind // gomobile generated framework
 
 class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private var tunnel: BindTunnel?
     private var logTimer: DispatchSourceTimer?
+    private var pathMonitor: NWPathMonitor?
     private let logDefaults = UserDefaults(suiteName: "group.com.callvpn.app")
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -59,6 +61,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             self?.tunnel = t
             self?.startLogForwarding()
             self?.startPacketForwarding()
+            self?.startPathMonitor()
             completionHandler(nil)
         }
     }
@@ -118,7 +121,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func startPathMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] _ in
+            self?.tunnel?.onNetworkChanged()
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
+        pathMonitor?.cancel()
+        pathMonitor = nil
         logTimer?.cancel()
         logTimer = nil
         logDefaults?.removeObject(forKey: "vpn_logs")
