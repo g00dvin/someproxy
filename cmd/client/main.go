@@ -355,12 +355,19 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		}
 	}()
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			logger.Error("proxy error", "err", err)
+	// Wait for both proxies or context cancellation.
+	// A single proxy bind failure should not kill the client.
+	remaining := 2
+	for remaining > 0 {
+		select {
+		case err := <-errCh:
+			remaining--
+			if err != nil {
+				logger.Warn("proxy error", "err", err)
+			}
+		case <-ctx.Done():
+			remaining = 0
 		}
-	case <-ctx.Done():
 	}
 
 	socks5Srv.Close()
