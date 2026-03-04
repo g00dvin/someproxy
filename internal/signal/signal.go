@@ -26,8 +26,22 @@ import (
 const (
 	// Wire-level identifiers intentionally neutral.
 	wireType       = "av-sync"
+	wireDisconnect = "av-reset" // explicit session teardown signal
 	wireRoleServer = "pub"
 	wireRoleClient = "sub"
+
+	// Reconnection signaling tags.
+	WireConnNew = "av-conn-new" // client → server: new relay addr for reconnect
+	WireConnOk  = "av-conn-ok"  // server → client: reply relay addr
+)
+
+// SessionEndReason indicates why WaitForSessionEnd returned.
+type SessionEndReason int
+
+const (
+	SessionEndHungup     SessionEndReason = iota // VK "hungup" notification
+	SessionEndDisconnect                         // peer sent explicit disconnect
+	SessionEndClosed                             // connection closed or context cancelled
 )
 
 // Client manages a VK signaling WebSocket connection.
@@ -41,6 +55,9 @@ type Client struct {
 	incoming   chan notification
 	done       chan struct{}
 	aead       cipher.AEAD // nil = no encryption (base64 only)
+
+	subsMu sync.Mutex
+	subs   map[string]chan []byte // tag -> subscriber channel
 }
 
 // SetKey derives an AES-256-GCM key from the shared token.
@@ -408,6 +425,70 @@ func (c *Client) WaitForHungup(ctx context.Context) {
 	}
 }
 
+// SendDisconnect sends an explicit disconnect signal to the remote peer
+// via VK signaling. The server uses this to tear down the old session
+// immediately instead of waiting for idle timeout.
+func (c *Client) SendDisconnect(ctx context.Context) error {
+	return c.SendPayload(ctx, wireDisconnect, nil)
+}
+
+// WaitForSessionEnd blocks until one of the following occurs:
+//   - "hungup" notification → SessionEndHungup
+//   - explicit disconnect signal (custom-data "av-reset") → SessionEndDisconnect
+//   - connection close or ctx cancellation → SessionEndClosed
+//
+// It drains other notifications to prevent buffer overflow.
+func (c *Client) WaitForSessionEnd(ctx context.Context) SessionEndReason {
+	for {
+		select {
+		case <-ctx.Done():
+			return SessionEndClosed
+		case <-c.done:
+			return SessionEndClosed
+		case notif := <-c.incoming:
+			if notif.Name == "hungup" {
+				return SessionEndHungup
+			}
+			if notif.Name == "custom-data" {
+				// Route to subscribers first (reconnect signals, etc.).
+				if c.routeToSubscriber(notif) {
+					continue
+				}
+				if c.isDisconnectSignal(notif) {
+					return SessionEndDisconnect
+				}
+			}
+		}
+	}
+}
+
+// isDisconnectSignal checks if a custom-data notification contains
+// an explicit disconnect signal ("av-reset").
+func (c *Client) isDisconnectSignal(notif notification) bool {
+	dataField := notif.Data
+	if len(dataField) == 0 || string(dataField) == "null" {
+		var raw struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
+			dataField = raw.Data
+		}
+	}
+	var blob string
+	if err := json.Unmarshal(dataField, &blob); err != nil {
+		return false
+	}
+	innerJSON, err := c.open(blob)
+	if err != nil {
+		return false
+	}
+	var data relayData
+	if err := json.Unmarshal(innerJSON, &data); err != nil {
+		return false
+	}
+	return data.Type == wireDisconnect
+}
+
 // SendPayload sends arbitrary data with a given tag via custom-data command.
 // Tag distinguishes payload types ("sdp-offer", "sdp-answer", "ice", "sync", etc.).
 func (c *Client) SendPayload(ctx context.Context, tag string, data []byte) error {
@@ -493,6 +574,77 @@ func (c *Client) RecvPayload(ctx context.Context, tag string) ([]byte, error) {
 			return payload, nil
 		}
 	}
+}
+
+// Subscribe registers a subscriber for custom-data messages with the
+// given tag. Returns a receive-only channel and an unsubscribe function.
+// Only one subscriber per tag is supported; duplicate tags overwrite.
+func (c *Client) Subscribe(tag string, bufSize int) (<-chan []byte, func()) {
+	ch := make(chan []byte, bufSize)
+	c.subsMu.Lock()
+	if c.subs == nil {
+		c.subs = make(map[string]chan []byte)
+	}
+	c.subs[tag] = ch
+	c.subsMu.Unlock()
+	return ch, func() {
+		c.subsMu.Lock()
+		if c.subs[tag] == ch {
+			delete(c.subs, tag)
+		}
+		c.subsMu.Unlock()
+	}
+}
+
+// extractTag decodes a custom-data notification and returns its relayData.Type.
+func (c *Client) extractTag(notif notification) (string, []byte, bool) {
+	dataField := notif.Data
+	if len(dataField) == 0 || string(dataField) == "null" {
+		var raw struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
+			dataField = raw.Data
+		}
+	}
+	var blob string
+	if err := json.Unmarshal(dataField, &blob); err != nil {
+		return "", nil, false
+	}
+	innerJSON, err := c.open(blob)
+	if err != nil {
+		return "", nil, false
+	}
+	var data relayData
+	if err := json.Unmarshal(innerJSON, &data); err != nil {
+		return "", nil, false
+	}
+	payload, err := base64.StdEncoding.DecodeString(data.Payload)
+	if err != nil {
+		return data.Type, nil, true
+	}
+	return data.Type, payload, true
+}
+
+// routeToSubscriber checks if a custom-data notification matches any
+// subscriber. If so, it sends the payload and returns true.
+func (c *Client) routeToSubscriber(notif notification) bool {
+	tag, payload, ok := c.extractTag(notif)
+	if !ok {
+		return false
+	}
+	c.subsMu.Lock()
+	ch, exists := c.subs[tag]
+	c.subsMu.Unlock()
+	if !exists {
+		return false
+	}
+	select {
+	case ch <- payload:
+	default:
+		c.logger.Warn("subscriber buffer full", "tag", tag)
+	}
+	return true
 }
 
 // Done returns a channel that is closed when the signaling WebSocket

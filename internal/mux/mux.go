@@ -36,6 +36,9 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 			m.mu.Unlock()
 
 			for _, mc := range conns {
+				if mc == nil {
+					continue
+				}
 				mc.mu.Lock()
 				mc.conn.Write(data)
 				mc.mu.Unlock()
@@ -77,6 +80,9 @@ type Mux struct {
 
 	acceptedStreams   chan *Stream // DispatchLoop pushes FrameOpen streams here
 	closeAcceptOnce  sync.Once
+
+	connDied     chan int        // index of dead connection, buffered
+	reconnecting atomic.Int32   // active reconnect count; prevents premature allDead close
 }
 
 type muxConn struct {
@@ -95,6 +101,7 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 		ctx:      ctx,
 		cancel:   cancel,
 		allDead:  make(chan struct{}),
+		connDied: make(chan int, 32),
 	}
 	for _, c := range conns {
 		mc := &muxConn{conn: c}
@@ -122,7 +129,14 @@ func (m *Mux) SetIdleTimeout(d time.Duration) {
 func (m *Mux) readLoop(idx int, mc *muxConn) {
 	defer func() {
 		mc.conn.Close() // close DTLS connection immediately to free resources
-		if m.activeReaders.Add(-1) == 0 {
+
+		// Notify about dead connection (non-blocking).
+		select {
+		case m.connDied <- idx:
+		default:
+		}
+
+		if m.activeReaders.Add(-1) == 0 && m.reconnecting.Load() == 0 {
 			m.allDeadOnce.Do(func() { close(m.allDead) })
 			m.closeInFrames.Do(func() { close(m.inFrames) })
 		}
@@ -163,14 +177,14 @@ func (m *Mux) selectConn() *muxConn {
 	if len(conns) == 0 {
 		return nil
 	}
-	if len(conns) == 1 {
-		return conns[0]
-	}
 
 	var best *muxConn
 	bestScore := int64(-1)
 
 	for _, mc := range conns {
+		if mc == nil {
+			continue
+		}
 		lat := mc.stats.latency.Load()
 		if lat == 0 {
 			lat = 1_000_000 // 1ms default
@@ -258,6 +272,9 @@ func (m *Mux) UpdateLatency(idx int, rtt time.Duration) {
 	}
 	mc := m.conns[idx]
 	m.mu.Unlock()
+	if mc == nil {
+		return
+	}
 	old := mc.stats.latency.Load()
 	if old == 0 {
 		mc.stats.latency.Store(rtt.Nanoseconds())
@@ -291,6 +308,38 @@ func (m *Mux) Dead() <-chan struct{} {
 	return m.allDead
 }
 
+// ConnDied returns a channel that receives the index of each connection
+// whose readLoop has exited. Use this to trigger per-connection reconnects.
+func (m *Mux) ConnDied() <-chan int {
+	return m.connDied
+}
+
+// RemoveConn sets the connection at the given index to nil.
+// The slot can later be filled by AddConn (which appends, so the old
+// index stays nil — this prevents index shift).
+func (m *Mux) RemoveConn(idx int) {
+	m.mu.Lock()
+	if idx >= 0 && idx < len(m.conns) {
+		m.conns[idx] = nil
+	}
+	m.mu.Unlock()
+}
+
+// BeginReconnect increments the reconnecting counter, preventing
+// the mux from closing allDead while reconnection is in progress.
+func (m *Mux) BeginReconnect() {
+	m.reconnecting.Add(1)
+}
+
+// EndReconnect decrements the reconnecting counter. If no active
+// readers remain and no reconnects are pending, allDead is closed.
+func (m *Mux) EndReconnect() {
+	if m.reconnecting.Add(-1) <= 0 && m.activeReaders.Load() == 0 {
+		m.allDeadOnce.Do(func() { close(m.allDead) })
+		m.closeInFrames.Do(func() { close(m.inFrames) })
+	}
+}
+
 // Close shuts down the multiplexer and all underlying connections.
 func (m *Mux) Close() error {
 	m.cancel()
@@ -305,7 +354,9 @@ func (m *Mux) Close() error {
 	conns := m.conns
 	m.mu.Unlock()
 	for _, mc := range conns {
-		mc.conn.Close()
+		if mc != nil {
+			mc.conn.Close()
+		}
 	}
 	return nil
 }

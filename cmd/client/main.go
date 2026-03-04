@@ -172,6 +172,9 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		os.Exit(1)
 	}
 
+	// Tell server to kill any existing session so it's ready for us.
+	_ = sigClient.SendDisconnect(ctx)
+
 	// 3. Create TURN allocations.
 	mgr := turn.NewManager(callLink, useTCP, logger)
 	defer mgr.CloseAll()
@@ -222,9 +225,6 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 		sendCancel()
 		<-sendDone
 	}()
-
-	// Drain signaling notifications to prevent incoming buffer overflow.
-	go sigClient.WaitForHungup(ctx)
 
 	// Match allocations to server addresses.
 	pairCount := len(allocs)
@@ -315,8 +315,147 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 	go m.DispatchLoop(ctx)
 	go m.StartPingLoop(ctx, 30*time.Second)
 
-	// 9. Start proxies.
+	// 9. Start per-connection reconnect goroutine.
+	go reconnectConns(ctx, sigClient, mgr, m, sessionID, authToken, logger)
+
+	// 10. Monitor signaling for session end.
+	go func() {
+		reason := sigClient.WaitForSessionEnd(ctx)
+		if reason == internalsignal.SessionEndHungup {
+			logger.Info("signaling hungup (server left call)")
+		}
+	}()
+
+	// Reconnect initially failed connections.
+	if missing := numConns - len(muxConns); missing > 0 {
+		logger.Info("attempting to reconnect initially failed connections", "missing", missing)
+		go func() {
+			ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
+			defer unsub()
+			for i := 0; i < missing; i++ {
+				m.BeginReconnect()
+				if err := reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger); err != nil {
+					logger.Warn("initial reconnect failed", "err", err)
+				}
+				m.EndReconnect()
+			}
+		}()
+	}
+
+	// 11. Start proxies.
 	startProxies(ctx, logger, siren, m, len(muxConns), numConns, socks5Port, httpPort, bindAddr)
+}
+
+// reconnectConns monitors ConnDied and reconnects individual dead connections
+// via VK signaling. Each dead connection triggers up to 3 reconnect attempts.
+func reconnectConns(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, sessionID uuid.UUID, authToken string, logger *slog.Logger) {
+
+	ackCh, unsub := sigClient.Subscribe(internalsignal.WireConnOk, 8)
+	defer unsub()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case idx, ok := <-m.ConnDied():
+			if !ok {
+				return
+			}
+			logger.Info("connection died, starting reconnect", "index", idx)
+			m.RemoveConn(idx)
+			m.BeginReconnect()
+
+			go func(deadIdx int) {
+				defer m.EndReconnect()
+				var err error
+				for attempt := 1; attempt <= 3; attempt++ {
+					err = reconnectOne(ctx, sigClient, mgr, m, ackCh, sessionID, authToken, logger)
+					if err == nil {
+						logger.Info("reconnected connection successfully", "dead_index", deadIdx, "attempt", attempt)
+						return
+					}
+					logger.Warn("reconnect attempt failed", "dead_index", deadIdx, "attempt", attempt, "err", err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Duration(attempt*2) * time.Second):
+					}
+				}
+				logger.Error("failed to reconnect after 3 attempts", "dead_index", deadIdx)
+			}(idx)
+		}
+	}
+}
+
+// reconnectOne allocates a new TURN relay, sends its address to the server
+// via signaling, waits for the server's relay address, then establishes
+// a new DTLS connection and adds it to the MUX.
+func reconnectOne(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, ackCh <-chan []byte,
+	sessionID uuid.UUID, authToken string, logger *slog.Logger) error {
+
+	allocs, err := mgr.Allocate(ctx, 1)
+	if err != nil {
+		return fmt.Errorf("allocate TURN: %w", err)
+	}
+	alloc := allocs[0]
+	myAddr := alloc.RelayAddr.String()
+
+	// Send our new relay address to server.
+	if err := sigClient.SendPayload(ctx, internalsignal.WireConnNew, []byte(myAddr)); err != nil {
+		return fmt.Errorf("send conn-new: %w", err)
+	}
+
+	// Wait for server's relay address (timeout 15s).
+	var serverAddr string
+	select {
+	case payload, ok := <-ackCh:
+		if !ok {
+			return fmt.Errorf("ack channel closed")
+		}
+		serverAddr = string(payload)
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("timeout waiting for server relay addr")
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	serverUDP, err := net.ResolveUDPAddr("udp", serverAddr)
+	if err != nil {
+		return fmt.Errorf("resolve server addr: %w", err)
+	}
+
+	// Punch and DTLS dial.
+	punchCtx, punchCancel := context.WithCancel(ctx)
+	defer punchCancel()
+	internaldtls.PunchRelay(alloc.RelayConn, serverUDP)
+	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, serverUDP)
+	time.Sleep(500 * time.Millisecond)
+
+	dtlsConn, _, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverUDP)
+	if err != nil {
+		return fmt.Errorf("DialOverTURN: %w", err)
+	}
+	punchCancel()
+
+	// Auth + session ID.
+	if authToken != "" {
+		if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
+			dtlsConn.Close()
+			return fmt.Errorf("write auth token: %w", err)
+		}
+	}
+	var sid [16]byte
+	copy(sid[:], sessionID[:])
+	if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+		dtlsConn.Close()
+		return fmt.Errorf("write session id: %w", err)
+	}
+
+	m.AddConn(dtlsConn)
+	logger.Info("reconnect: new connection added to MUX")
+	return nil
 }
 
 // startProxies starts SOCKS5 and HTTP proxies over the given Mux.

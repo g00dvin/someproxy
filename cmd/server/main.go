@@ -285,8 +285,11 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
+	pingCtx, pingCancel := context.WithCancel(sessCtx)
+	defer pingCancel()
+
 	go m.DispatchLoop(sessCtx)
-	go m.StartPingLoop(sessCtx, 30*time.Second)
+	go m.StartPingLoop(pingCtx, 30*time.Second)
 
 	// Start netstack for raw IP packets (mobile clients).
 	ns := netstack.New(logger, m)
@@ -331,15 +334,26 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 		return fmt.Errorf("no connections passed auth/session handshake")
 	}
 
-	// Drain signaling notifications. On hungup or WS close, reduce idle
-	// timeout so connections die quickly if the client is truly gone.
-	// We do NOT cancel immediately because VK sends "hungup" for old
-	// participants during client reconnection — cancelling would kill
-	// active connections prematurely.
+	// Start per-connection reconnection handler.
+	go handleReconnections(sessCtx, sigClient, mgr, m, authToken, logger)
+
+	// Listen for session end signals. Two cases:
+	// 1. Explicit disconnect ("av-reset") from client → cancel immediately.
+	// 2. VK "hungup" notification → stop pings + reduce idle timeout to 15s.
+	//    We don't cancel immediately on hungup because VK sends it for old
+	//    participants during client reconnection — cancelling would kill
+	//    active connections prematurely.
 	go func() {
-		sigClient.WaitForHungup(sessCtx)
-		logger.Info("signaling hungup/closed, reducing idle timeout")
-		m.SetIdleTimeout(15 * time.Second)
+		reason := sigClient.WaitForSessionEnd(sessCtx)
+		switch reason {
+		case internalsignal.SessionEndDisconnect:
+			logger.Info("client sent disconnect signal, cancelling session")
+			sessCancel()
+		case internalsignal.SessionEndHungup:
+			logger.Info("signaling hungup, stopping pings and reducing idle timeout")
+			pingCancel()
+			m.SetIdleTimeout(15 * time.Second)
+		}
 	}()
 
 	// Cancel session context when all MUX connections are dead.
@@ -365,6 +379,85 @@ func runOneRelaySession(ctx context.Context, logger *slog.Logger, siren *monitor
 			return nil
 		}
 	}
+}
+
+// handleReconnections subscribes to "av-conn-new" reconnect requests from
+// the client. For each request it allocates a new TURN relay, sends back
+// its address via "av-conn-ok", and accepts a DTLS connection into the MUX.
+func handleReconnections(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, authToken string, logger *slog.Logger) {
+
+	ch, unsub := sigClient.Subscribe(internalsignal.WireConnNew, 8)
+	defer unsub()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
+			// payload = client's new relay address
+			clientAddr := string(payload)
+			go func() {
+				if err := handleOneReconnect(ctx, sigClient, mgr, m, authToken, clientAddr, logger); err != nil {
+					logger.Warn("reconnect handler failed", "client_addr", clientAddr, "err", err)
+				}
+			}()
+		}
+	}
+}
+
+func handleOneReconnect(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, authToken, clientAddr string, logger *slog.Logger) error {
+
+	clientUDP, err := net.ResolveUDPAddr("udp", clientAddr)
+	if err != nil {
+		return fmt.Errorf("resolve client addr: %w", err)
+	}
+
+	allocs, err := mgr.Allocate(ctx, 1)
+	if err != nil {
+		return fmt.Errorf("allocate TURN: %w", err)
+	}
+	alloc := allocs[0]
+	myAddr := alloc.RelayAddr.String()
+
+	// Send our relay address back to client.
+	if err := sigClient.SendPayload(ctx, internalsignal.WireConnOk, []byte(myAddr)); err != nil {
+		return fmt.Errorf("send conn-ok: %w", err)
+	}
+	logger.Info("reconnect: sent relay addr to client", "my_addr", myAddr, "client_addr", clientAddr)
+
+	// Punch and accept DTLS.
+	punchCtx, punchCancel := context.WithCancel(ctx)
+	defer punchCancel()
+	internaldtls.PunchRelay(alloc.RelayConn, clientUDP)
+	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, clientUDP)
+	time.Sleep(500 * time.Millisecond)
+
+	dtlsConn, _, err := internaldtls.AcceptOverTURN(ctx, alloc.RelayConn, clientUDP)
+	if err != nil {
+		return fmt.Errorf("AcceptOverTURN: %w", err)
+	}
+	punchCancel()
+
+	// Auth + session ID.
+	if authToken != "" {
+		if err := mux.ValidateAuthToken(dtlsConn, authToken); err != nil {
+			dtlsConn.Close()
+			return fmt.Errorf("auth: %w", err)
+		}
+	}
+	if _, err := mux.ReadSessionID(dtlsConn); err != nil {
+		dtlsConn.Close()
+		return fmt.Errorf("read session id: %w", err)
+	}
+
+	m.AddConn(dtlsConn)
+	logger.Info("reconnect: new connection added to MUX")
+	return nil
 }
 
 func handleConnection(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren, conn net.Conn, authToken string) {

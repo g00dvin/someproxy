@@ -28,7 +28,9 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -106,7 +108,7 @@ class MainActivity : ComponentActivity() {
                     CallVpnScreen(
                         vpnState = vpnState.value,
                         logLines = logLines.value,
-                        onConnect = { callLink, serverAddr, token -> requestConnect(callLink, serverAddr, token) },
+                        onConnect = { callLink, serverAddr, token, numConns -> requestConnect(callLink, serverAddr, token, numConns) },
                         onDisconnect = { stopVpn() }
                     )
                 }
@@ -121,10 +123,13 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    private fun requestConnect(callLink: String, serverAddr: String, token: String) {
+    private var pendingNumConns = 4
+
+    private fun requestConnect(callLink: String, serverAddr: String, token: String, numConns: Int) {
         pendingCallLink = callLink
         pendingServerAddr = serverAddr
         pendingToken = token
+        pendingNumConns = numConns
 
         val intent = VpnService.prepare(this)
         if (intent != null) {
@@ -141,7 +146,7 @@ class MainActivity : ComponentActivity() {
             action = CallVpnService.ACTION_START
             putExtra(CallVpnService.EXTRA_CALL_LINK, pendingCallLink)
             putExtra(CallVpnService.EXTRA_SERVER_ADDR, pendingServerAddr)
-            putExtra(CallVpnService.EXTRA_NUM_CONNS, 4)
+            putExtra(CallVpnService.EXTRA_NUM_CONNS, pendingNumConns)
             putExtra(CallVpnService.EXTRA_TOKEN, pendingToken)
         }
         ContextCompat.startForegroundService(this, intent)
@@ -166,7 +171,7 @@ private fun parseCallLink(input: String): String {
 fun CallVpnScreen(
     vpnState: VpnState,
     logLines: List<String>,
-    onConnect: (callLink: String, serverAddr: String, token: String) -> Unit,
+    onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int) -> Unit,
     onDisconnect: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -177,6 +182,7 @@ fun CallVpnScreen(
     var callLinkInput by remember { mutableStateOf(prefs.getString("call_link", "") ?: "") }
     var serverAddr by remember { mutableStateOf(prefs.getString("server_addr", "") ?: "") }
     var tokenInput by remember { mutableStateOf(prefs.getString("token", "") ?: "") }
+    var numConnsInput by remember { mutableStateOf(prefs.getInt("num_conns", 4).toString()) }
     var connectionMode by remember {
         val saved = prefs.getString("connection_mode", "Relay") ?: "Relay"
         mutableStateOf(if (saved == "Direct") ConnectionMode.Direct else ConnectionMode.Relay)
@@ -286,13 +292,15 @@ fun CallVpnScreen(
                 when (vpnState) {
                     VpnState.Disconnected -> {
                         if (canConnect) {
+                            val conns = numConnsInput.toIntOrNull()?.coerceIn(1, 16) ?: 4
                             prefs.edit()
                                 .putString("call_link", callLinkInput)
                                 .putString("server_addr", serverAddr)
                                 .putString("token", tokenInput)
+                                .putInt("num_conns", conns)
                                 .apply()
                             val effectiveServerAddr = if (connectionMode == ConnectionMode.Relay) "" else serverAddr
-                            onConnect(parsedId, effectiveServerAddr, tokenInput)
+                            onConnect(parsedId, effectiveServerAddr, tokenInput, conns)
                         }
                     }
                     VpnState.Connected -> onDisconnect()
@@ -363,6 +371,22 @@ fun CallVpnScreen(
             singleLine = true,
             enabled = !isConnected,
             visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        // Connections count input
+        OutlinedTextField(
+            value = numConnsInput,
+            onValueChange = { value ->
+                if (value.isEmpty() || value.all { it.isDigit() }) {
+                    numConnsInput = value
+                }
+            },
+            label = { Text("Подключения (1-16)") },
+            placeholder = { Text("4") },
+            singleLine = true,
+            enabled = !isConnected,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
             modifier = Modifier.fillMaxWidth()
         )
 
