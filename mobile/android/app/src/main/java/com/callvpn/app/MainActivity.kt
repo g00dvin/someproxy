@@ -13,7 +13,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.*
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -24,7 +23,6 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -294,65 +292,42 @@ fun CallVpnScreen(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Big round button with progress ring
-        Box(contentAlignment = Alignment.Center) {
-            // Animated progress ring during connecting
-            if (vpnState == VpnState.Connecting) {
-                val infiniteTransition = rememberInfiniteTransition(label = "connecting")
-                val rotation by infiniteTransition.animateFloat(
-                    initialValue = 0f,
-                    targetValue = 360f,
-                    animationSpec = infiniteRepeatable(
-                        animation = tween(durationMillis = 1200, easing = LinearEasing),
-                        repeatMode = RepeatMode.Restart
-                    ),
-                    label = "rotation"
-                )
-                CircularProgressIndicator(
-                    modifier = Modifier.size(190.dp),
-                    strokeWidth = 4.dp,
-                    color = Color(0xFFFFC107),
-                    trackColor = Color(0x33FFC107),
-                    strokeCap = StrokeCap.Round
-                )
-            }
+        // Big round button
+        Button(
+            onClick = {
+                when (vpnState) {
+                    VpnState.Disconnected -> {
+                        if (canConnect) {
+                            val conns = numConnsInput.toIntOrNull()?.coerceIn(1, 16) ?: 4
+                            prefs.edit()
+                                .putString("call_link", callLinkInput)
+                                .putString("server_addr", serverAddr)
+                                .putString("token", tokenInput)
+                                .putInt("num_conns", conns)
+                                .apply()
+                            // Save to recent IDs
+                            val updated = (listOf(parsedId) + recentIds.filter { it != parsedId }).take(5)
+                            recentIds = updated
+                            prefs.edit().putString("recent_ids", updated.joinToString("\n")).apply()
 
-            Button(
-                onClick = {
-                    when (vpnState) {
-                        VpnState.Disconnected -> {
-                            if (canConnect) {
-                                val conns = numConnsInput.toIntOrNull()?.coerceIn(1, 16) ?: 4
-                                prefs.edit()
-                                    .putString("call_link", callLinkInput)
-                                    .putString("server_addr", serverAddr)
-                                    .putString("token", tokenInput)
-                                    .putInt("num_conns", conns)
-                                    .apply()
-                                // Save to recent IDs
-                                val updated = (listOf(parsedId) + recentIds.filter { it != parsedId }).take(5)
-                                recentIds = updated
-                                prefs.edit().putString("recent_ids", updated.joinToString("\n")).apply()
-
-                                val effectiveServerAddr = if (connectionMode == ConnectionMode.Relay) "" else serverAddr
-                                onConnect(parsedId, effectiveServerAddr, tokenInput, conns)
-                            }
+                            val effectiveServerAddr = if (connectionMode == ConnectionMode.Relay) "" else serverAddr
+                            onConnect(parsedId, effectiveServerAddr, tokenInput, conns)
                         }
-                        VpnState.Connecting -> onDisconnect()
-                        VpnState.Connected -> onDisconnect()
                     }
-                },
-                modifier = Modifier.size(170.dp),
-                shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
-            ) {
-                Text(
-                    text = buttonText,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White
-                )
-            }
+                    VpnState.Connecting -> onDisconnect()
+                    VpnState.Connected -> onDisconnect()
+                }
+            },
+            modifier = Modifier.size(170.dp),
+            shape = CircleShape,
+            colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
+        ) {
+            Text(
+                text = buttonText,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
         }
 
         // App version
