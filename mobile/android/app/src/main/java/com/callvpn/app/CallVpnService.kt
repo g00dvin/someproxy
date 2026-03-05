@@ -97,6 +97,7 @@ class CallVpnService : VpnService() {
         val numConns = intent.getIntExtra(EXTRA_NUM_CONNS, 4)
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
 
+        running = true
         startForeground(NOTIFICATION_ID, buildNotification("Подключение..."))
         broadcastState("connecting")
 
@@ -115,14 +116,33 @@ class CallVpnService : VpnService() {
             }
 
             val t = Tunnel()
+            tunnel = t
             try {
                 t.start(config)
             } catch (e: Exception) {
+                tunnel = null
                 broadcastState("disconnected")
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 return@Thread
             }
-            tunnel = t
+
+            // Check if user cancelled while we were connecting.
+            if (!running) {
+                t.stop()
+                tunnel = null
+                broadcastState("disconnected")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                return@Thread
+            }
+
+            // Check again if cancelled before establishing VPN interface.
+            if (!running) {
+                t.stop()
+                tunnel = null
+                broadcastState("disconnected")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                return@Thread
+            }
 
             // 2. NOW establish VPN interface — tunnel connections are already
             //    up and won't be affected by the route change.
@@ -153,7 +173,6 @@ class CallVpnService : VpnService() {
             }
             vpnInterface = vpn
 
-            running = true
             broadcastState("connected")
 
             // Register network change callback for fast reconnect.

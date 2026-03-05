@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call VPN Server</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --border: #2a2d3a;
+    --text: #e4e4e7;
+    --text-dim: #71717a;
+    --accent: #6366f1;
+    --accent-hover: #818cf8;
+    --danger: #ef4444;
+    --danger-hover: #f87171;
+    --success: #22c55e;
+    --radius: 10px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 40px 20px;
+  }
+
+  .app {
+    width: 100%;
+    max-width: 560px;
+  }
+
+  h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 24px;
+    letter-spacing: -0.02em;
+  }
+
+  .field {
+    margin-bottom: 16px;
+  }
+
+  .field label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-dim);
+    margin-bottom: 6px;
+  }
+
+  .field input {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 14px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .field input:focus {
+    border-color: var(--accent);
+  }
+
+  .field input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .input-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .input-row input {
+    flex: 1;
+  }
+
+  .btn-icon {
+    width: 40px;
+    height: 40px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-icon:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .btn-icon:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-icon svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .token-toast {
+    font-size: 11px;
+    color: var(--success);
+    margin-top: 4px;
+    min-height: 18px;
+  }
+
+  .parsed-id {
+    font-size: 12px;
+    color: var(--accent);
+    margin-top: 4px;
+    min-height: 18px;
+  }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+
+  .btn {
+    padding: 10px 28px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .btn-connect {
+    background: var(--accent);
+    color: white;
+  }
+
+  .btn-connect:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+
+  .btn-disconnect {
+    background: var(--danger);
+    color: white;
+  }
+
+  .btn-disconnect:hover:not(:disabled) {
+    background: var(--danger-hover);
+  }
+
+  .status {
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  .status-dot.off { background: var(--text-dim); }
+  .status-dot.on { background: var(--success); }
+
+  .logs-section {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+
+  .logs-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--surface);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s;
+  }
+
+  .logs-header:hover {
+    background: #1f2233;
+  }
+
+  .logs-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .logs-header .arrow {
+    font-size: 10px;
+    transition: transform 0.2s;
+    color: var(--text-dim);
+  }
+
+  .logs-header .arrow.open {
+    transform: rotate(90deg);
+  }
+
+  .copy-hint {
+    font-size: 11px;
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+
+  .logs-section:hover .copy-hint {
+    opacity: 1;
+  }
+
+  .copy-toast {
+    font-size: 11px;
+    color: var(--success);
+    display: none;
+  }
+
+  .logs-body {
+    display: none;
+    max-height: 400px;
+    overflow-y: auto;
+    background: #0c0d12;
+    cursor: pointer;
+  }
+
+  .logs-body.open {
+    display: block;
+  }
+
+  .logs-body::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .logs-body::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .logs-body::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+  }
+
+  .log-line {
+    padding: 2px 14px;
+    font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text-dim);
+    word-break: break-all;
+  }
+
+  .log-line:hover {
+    background: rgba(99, 102, 241, 0.08);
+  }
+
+  .logs-empty {
+    padding: 20px 14px;
+    text-align: center;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Call VPN Server</h1>
+
+  <div class="field">
+    <label for="link">VK Call Link</label>
+    <input type="text" id="link" placeholder="https://vk.com/call/join/... or call ID" autocomplete="off" spellcheck="false">
+    <div class="parsed-id" id="parsed"></div>
+  </div>
+
+  <div class="field">
+    <label for="token">Auth Token</label>
+    <div class="input-row">
+      <input type="password" id="token" placeholder="Token (or set VPN_TOKEN env var)" autocomplete="off" spellcheck="false">
+      <button class="btn-icon" id="genTokenBtn" title="Generate token & copy" onclick="generateToken()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
+        </svg>
+      </button>
+    </div>
+    <div class="token-toast" id="tokenToast"></div>
+  </div>
+
+  <div class="controls">
+    <button class="btn btn-connect" id="connectBtn" onclick="toggleConnection()">Connect</button>
+    <span class="status" id="status">
+      <span class="status-dot off" id="statusDot"></span>
+      <span id="statusText">Disconnected</span>
+    </span>
+  </div>
+
+  <div class="logs-section">
+    <div class="logs-header" onclick="toggleLogs()">
+      <div class="logs-header-left">
+        <span class="arrow" id="logsArrow">&#9654;</span>
+        <span>Logs</span>
+        <span class="log-count" id="logCount"></span>
+      </div>
+      <span class="copy-hint" id="copyHint">click logs to copy</span>
+      <span class="copy-toast" id="copyToast">Copied!</span>
+    </div>
+    <div class="logs-body" id="logsBody" onclick="copyLogs()">
+      <div class="logs-empty" id="logsEmpty">No logs yet</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const linkRe = /vk\.com\/call\/join\/([A-Za-z0-9_-]+)/;
+let connected = false;
+let logsOpen = false;
+let logLines = [];
+let evtSource = null;
+
+const $ = id => document.getElementById(id);
+
+function parseLink(input) {
+  const m = input.match(linkRe);
+  return m ? m[1] : input.trim();
+}
+
+$('link').addEventListener('input', e => {
+  const id = parseLink(e.target.value);
+  const parsed = $('parsed');
+  if (id && id !== e.target.value.trim()) {
+    parsed.textContent = 'ID: ' + id;
+  } else {
+    parsed.textContent = '';
+  }
+});
+
+function setStatus(on, text) {
+  connected = on;
+  $('statusDot').className = 'status-dot ' + (on ? 'on' : 'off');
+  $('statusText').textContent = text;
+  $('link').disabled = on;
+  $('token').disabled = on;
+  $('genTokenBtn').disabled = on;
+
+  const btn = $('connectBtn');
+  if (on) {
+    btn.textContent = 'Disconnect';
+    btn.className = 'btn btn-disconnect';
+  } else {
+    btn.textContent = 'Connect';
+    btn.className = 'btn btn-connect';
+  }
+  btn.disabled = false;
+}
+
+async function toggleConnection() {
+  const btn = $('connectBtn');
+  btn.disabled = true;
+
+  if (connected) {
+    setStatus(true, 'Disconnecting...');
+    try {
+      await fetch('/api/disconnect', { method: 'POST' });
+    } catch(e) {}
+    setStatus(false, 'Disconnected');
+  } else {
+    const link = $('link').value.trim();
+    if (!link) {
+      btn.disabled = false;
+      return;
+    }
+    setStatus(false, 'Connecting...');
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/connect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ link, token: $('token').value })
+      });
+      if (res.ok) {
+        setStatus(true, 'Connected');
+        connectSSE();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setStatus(false, data.error || 'Connection failed');
+      }
+    } catch(e) {
+      setStatus(false, 'Connection failed');
+    }
+  }
+}
+
+function toggleLogs() {
+  logsOpen = !logsOpen;
+  $('logsBody').className = 'logs-body' + (logsOpen ? ' open' : '');
+  $('logsArrow').className = 'arrow' + (logsOpen ? ' open' : '');
+  if (logsOpen) {
+    $('logsBody').scrollTop = $('logsBody').scrollHeight;
+  }
+}
+
+function addLogLine(text) {
+  logLines.push(text);
+  const body = $('logsBody');
+  $('logsEmpty').style.display = 'none';
+
+  const div = document.createElement('div');
+  div.className = 'log-line';
+  div.textContent = text;
+  body.appendChild(div);
+
+  $('logCount').textContent = '(' + logLines.length + ')';
+
+  // Auto-scroll if near bottom.
+  if (body.scrollHeight - body.scrollTop - body.clientHeight < 80) {
+    body.scrollTop = body.scrollHeight;
+  }
+}
+
+function copyLogs() {
+  if (logLines.length === 0) return;
+  navigator.clipboard.writeText(logLines.join('\n')).then(() => {
+    const toast = $('copyToast');
+    const hint = $('copyHint');
+    hint.style.display = 'none';
+    toast.style.display = 'inline';
+    setTimeout(() => {
+      toast.style.display = 'none';
+      hint.style.display = '';
+    }, 1500);
+  });
+}
+
+function generateToken() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const arr = new Uint8Array(40);
+  crypto.getRandomValues(arr);
+  const token = Array.from(arr, b => chars[b % chars.length]).join('');
+  $('token').value = token;
+  $('token').type = 'text';
+  navigator.clipboard.writeText(token).then(() => {
+    $('tokenToast').textContent = 'Token generated & copied to clipboard';
+    setTimeout(() => {
+      $('tokenToast').textContent = '';
+      $('token').type = 'password';
+    }, 3000);
+  });
+}
+
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  logLines = [];
+  $('logsBody').querySelectorAll('.log-line').forEach(el => el.remove());
+  $('logsEmpty').style.display = '';
+  $('logCount').textContent = '';
+
+  evtSource = new EventSource('/api/logs');
+  evtSource.onmessage = e => addLogLine(e.data);
+  evtSource.onerror = () => {
+    // Check if server disconnected.
+    fetch('/api/status').then(r => r.json()).then(data => {
+      if (!data.connected && connected) {
+        setStatus(false, 'Disconnected (server stopped)');
+      }
+    }).catch(() => {});
+  };
+}
+
+// Initialize.
+(async () => {
+  // Load saved config.
+  try {
+    const cfg = await fetch('/api/config').then(r => r.json());
+    if (cfg.call_link) $('link').value = cfg.call_link;
+    if (cfg.auth_token) $('token').value = cfg.auth_token;
+    $('link').dispatchEvent(new Event('input'));
+  } catch(e) {}
+
+  // Check current status.
+  try {
+    const st = await fetch('/api/status').then(r => r.json());
+    if (st.connected) {
+      setStatus(true, 'Connected');
+      connectSSE();
+      // Open logs automatically if connected.
+      if (!logsOpen) toggleLogs();
+    }
+  } catch(e) {}
+})();
+</script>
+</body>
+</html>

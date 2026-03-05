@@ -1,0 +1,575 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
+	"github.com/call-vpn/call-vpn/internal/monitoring"
+	"github.com/call-vpn/call-vpn/internal/mux"
+	"github.com/call-vpn/call-vpn/internal/netstack"
+	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
+	"github.com/call-vpn/call-vpn/internal/turn"
+)
+
+// Config holds server configuration.
+type Config struct {
+	ListenAddr string // DTLS/UDP listen address for direct mode
+	AuthToken  string // Client authentication token
+	CallLink   string // VK call link ID for relay-to-relay mode
+	UseTCP     bool   // Use TCP for TURN connections
+	Logger     *slog.Logger
+	Siren      *monitoring.Siren
+}
+
+// Server manages VPN server operations.
+type Server struct {
+	cfg Config
+
+	cancel     context.CancelFunc
+	done       chan struct{}
+	sessionsMu sync.Mutex
+	sessions   map[[16]byte]*session
+}
+
+type session struct {
+	mu     sync.Mutex
+	m      *mux.Mux
+	logger *slog.Logger
+	cancel context.CancelFunc
+	conns  int
+}
+
+// New creates a new Server instance.
+func New(cfg Config) *Server {
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	if cfg.Siren == nil {
+		cfg.Siren = monitoring.New(cfg.Logger)
+	}
+	return &Server{
+		cfg:      cfg,
+		sessions: make(map[[16]byte]*session),
+		done:     make(chan struct{}),
+	}
+}
+
+// Start begins server operation in a goroutine.
+func (s *Server) Start(ctx context.Context) {
+	ctx, s.cancel = context.WithCancel(ctx)
+	go func() {
+		defer close(s.done)
+		if s.cfg.CallLink != "" {
+			s.runRelayMode(ctx)
+		} else {
+			s.runDirectMode(ctx)
+		}
+	}()
+}
+
+// Stop signals the server to shut down and waits for completion.
+func (s *Server) Stop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	<-s.done
+}
+
+// Done returns a channel that's closed when the server stops.
+func (s *Server) Done() <-chan struct{} {
+	return s.done
+}
+
+// --- Direct mode ---
+
+func (s *Server) runDirectMode(ctx context.Context) {
+	ln, err := internaldtls.Listen(s.cfg.ListenAddr)
+	if err != nil {
+		s.cfg.Logger.Error("failed to start DTLS listener", "err", err)
+		return
+	}
+	defer ln.Close()
+
+	s.cfg.Logger.Info("server listening (DTLS/UDP, direct mode)", "addr", s.cfg.ListenAddr)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.cfg.Logger.Warn("accept error", "err", err)
+			continue
+		}
+		go s.handleConnection(ctx, conn)
+	}
+}
+
+func (s *Server) handleConnection(ctx context.Context, conn net.Conn) {
+	if s.cfg.AuthToken != "" {
+		if err := mux.ValidateAuthToken(conn, s.cfg.AuthToken); err != nil {
+			s.cfg.Logger.Warn("auth failed", "remote", conn.RemoteAddr(), "err", err)
+			conn.Close()
+			return
+		}
+	}
+
+	sessionID, err := mux.ReadSessionID(conn)
+	if err != nil {
+		s.cfg.Logger.Warn("read session id failed", "remote", conn.RemoteAddr(), "err", err)
+		conn.Close()
+		return
+	}
+
+	s.cfg.Logger.Info("connection received",
+		"remote", conn.RemoteAddr(),
+		"session_id", fmt.Sprintf("%x", sessionID),
+	)
+
+	sess := s.getOrCreateSession(ctx, sessionID)
+
+	sess.mu.Lock()
+	sess.m.AddConn(conn)
+	sess.conns++
+	count := sess.conns
+	sess.mu.Unlock()
+
+	s.cfg.Logger.Info("connection added to session",
+		"session_id", fmt.Sprintf("%x", sessionID),
+		"total_conns", count,
+	)
+}
+
+func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
+	s.sessionsMu.Lock()
+	if sess, ok := s.sessions[id]; ok {
+		s.sessionsMu.Unlock()
+		return sess
+	}
+
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	sessLogger := s.cfg.Logger.With("session_id", fmt.Sprintf("%x", id))
+	m := mux.New(sessLogger)
+
+	m.EnableRawPackets(256)
+	m.EnableStreamAccept(64)
+	m.SetIdleTimeout(90 * time.Second)
+
+	sess := &session{
+		m:      m,
+		logger: sessLogger,
+		cancel: sessCancel,
+	}
+	s.sessions[id] = sess
+	s.sessionsMu.Unlock()
+
+	go m.DispatchLoop(sessCtx)
+	go m.StartPingLoop(sessCtx, 10*time.Second)
+
+	ns := netstack.New(sessLogger, m)
+	if ns != nil {
+		ns.Start(sessCtx)
+	}
+
+	go func() {
+		defer func() {
+			s.sessionsMu.Lock()
+			delete(s.sessions, id)
+			s.sessionsMu.Unlock()
+			if ns != nil {
+				ns.Close()
+			}
+			m.Close()
+			sessCancel()
+			sessLogger.Info("session closed")
+		}()
+
+		for {
+			select {
+			case stream, ok := <-m.AcceptedStreams():
+				if !ok {
+					return
+				}
+				go handleStream(sessCtx, sessLogger, stream)
+			case <-m.Dead():
+				s.cfg.Siren.AlertDisconnect(sessCtx, fmt.Sprintf("session-%x", id))
+				return
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		timer := time.NewTimer(5 * time.Minute)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-sessCtx.Done():
+		}
+	}()
+
+	return sess
+}
+
+// --- Relay mode ---
+
+func (s *Server) runRelayMode(ctx context.Context) {
+	s.cfg.Logger.Info("starting relay-to-relay mode", "link", s.cfg.CallLink)
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		s.cfg.Logger.Info("waiting for client session...")
+		err := s.runOneRelaySession(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			s.cfg.Logger.Warn("relay session failed", "err", err)
+		} else {
+			s.cfg.Logger.Info("relay session ended")
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+func (s *Server) runOneRelaySession(ctx context.Context) error {
+	jr, err := turn.FetchJoinResponse(ctx, s.cfg.CallLink)
+	if err != nil {
+		return fmt.Errorf("join VK conference: %w", err)
+	}
+	s.cfg.Logger.Info("joined VK conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+
+	sigClient, err := internalsignal.Connect(ctx, jr.WSEndpoint, s.cfg.Logger.With("component", "signaling"))
+	if err != nil {
+		return fmt.Errorf("signaling connect: %w", err)
+	}
+	defer sigClient.Close()
+
+	if err := sigClient.SetKey(s.cfg.AuthToken); err != nil {
+		return fmt.Errorf("set signaling key: %w", err)
+	}
+
+	mgr := turn.NewManager(s.cfg.CallLink, s.cfg.UseTCP, s.cfg.Logger)
+	defer mgr.CloseAll()
+
+	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
+	if err != nil {
+		return fmt.Errorf("recv relay addrs: %w", err)
+	}
+	s.cfg.Logger.Info("received client relay addresses", "count", len(clientAddrs))
+
+	pairCount := len(clientAddrs)
+	allocs, err := mgr.Allocate(ctx, pairCount)
+	if err != nil {
+		s.cfg.Siren.AlertTURNAuthFailure(ctx, err)
+		return fmt.Errorf("allocate TURN connections: %w", err)
+	}
+	s.cfg.Logger.Info("TURN allocations created on demand", "count", len(allocs))
+
+	ourAddrs := make([]string, len(allocs))
+	for i, a := range allocs {
+		ourAddrs[i] = a.RelayAddr.String()
+	}
+
+	sendDone := make(chan struct{})
+	sendCtx, sendCancel := context.WithCancel(ctx)
+	go func() {
+		defer close(sendDone)
+		for {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "server"); err != nil {
+				return
+			}
+			select {
+			case <-sendCtx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}()
+	go func() {
+		time.Sleep(5 * time.Second)
+		sendCancel()
+		<-sendDone
+	}()
+
+	type dtlsResult struct {
+		index   int
+		conn    net.Conn
+		cleanup context.CancelFunc
+		err     error
+	}
+	results := make(chan dtlsResult, pairCount)
+	punchCtx, punchCancel := context.WithCancel(ctx)
+
+	for i := 0; i < pairCount; i++ {
+		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
+		if err != nil {
+			s.cfg.Logger.Warn("resolve client relay addr", "index", i, "addr", clientAddrs[i], "err", err)
+			results <- dtlsResult{index: i, err: err}
+			continue
+		}
+		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
+			internaldtls.PunchRelay(relayConn, addr)
+			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
+			time.Sleep(500 * time.Millisecond)
+
+			dtlsConn, cleanup, err := internaldtls.AcceptOverTURN(ctx, relayConn, addr)
+			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: err}
+		}(i, allocs[i].RelayConn, clientUDP)
+	}
+
+	var dtlsConns []net.Conn
+	var cleanups []context.CancelFunc
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	for j := 0; j < pairCount; j++ {
+		r := <-results
+		if r.err != nil {
+			s.cfg.Logger.Warn("AcceptOverTURN failed", "index", r.index, "err", r.err)
+			continue
+		}
+		cleanups = append(cleanups, r.cleanup)
+		dtlsConns = append(dtlsConns, r.conn)
+		s.cfg.Logger.Info("relay DTLS connection accepted", "index", r.index)
+	}
+	punchCancel()
+
+	if len(dtlsConns) == 0 {
+		return fmt.Errorf("no relay DTLS connections established")
+	}
+
+	s.cfg.Logger.Info("relay-to-relay mode active", "connections", len(dtlsConns))
+
+	m := mux.New(s.cfg.Logger)
+	defer m.Close()
+
+	m.EnableRawPackets(256)
+	m.EnableStreamAccept(64)
+	m.SetIdleTimeout(90 * time.Second)
+
+	sessCtx, sessCancel := context.WithCancel(ctx)
+	defer sessCancel()
+
+	pingCtx, pingCancel := context.WithCancel(sessCtx)
+	defer pingCancel()
+
+	go m.DispatchLoop(sessCtx)
+	go m.StartPingLoop(pingCtx, 10*time.Second)
+	go mgr.StartKeepalive(sessCtx, 10*time.Second)
+
+	ns := netstack.New(s.cfg.Logger, m)
+	if ns != nil {
+		ns.Start(sessCtx)
+		defer ns.Close()
+	}
+
+	var wg sync.WaitGroup
+	var added atomic.Int32
+	for i, conn := range dtlsConns {
+		wg.Add(1)
+		go func(idx int, c net.Conn) {
+			defer wg.Done()
+			if s.cfg.AuthToken != "" {
+				if err := mux.ValidateAuthToken(c, s.cfg.AuthToken); err != nil {
+					s.cfg.Logger.Warn("auth failed on relay conn", "index", idx, "err", err)
+					c.Close()
+					return
+				}
+			}
+			sessionID, err := mux.ReadSessionID(c)
+			if err != nil {
+				s.cfg.Logger.Warn("read session id failed on relay conn", "index", idx, "err", err)
+				c.Close()
+				return
+			}
+			s.cfg.Logger.Info("connection received",
+				"index", idx,
+				"session_id", fmt.Sprintf("%x", sessionID),
+			)
+			m.AddConn(c)
+			added.Add(1)
+		}(i, conn)
+	}
+	wg.Wait()
+
+	if added.Load() == 0 {
+		return fmt.Errorf("no connections passed auth/session handshake")
+	}
+
+	go s.handleReconnections(sessCtx, sigClient, mgr, m)
+
+	go func() {
+		reason := sigClient.WaitForSessionEnd(sessCtx)
+		switch reason {
+		case internalsignal.SessionEndDisconnect:
+			s.cfg.Logger.Info("client sent disconnect signal, cancelling session")
+			sessCancel()
+		case internalsignal.SessionEndHungup:
+			s.cfg.Logger.Info("signaling hungup, stopping pings and reducing idle timeout")
+			pingCancel()
+			m.SetIdleTimeout(15 * time.Second)
+			go sigClient.DrainAndRoute(sessCtx)
+		}
+	}()
+
+	go func() {
+		select {
+		case <-m.Dead():
+			sessCancel()
+		case <-sessCtx.Done():
+		}
+	}()
+
+	for {
+		select {
+		case stream, ok := <-m.AcceptedStreams():
+			if !ok {
+				return nil
+			}
+			go handleStream(sessCtx, s.cfg.Logger, stream)
+		case <-m.Dead():
+			return nil
+		case <-sessCtx.Done():
+			return nil
+		}
+	}
+}
+
+func (s *Server) handleReconnections(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux) {
+
+	ch, unsub := sigClient.Subscribe(internalsignal.WireConnNew, 8)
+	defer unsub()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload, ok := <-ch:
+			if !ok {
+				return
+			}
+			clientAddr := string(payload)
+			go func() {
+				if err := s.handleOneReconnect(ctx, sigClient, mgr, m, clientAddr); err != nil {
+					s.cfg.Logger.Warn("reconnect handler failed", "client_addr", clientAddr, "err", err)
+				}
+			}()
+		}
+	}
+}
+
+func (s *Server) handleOneReconnect(ctx context.Context, sigClient *internalsignal.Client,
+	mgr *turn.Manager, m *mux.Mux, clientAddr string) error {
+
+	clientUDP, err := net.ResolveUDPAddr("udp", clientAddr)
+	if err != nil {
+		return fmt.Errorf("resolve client addr: %w", err)
+	}
+
+	allocs, err := mgr.Allocate(ctx, 1)
+	if err != nil {
+		return fmt.Errorf("allocate TURN: %w", err)
+	}
+	alloc := allocs[0]
+	myAddr := alloc.RelayAddr.String()
+
+	if err := sigClient.SendPayload(ctx, internalsignal.WireConnOk, []byte(myAddr)); err != nil {
+		return fmt.Errorf("send conn-ok: %w", err)
+	}
+	s.cfg.Logger.Info("reconnect: sent relay addr to client", "my_addr", myAddr, "client_addr", clientAddr)
+
+	punchCtx, punchCancel := context.WithCancel(ctx)
+	defer punchCancel()
+	internaldtls.PunchRelay(alloc.RelayConn, clientUDP)
+	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, clientUDP)
+	time.Sleep(200 * time.Millisecond)
+
+	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer reconnCancel()
+	dtlsConn, _, err := internaldtls.AcceptOverTURN(reconnCtx, alloc.RelayConn, clientUDP)
+	if err != nil {
+		return fmt.Errorf("AcceptOverTURN: %w", err)
+	}
+	punchCancel()
+
+	if s.cfg.AuthToken != "" {
+		if err := mux.ValidateAuthToken(dtlsConn, s.cfg.AuthToken); err != nil {
+			dtlsConn.Close()
+			return fmt.Errorf("auth: %w", err)
+		}
+	}
+	if _, err := mux.ReadSessionID(dtlsConn); err != nil {
+		dtlsConn.Close()
+		return fmt.Errorf("read session id: %w", err)
+	}
+
+	m.AddConn(dtlsConn)
+	s.cfg.Logger.Info("reconnect: new connection added to MUX")
+	return nil
+}
+
+func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) {
+	defer stream.Close()
+
+	addrBuf := make([]byte, 512)
+	n, err := stream.Read(addrBuf)
+	if err != nil {
+		logger.Debug("read target address failed", "err", err)
+		return
+	}
+	target := string(addrBuf[:n])
+
+	logger.Debug("connecting to target", "stream_id", stream.ID, "target", target)
+
+	dialer := net.Dialer{}
+	outConn, err := dialer.DialContext(ctx, "tcp", target)
+	if err != nil {
+		logger.Warn("dial target failed", "target", target, "err", err)
+		return
+	}
+	defer outConn.Close()
+
+	buf := make([]byte, mux.MaxFramePayload)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		io.CopyBuffer(outConn, stream, buf)
+	}()
+
+	go func() {
+		defer wg.Done()
+		buf2 := make([]byte, mux.MaxFramePayload)
+		io.CopyBuffer(stream, outConn, buf2)
+	}()
+
+	wg.Wait()
+}

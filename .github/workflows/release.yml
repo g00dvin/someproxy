@@ -24,12 +24,27 @@ jobs:
           - goos: windows
             goarch: amd64
             output: client-windows-amd64.exe
+            target: ./cmd/client
           - goos: darwin
             goarch: amd64
             output: client-darwin-amd64
+            target: ./cmd/client
           - goos: darwin
             goarch: arm64
             output: client-darwin-arm64
+            target: ./cmd/client
+          - goos: windows
+            goarch: amd64
+            output: server-ui-windows-amd64.exe
+            target: ./cmd/server-ui
+          - goos: darwin
+            goarch: amd64
+            output: server-ui-darwin-amd64
+            target: ./cmd/server-ui
+          - goos: darwin
+            goarch: arm64
+            output: server-ui-darwin-arm64
+            target: ./cmd/server-ui
 
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +60,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
-        run: go build -ldflags="-s -w" -o ${{ matrix.output }} ./cmd/client
+        run: go build -ldflags="-s -w" -o ${{ matrix.output }} ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
@@ -191,6 +206,9 @@ jobs:
             artifacts/client-windows-amd64.exe
             artifacts/client-darwin-amd64
             artifacts/client-darwin-arm64
+            artifacts/server-ui-windows-amd64.exe
+            artifacts/server-ui-darwin-amd64
+            artifacts/server-ui-darwin-arm64
             artifacts/app-release.apk
           fail_on_unmatched_files: false
           generate_release_notes: true
