@@ -120,6 +120,8 @@ class MainActivity : ComponentActivity() {
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
         lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
 
+        handleQuickConnect(intent)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(
@@ -183,6 +185,34 @@ class MainActivity : ComponentActivity() {
             action = CallVpnService.ACTION_STOP
         }
         startService(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleQuickConnect(intent)
+    }
+
+    private fun handleQuickConnect(intent: Intent?) {
+        if (intent?.action != ACTION_QUICK_CONNECT) return
+        if (vpnState.value != VpnState.Disconnected) return
+
+        val prefs = getSharedPreferences("callvpn", Context.MODE_PRIVATE)
+        val rawCallLink = prefs.getString("call_link", "") ?: ""
+        if (rawCallLink.isBlank()) return
+
+        val callLink = parseCallLink(rawCallLink)
+        val token = prefs.getString("token", "") ?: ""
+        val numConns = prefs.getInt("num_conns", 4)
+        val connectionMode = prefs.getString("connection_mode", "Relay") ?: "Relay"
+        val serverAddr = if (connectionMode == "Direct") {
+            prefs.getString("server_addr", "") ?: ""
+        } else ""
+
+        requestConnect(callLink, serverAddr, token, numConns)
+    }
+
+    companion object {
+        const val ACTION_QUICK_CONNECT = "com.callvpn.QUICK_CONNECT"
     }
 }
 

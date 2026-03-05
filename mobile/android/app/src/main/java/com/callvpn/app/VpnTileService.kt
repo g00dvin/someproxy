@@ -8,7 +8,6 @@ import android.content.IntentFilter
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
-import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 
 class VpnTileService : TileService() {
@@ -43,55 +42,27 @@ class VpnTileService : TileService() {
                 startService(intent)
             }
             else -> {
-                // Check saved settings
-                val prefs = getSharedPreferences("callvpn", Context.MODE_PRIVATE)
-                val callLink = prefs.getString("call_link", "") ?: ""
-                if (callLink.isBlank()) {
-                    openApp()
-                    return
+                // Launch Activity which will start the foreground VPN service.
+                // Starting FGS directly from TileService is blocked on Android 14/16.
+                val activityIntent = Intent(this, MainActivity::class.java).apply {
+                    action = MainActivity.ACTION_QUICK_CONNECT
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
-
-                val token = prefs.getString("token", "") ?: ""
-                val numConns = prefs.getInt("num_conns", 4)
-                val connectionMode = prefs.getString("connection_mode", "Relay") ?: "Relay"
-                val serverAddr = if (connectionMode == "Direct") {
-                    prefs.getString("server_addr", "") ?: ""
-                } else ""
-
-                // Check if VPN permission has been granted previously.
-                // VpnService.prepare() must NOT be called from a non-Activity context
-                // on many Android versions. We store the grant state in prefs instead.
-                val vpnGranted = prefs.getBoolean("vpn_permission_granted", false)
-                if (!vpnGranted) {
-                    openApp()
-                    return
-                }
-
-                val intent = Intent(this, CallVpnService::class.java).apply {
-                    action = CallVpnService.ACTION_START
-                    putExtra(CallVpnService.EXTRA_CALL_LINK, callLink)
-                    putExtra(CallVpnService.EXTRA_SERVER_ADDR, serverAddr)
-                    putExtra(CallVpnService.EXTRA_NUM_CONNS, numConns)
-                    putExtra(CallVpnService.EXTRA_TOKEN, token)
-                }
-                ContextCompat.startForegroundService(this, intent)
+                collapseAndStartActivity(activityIntent)
             }
         }
     }
 
     @Suppress("DEPRECATION")
-    private fun openApp() {
-        val activityIntent = Intent(this, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
+    private fun collapseAndStartActivity(intent: Intent) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             val pending = PendingIntent.getActivity(
-                this, 0, activityIntent,
+                this, 0, intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
             startActivityAndCollapse(pending)
         } else {
-            startActivityAndCollapse(activityIntent)
+            startActivityAndCollapse(intent)
         }
     }
 
