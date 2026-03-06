@@ -437,6 +437,11 @@ function createInstanceHTML(idx) {
         <label>Auth Token</label>
         <div class="input-row">
           <input type="password" id="token_${idx}" placeholder="Token (or set VPN_TOKEN env var)" autocomplete="off" spellcheck="false">
+          <button class="btn-icon" id="copyTokenBtn_${idx}" onclick="copyToken(${idx})" title="Copy token">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </button>
           <button class="btn-icon" id="genTokenBtn_${idx}" onclick="generateToken(${idx})" title="Generate token & copy">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
@@ -523,6 +528,7 @@ function setStatus(idx, on, text) {
   el('statusText', idx).textContent = text;
   el('link', idx).disabled = on;
   el('token', idx).disabled = on;
+  el('copyTokenBtn', idx).disabled = on;
   el('genTokenBtn', idx).disabled = on;
 
   const btn = el('connectBtn', idx);
@@ -621,6 +627,19 @@ function copyLogs(idx) {
       toast.style.display = 'none';
       hint.style.display = '';
     }, 1500);
+  });
+}
+
+function copyToken(idx) {
+  const token = el('token', idx).value;
+  if (!token) {
+    el('tokenToast', idx).textContent = 'No token to copy';
+    setTimeout(() => el('tokenToast', idx).textContent = '', 2000);
+    return;
+  }
+  navigator.clipboard.writeText(token).then(() => {
+    el('tokenToast', idx).textContent = 'Token copied to clipboard';
+    setTimeout(() => el('tokenToast', idx).textContent = '', 2000);
   });
 }
 
