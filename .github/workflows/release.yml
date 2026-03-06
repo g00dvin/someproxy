@@ -83,14 +83,29 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
+          cache-dependency-path: mobile/android/**/*.gradle.kts
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Cache gomobile tools
+        id: cache-gomobile
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/gomobile
+            ~/go/bin/gobind
+          key: gomobile-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+
       - name: Install gomobile
+        if: steps.cache-gomobile.outputs.cache-hit != 'true'
         run: |
           go install golang.org/x/mobile/cmd/gomobile@latest
           go install golang.org/x/mobile/cmd/gobind@latest
+
+      - name: Init gomobile
+        run: |
           go get golang.org/x/mobile/bind@latest
           gomobile init
 
@@ -104,14 +119,17 @@ jobs:
           sed -i "s/versionName = \"[^\"]*\"/versionName = \"$VERSION\"/" mobile/android/app/build.gradle.kts
           echo "Set versionName=$VERSION versionCode=$VERSION_CODE"
 
+      - name: Cache Go build (gomobile)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-android-${{ env.GO_VERSION }}-${{ hashFiles('go.sum', 'mobile/bind/**/*.go', 'internal/**/*.go') }}
+          restore-keys: gobuild-android-${{ env.GO_VERSION }}-
+
       - name: Build Go AAR
         run: |
           mkdir -p mobile/android/app/libs
           gomobile bind -ldflags="-checklinkname=0" -target android -androidapi 24 -o mobile/android/app/libs/bind.aar ./mobile/bind/
-
-      - name: Generate Gradle wrapper
-        working-directory: mobile/android
-        run: gradle wrapper --gradle-version 8.5
 
       - name: Build and sign APK
         env:
