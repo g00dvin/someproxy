@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
 	"github.com/call-vpn/call-vpn/internal/server"
 )
 

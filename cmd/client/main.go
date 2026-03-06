@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/bypass"
+	_ "github.com/call-vpn/call-vpn/internal/hrtimer"
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/monitoring"
 	"github.com/call-vpn/call-vpn/internal/mux"
