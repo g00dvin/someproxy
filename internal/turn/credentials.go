@@ -200,7 +200,7 @@ func vkMessagesToken(ctx context.Context, client *http.Client, token2 string) (s
 func vkJoinToken(ctx context.Context, client *http.Client, link, token3 string) (string, error) {
 	data := url.Values{
 		"vk_join_link":  {fmt.Sprintf("https://vk.com/call/join/%s", link)},
-		"name":          {"guest"},
+		"name":          {RandomDisplayName()},
 		"access_token":  {token3},
 	}
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
