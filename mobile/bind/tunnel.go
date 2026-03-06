@@ -83,6 +83,7 @@ func (lb *LogBuffer) ReadAndClear() string {
 type tunnelState struct {
 	mgr       *turn.Manager
 	m         *mux.Mux
+	conns     []io.ReadWriteCloser   // connections to add after idle timeout is set
 	cleanups  []context.CancelFunc
 	sigClient *internalsignal.Client // non-nil in relay mode; kept alive for reconnect signaling
 	sessionID uuid.UUID              // session UUID for reconnect auth
@@ -237,11 +238,11 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 		return nil, fmt.Errorf("no DTLS connections established")
 	}
 
-	m := mux.New(t.logger, muxConns...)
+	m := mux.New(t.logger)
 	t.logger.Info("tunnel connected (direct)",
-		"active", m.ActiveConns(), "target", cfg.NumConns,
+		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
-	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups}, nil
+	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
 }
 
 // connectRelay creates TURN allocations, exchanges relay addresses via VK
@@ -385,11 +386,11 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		return nil, fmt.Errorf("no relay DTLS connections established")
 	}
 
-	m := mux.New(t.logger, muxConns...)
+	m := mux.New(t.logger)
 	t.logger.Info("tunnel connected (relay-to-relay)",
-		"active", m.ActiveConns(), "target", cfg.NumConns,
+		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
-	return &tunnelState{mgr: mgr, m: m, cleanups: cleanups, sigClient: sigClient, sessionID: sessionID}, nil
+	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups, sigClient: sigClient, sessionID: sessionID}, nil
 }
 
 // applyState installs a new tunnelState into the tunnel, starting
@@ -413,6 +414,13 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	state.m.SetIdleTimeout(15 * time.Second)
 	go state.m.DispatchLoop(muxCtx)
 	go state.m.StartPingLoop(muxCtx, 5*time.Second)
+
+	// Add connections AFTER idle timeout and DispatchLoop are set up.
+	// This prevents a race where readLoops (started by AddConn) set
+	// the 15s deadline before DispatchLoop is ready to process pongs.
+	for _, conn := range state.conns {
+		state.m.AddConn(conn)
+	}
 
 	// Start per-connection reconnect for relay mode.
 	if state.sigClient != nil {
@@ -539,6 +547,12 @@ func (t *Tunnel) reconnectLoop() {
 			t.applyState(state)
 			t.logger.Info("reconnected successfully")
 			backoff = time.Second
+			// Drain any force signal that arrived during connectRelay/connectDirect
+			// to prevent immediately tearing down the fresh connection.
+			select {
+			case <-force:
+			default:
+			}
 			break
 		}
 	}

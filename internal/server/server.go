@@ -210,6 +210,21 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 		ns.Start(sessCtx)
 	}
 
+	// Drain dead connections so their MUX slots can be reused.
+	go func() {
+		for {
+			select {
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				m.RemoveConn(idx)
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
+
 	go func() {
 		defer func() {
 			s.sessionsMu.Lock()
@@ -452,6 +467,24 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		"active", m.ActiveConns(),
 		"total", int(added.Load()),
 	)
+
+	// Drain dead connections so their MUX slots are reused by AddConn.
+	// Without this, dead muxConns stay non-nil, AddConn always appends,
+	// and the MUX grows unbounded on per-connection reconnects.
+	go func() {
+		for {
+			select {
+			case idx, ok := <-m.ConnDied():
+				if !ok {
+					return
+				}
+				m.RemoveConn(idx)
+				s.cfg.Logger.Info("removed dead connection from MUX", "index", idx, "active", m.ActiveConns())
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
 
 	go s.handleReconnections(sessCtx, sigClient, mgr, m)
 
