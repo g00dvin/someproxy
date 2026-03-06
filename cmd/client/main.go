@@ -354,7 +354,7 @@ func runRelayToRelay(ctx context.Context, logger *slog.Logger, siren *monitoring
 //
 // Two modes:
 //   - Normal: active >= minActive AND healthy — try 5 attempts per conn, then wait for next tick.
-//   - Critical: active < minActive OR unhealthy (no pong for 15s) — retry indefinitely with exp backoff (1s→30s).
+//   - Critical: active < minActive OR unhealthy (no pong for 10s) — retry indefinitely with exp backoff (1s→30s).
 //
 // minActive = max(2, targetConns/2).
 func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
@@ -369,7 +369,7 @@ func reconnectManager(ctx context.Context, sigClient *internalsignal.Client,
 		minActive = 2
 	}
 
-	const healthTimeout = 15 * time.Second
+	const healthTimeout = 10 * time.Second
 
 	// Wakeup signal: triggered on connection death for fast response.
 	wakeup := make(chan struct{}, 1)

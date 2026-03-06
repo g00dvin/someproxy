@@ -565,7 +565,7 @@ func (t *Tunnel) reconnectConns(ctx context.Context, sigClient *internalsignal.C
 		minActive = 2
 	}
 
-	const healthTimeout = 15 * time.Second
+	const healthTimeout = 10 * time.Second
 
 	// Wakeup signal: triggered on connection death for fast response.
 	wakeup := make(chan struct{}, 1)

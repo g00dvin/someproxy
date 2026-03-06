@@ -126,6 +126,8 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 		// packets. A small buffer forces the bridge goroutine to block earlier.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			tcpConn.SetWriteBuffer(16384)
+			tcpConn.SetKeepAlive(true)
+			tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		}
 		turnConn = pionTurn.NewSTUNConn(conn)
 	} else {
@@ -204,8 +206,17 @@ func (m *Manager) StartKeepalive(ctx context.Context, interval time.Duration) {
 			m.mu.Unlock()
 			for i, a := range allocs {
 				if a != nil && a.Client != nil {
+					// Set a write deadline so keepalive doesn't block forever
+					// on a dead TCP socket after network change.
+					if a.conn != nil {
+						a.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					}
 					if _, err := a.Client.SendBindingRequest(); err != nil {
 						m.logger.Debug("TURN keepalive failed", "index", i, "err", err)
+					}
+					// Clear deadline for normal data flow.
+					if a.conn != nil {
+						a.conn.SetWriteDeadline(time.Time{})
 					}
 				}
 				if a != nil {

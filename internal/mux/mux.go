@@ -74,7 +74,13 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 				go func(mc *muxConn, data []byte) {
 					defer wg.Done()
 					mc.mu.Lock()
+					if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+						d.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					}
 					mc.conn.Write(data)
+					if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+						d.SetWriteDeadline(time.Time{})
+					}
 					mc.mu.Unlock()
 				}(mc, data)
 			}
@@ -279,7 +285,13 @@ func (m *Mux) sendFrameOn(mc *muxConn, f *Frame) error {
 	}
 
 	mc.mu.Lock()
+	if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	}
 	_, err = mc.conn.Write(data)
+	if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		d.SetWriteDeadline(time.Time{})
+	}
 	mc.mu.Unlock()
 
 	if err != nil {
@@ -289,7 +301,13 @@ func (m *Mux) sendFrameOn(mc *muxConn, f *Frame) error {
 		if fallback != nil && fallback != mc {
 			mc = fallback
 			mc.mu.Lock()
+			if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				d.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			}
 			_, err = mc.conn.Write(data)
+			if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+				d.SetWriteDeadline(time.Time{})
+			}
 			mc.mu.Unlock()
 			if err != nil {
 				mc.stats.errors.Add(1)
@@ -418,7 +436,13 @@ func (m *Mux) ProbeConnections(probeTimeout time.Duration) {
 		if d, ok := mc.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
 			d.SetReadDeadline(time.Now().Add(probeTimeout))
 		}
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Now().Add(probeTimeout))
+		}
 		mc.conn.Write(data)
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Time{})
+		}
 		mc.mu.Unlock()
 	}
 }
