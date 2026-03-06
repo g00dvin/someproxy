@@ -49,7 +49,10 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 
 	conn1, conn2 := connutil.LimitedAsyncPacketPipe(bridgePipeBufferSize)
 
-	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	// Use Background so the bridge outlives the caller's ctx (which may be
+	// a short-lived timeout used only for the handshake). The cleanup func
+	// returned to the caller is the sole way to tear down the bridge.
+	bridgeCtx, bridgeCancel := context.WithCancel(context.Background())
 
 	var wg sync.WaitGroup
 	wg.Add(2)
