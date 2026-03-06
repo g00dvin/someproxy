@@ -494,7 +494,7 @@ func (t *Tunnel) reconnectLoop() {
 				t.teardownMux()
 			case <-force:
 				t.logger.Info("network change forced reconnect")
-				// teardownMux already called by OnNetworkChanged debounce
+				t.teardownMux()
 			case <-t.rootCtx.Done():
 				return
 			}
