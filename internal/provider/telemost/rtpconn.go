@@ -16,33 +16,63 @@ import (
 // into a bidirectional io.ReadWriteCloser. VPN data is encoded as VP8 keyframes
 // and forwarded by the SFU through its standard RTP media pipeline.
 //
+// The reliability layer (FEC + ARQ) ensures data delivery over the lossy SFU channel:
+// - XOR FEC with interleaved groups recovers single losses per group
+// - NACK-based retransmission handles cases FEC can't recover
+//
 // When multiple video tracks are received (e.g. stale participants in the room),
 // RTPConn locks to the first track that delivers valid VPN data and ignores others.
+
 // maxVP8Data is the maximum VPN data per VP8 frame to ensure each frame fits
 // in a single RTP packet. RTP MTU ~1200 bytes minus VP8 RTP descriptor (~5 bytes)
-// minus VP8 header (16 bytes) minus chunk header (4 bytes).
+// minus VP8 header (16 bytes) minus reliability header (3 bytes) minus chunk header (4 bytes).
 const maxVP8Data = 1100
 
 // writePace is the minimum interval between consecutive VP8 frame writes.
 // Without pacing, burst writes overwhelm the SFU's video forwarding pipeline.
 const writePace = 10 * time.Millisecond
 
+// nackCheckInterval is how often we check for expired NACKs to send.
+const nackCheckInterval = 15 * time.Millisecond
+
+// Packet types for the reliability layer.
+const (
+	pktDATA byte = 0x01 // normal data chunk
+	pktFEC  byte = 0x02 // XOR FEC parity
+	pktNACK byte = 0x03 // request retransmission
+	pktRETX byte = 0x04 // retransmitted data chunk
+)
+
 type RTPConn struct {
 	pubTrack *webrtc.TrackLocalStaticSample // publisher video track (write path)
-	readCh   chan []byte                    // decoded payloads from subscriber tracks
 	once     sync.Once
 	closeCh  chan struct{}
 
 	lockedMu   sync.Mutex
 	lockedSSRC uint32 // SSRC of the track we've locked to (0 = not yet locked)
 
-	seqMu    sync.Mutex
-	seqNum   uint16 // write sequence counter
+	seqMu     sync.Mutex
+	seqNum    uint16    // write sequence counter (per-Write() call)
 	lastWrite time.Time // last VP8 frame write time for pacing
+
+	// Packet-level sequence for the reliability layer (per VP8 frame).
+	pktSeqMu   sync.Mutex
+	nextPktSeq uint16
+
+	// Reliability components.
+	fecEncoder *FECEncoder
+	fecDecoder *FECDecoder
+	retxBuf    *RetransmitBuffer
+	nackTrack  *NACKTracker
+
+	// rawPktCh receives VP8 payloads from HandleTrack (with reliability header).
+	rawPktCh chan []byte
+	// readCh receives chunkPayloads after reliability processing.
+	readCh chan []byte
 
 	// Reassembly state (single-goroutine access from reassemblyLoop).
 	reassembly  map[uint16]*reassemblyBuf
-	nextReadSeq uint16     // next expected sequence number for ordered delivery
+	nextReadSeq uint16     // next expected write-sequence for ordered delivery
 	nrsMu       sync.Mutex // protects nextReadSeq for cross-goroutine reads
 	orderedCh   chan []byte
 }
@@ -57,12 +87,19 @@ type reassemblyBuf struct {
 func NewRTPConn(pubTrack *webrtc.TrackLocalStaticSample) *RTPConn {
 	c := &RTPConn{
 		pubTrack:   pubTrack,
-		readCh:     make(chan []byte, 256),
 		closeCh:    make(chan struct{}),
+		rawPktCh:   make(chan []byte, 256),
+		readCh:     make(chan []byte, 256),
 		reassembly: make(map[uint16]*reassemblyBuf),
 		orderedCh:  make(chan []byte, 64),
+		fecEncoder: NewFECEncoder(),
+		fecDecoder: NewFECDecoder(),
+		retxBuf:    &RetransmitBuffer{},
+		nackTrack:  NewNACKTracker(),
 	}
+	go c.reliabilityLoop()
 	go c.reassemblyLoop()
+	go c.nackLoop()
 	return c
 }
 
@@ -74,17 +111,24 @@ func (c *RTPConn) nextSeq() uint16 {
 	return s
 }
 
-// reassemblyTimeout is how long we wait for a missing sequence before skipping it.
-// If the SFU drops a VP8 frame, we can't stall forever — skip after this timeout.
-const reassemblyTimeout = 100 * time.Millisecond
+func (c *RTPConn) nextPktSeqNum() uint16 {
+	c.pktSeqMu.Lock()
+	s := c.nextPktSeq
+	c.nextPktSeq++
+	c.pktSeqMu.Unlock()
+	return s
+}
 
-// reassemblyLoop reads raw chunks from readCh, reassembles multi-chunk
-// messages, and delivers them in sequence order to orderedCh.
-// If a sequence is missing for longer than reassemblyTimeout, it is skipped
-// to prevent a single lost frame from stalling the entire data pipeline.
+// reassemblyTimeout is the maximum time to wait for a missing write-sequence.
+// If FEC + repeated NACKs can't recover the data within this window,
+// the connection is closed (MUX requires reliable delivery — skipping corrupts framing).
+const reassemblyTimeout = 3 * time.Second
+
+// reassemblyLoop reads chunkPayloads from readCh, reassembles multi-chunk
+// messages, and delivers them in write-sequence order to orderedCh.
 func (c *RTPConn) reassemblyLoop() {
 	var stallTimer *time.Timer
-	var stallCh <-chan time.Time // nil when no stall detected
+	var stallCh <-chan time.Time
 
 	for {
 		select {
@@ -95,42 +139,25 @@ func (c *RTPConn) reassemblyLoop() {
 			return
 
 		case <-stallCh:
-			// Timeout waiting for nextReadSeq — skip missing/incomplete sequences.
-			skipped := 0
-			for {
-				rb, exists := c.reassembly[c.nextReadSeq]
-				if exists && rb.got >= rb.total {
-					break // this seq is complete, deliverReady will handle it
+			// Check if the stalled sequence was recovered while we waited.
+			rb, exists := c.reassembly[c.nextReadSeq]
+			if exists && rb.got >= rb.total {
+				stallCh = nil
+				c.deliverReady()
+				if c.hasBufferedAhead() {
+					stallTimer.Reset(reassemblyTimeout)
+					stallCh = stallTimer.C
 				}
-				// Check if there's any higher seq buffered.
-				hasHigher := false
-				for seq := range c.reassembly {
-					if seqAfter(seq, c.nextReadSeq) {
-						hasHigher = true
-						break
-					}
-				}
-				if !hasHigher {
-					break // nothing buffered ahead, just wait
-				}
-				// Skip this missing or incomplete sequence.
-				delete(c.reassembly, c.nextReadSeq)
-				skipped++
-				c.incNextReadSeq()
+				continue
 			}
-			if skipped > 0 {
-				slog.Info("rtpconn: skipped lost/incomplete sequences", "count", skipped, "nextReadSeq", c.nextReadSeq)
-			}
-			stallCh = nil
-
-			// Try to deliver what we can now.
-			c.deliverReady()
-
-			// Check if still stalled on next missing seq.
-			if c.hasBufferedAhead() {
-				stallTimer.Reset(reassemblyTimeout)
-				stallCh = stallTimer.C
-			}
+			// Unrecoverable loss: FEC + NACK retries couldn't recover the data
+			// within the timeout. Close the connection — MUX requires reliable
+			// delivery, skipping would corrupt framing.
+			slog.Error("rtpconn: unrecoverable loss, closing connection",
+				"missingWriteSeq", c.nextReadSeq,
+				"timeout", reassemblyTimeout)
+			c.Close()
+			return
 
 		case raw, ok := <-c.readCh:
 			if !ok {
@@ -151,7 +178,6 @@ func (c *RTPConn) reassemblyLoop() {
 				continue
 			}
 
-
 			buf, exists := c.reassembly[seq]
 			if !exists {
 				buf = &reassemblyBuf{
@@ -167,11 +193,8 @@ func (c *RTPConn) reassemblyLoop() {
 				buf.got++
 			}
 
-			// Try to deliver completed sequences in order.
 			c.deliverReady()
 
-			// If we have buffered data ahead of nextReadSeq but nextReadSeq is missing,
-			// start a stall timer to skip it after timeout.
 			if stallCh == nil && c.hasBufferedAhead() {
 				if stallTimer == nil {
 					stallTimer = time.NewTimer(reassemblyTimeout)
@@ -180,7 +203,6 @@ func (c *RTPConn) reassemblyLoop() {
 				}
 				stallCh = stallTimer.C
 			}
-			// If we caught up (no stall), cancel the timer.
 			if stallCh != nil && !c.hasBufferedAhead() {
 				stallTimer.Stop()
 				stallCh = nil
@@ -226,7 +248,7 @@ func (c *RTPConn) hasBufferedAhead() bool {
 	if currentExists {
 		rb := c.reassembly[c.nextReadSeq]
 		if rb.got >= rb.total {
-			return false // current is ready, deliverReady will handle it
+			return false
 		}
 	}
 	for seq := range c.reassembly {
@@ -235,6 +257,177 @@ func (c *RTPConn) hasBufferedAhead() bool {
 		}
 	}
 	return false
+}
+
+// reliabilityLoop processes raw packets from HandleTrack, handles FEC/NACK,
+// and forwards data chunks to readCh for reassembly.
+func (c *RTPConn) reliabilityLoop() {
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case raw, ok := <-c.rawPktCh:
+			if !ok {
+				return
+			}
+			if len(raw) < 1 {
+				continue
+			}
+			pktType := raw[0]
+
+			switch pktType {
+			case pktDATA, pktRETX:
+				c.handleDataPacket(raw)
+			case pktFEC:
+				c.handleFECPacket(raw)
+			case pktNACK:
+				c.handleNACKPacket(raw)
+			}
+		}
+	}
+}
+
+// handleDataPacket processes a DATA or RETX packet.
+// Format: type(1) + pktSeq(2) + chunkPayload
+func (c *RTPConn) handleDataPacket(raw []byte) {
+	if len(raw) < 3 {
+		return
+	}
+	pktSeq := binary.BigEndian.Uint16(raw[1:3])
+	chunkPayload := raw[3:]
+
+	// Record in FEC decoder pool and NACK tracker.
+	c.fecDecoder.AddData(pktSeq, chunkPayload)
+	c.nackTrack.Record(pktSeq)
+
+	// Periodically prune old FEC data.
+	nrs := c.getNextReadSeq()
+	if pktSeq%64 == 0 {
+		c.fecDecoder.Prune(nrs)
+		c.nackTrack.Prune(nrs)
+	}
+
+	// Forward to reassembly.
+	select {
+	case c.readCh <- chunkPayload:
+	case <-c.closeCh:
+	}
+}
+
+// handleFECPacket processes a FEC parity packet.
+// Format: type(1) + firstSeq(2) + stride(1) + count(1) + xorPayload
+func (c *RTPConn) handleFECPacket(raw []byte) {
+	if len(raw) < 5 {
+		return
+	}
+	firstSeq := binary.BigEndian.Uint16(raw[1:3])
+	stride := raw[3]
+	count := int(raw[4])
+	parity := raw[5:]
+
+	recoveredSeq, recoveredPayload, ok := c.fecDecoder.Recover(firstSeq, stride, count, parity)
+	if ok {
+		slog.Info("rtpconn: FEC recovered packet", "pktSeq", recoveredSeq)
+		// Record recovery in NACK tracker so it doesn't send unnecessary NACKs.
+		c.nackTrack.Resolve(recoveredSeq)
+		// Also add recovered data to FEC pool for potential future FEC groups.
+		c.fecDecoder.AddData(recoveredSeq, recoveredPayload)
+
+		// Forward recovered chunk to reassembly.
+		select {
+		case c.readCh <- recoveredPayload:
+		case <-c.closeCh:
+		}
+	}
+}
+
+// handleNACKPacket processes a NACK from the remote peer.
+// Format: type(1) + count(1) + [pktSeq(2)]*count
+func (c *RTPConn) handleNACKPacket(raw []byte) {
+	if len(raw) < 2 {
+		return
+	}
+	count := int(raw[1])
+	if len(raw) < 2+count*2 {
+		return
+	}
+
+	for i := 0; i < count; i++ {
+		off := 2 + i*2
+		pktSeq := binary.BigEndian.Uint16(raw[off : off+2])
+
+		chunkPayload := c.retxBuf.Get(pktSeq)
+		if chunkPayload == nil {
+			continue
+		}
+
+		// Build RETX packet: type(1) + pktSeq(2) + chunkPayload
+		retxPkt := make([]byte, 3+len(chunkPayload))
+		retxPkt[0] = pktRETX
+		binary.BigEndian.PutUint16(retxPkt[1:3], pktSeq)
+		copy(retxPkt[3:], chunkPayload)
+
+		if err := c.sendRawVP8(retxPkt); err != nil {
+			slog.Info("rtpconn: retransmit failed", "pktSeq", pktSeq, "err", err)
+			return
+		}
+		slog.Info("rtpconn: retransmitted", "pktSeq", pktSeq)
+	}
+}
+
+// nackLoop periodically checks for gaps and sends NACK packets to the remote peer.
+func (c *RTPConn) nackLoop() {
+	ticker := time.NewTicker(nackCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
+			nacks := c.nackTrack.GetNACKs()
+			if len(nacks) == 0 {
+				continue
+			}
+
+			// Build NACK packet: type(1) + count(1) + [pktSeq(2)]*count
+			pkt := make([]byte, 2+len(nacks)*2)
+			pkt[0] = pktNACK
+			pkt[1] = byte(len(nacks))
+			for i, seq := range nacks {
+				binary.BigEndian.PutUint16(pkt[2+i*2:], seq)
+			}
+
+			if err := c.sendRawVP8(pkt); err != nil {
+				slog.Info("rtpconn: send NACK failed", "err", err)
+			} else {
+				slog.Info("rtpconn: sent NACK", "count", len(nacks), "seqs", nacks)
+			}
+		}
+	}
+}
+
+// sendRawVP8 wraps a reliability-layer packet in VP8 and writes to the publisher track.
+// All VP8 writes are paced to avoid overwhelming the SFU with burst frames.
+func (c *RTPConn) sendRawVP8(payload []byte) error {
+	c.seqMu.Lock()
+	elapsed := time.Since(c.lastWrite)
+	c.seqMu.Unlock()
+	if elapsed < writePace {
+		time.Sleep(writePace - elapsed)
+	}
+
+	frame := buildVP8Frame(payload)
+	err := c.pubTrack.WriteSample(media.Sample{
+		Data:     frame,
+		Duration: 33 * time.Millisecond,
+	})
+
+	c.seqMu.Lock()
+	c.lastWrite = time.Now()
+	c.seqMu.Unlock()
+
+	return err
 }
 
 // seqAfter returns true if a is after b in uint16 sequence space.
@@ -274,7 +467,6 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 
 	go func() {
 		defer func() {
-			// When this track closes, unlock SSRC if we held the lock.
 			c.lockedMu.Lock()
 			if c.lockedSSRC == ssrc {
 				slog.Info("rtpconn: track closed, unlocking SSRC", "ssrc", ssrc)
@@ -283,7 +475,7 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 			c.lockedMu.Unlock()
 		}()
 
-		var frameBuf []byte // accumulates VP8 payload across RTP packets
+		var frameBuf []byte
 
 		for {
 			select {
@@ -297,7 +489,6 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 				return
 			}
 
-			// If we've already locked to a different track, ignore this one.
 			c.lockedMu.Lock()
 			locked := c.lockedSSRC
 			c.lockedMu.Unlock()
@@ -305,54 +496,62 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 				continue
 			}
 
-			// Strip VP8 RTP payload descriptor to get raw VP8 bitstream.
 			vp8Payload := stripVP8Descriptor(pkt.Payload)
 			if vp8Payload == nil {
 				continue
 			}
 
-			// Check S bit (start of VP8 partition) in the first byte.
 			isStart := len(pkt.Payload) > 0 && (pkt.Payload[0]&0x10) != 0
 
 			if isStart {
-				// New frame — reset buffer.
 				frameBuf = append(frameBuf[:0], vp8Payload...)
 			} else {
-				// Continuation — append to buffer.
 				frameBuf = append(frameBuf, vp8Payload...)
 			}
 
-			// Marker bit = last packet of this frame.
 			if !pkt.Marker {
 				continue
 			}
 
-			// Frame complete — extract VPN data.
 			data := extractVP8Data(frameBuf)
 			if data == nil || len(data) == 0 {
-				continue // skip non-VPN frames and keepalive frames
+				continue
 			}
 
-			// Lock to this track — verify seq is reasonable to avoid ghost data.
-			if locked == 0 && len(data) >= 2 {
-				chunkSeq := binary.BigEndian.Uint16(data[0:2])
-				nrs := c.getNextReadSeq()
-				c.lockedMu.Lock()
-				if c.lockedSSRC == 0 {
-					if nrs == 0 || seqClose(chunkSeq, nrs) {
-						c.lockedSSRC = ssrc
-						slog.Info("rtpconn: locked to SSRC", "ssrc", ssrc, "chunkSeq", chunkSeq, "nextReadSeq", nrs)
-					} else {
-						c.lockedMu.Unlock()
-						slog.Info("rtpconn: rejected SSRC (seq mismatch)", "ssrc", ssrc, "chunkSeq", chunkSeq, "nextReadSeq", nrs)
+			// SSRC locking: verify the packet looks like valid VPN data.
+			// For DATA/RETX packets, extract writeSeq from chunkPayload and compare
+			// with nextReadSeq (both in write-sequence space).
+			// Format: pktType(1) + pktSeq(2) + writeSeq(2) + idx(1) + total(1) + data
+			if locked == 0 && len(data) >= 7 {
+				pktType := data[0]
+				if pktType == pktDATA || pktType == pktRETX {
+					writeSeq := binary.BigEndian.Uint16(data[3:5])
+					nrs := c.getNextReadSeq()
+					c.lockedMu.Lock()
+					if c.lockedSSRC == 0 {
+						if nrs == 0 || seqClose(writeSeq, nrs) {
+							c.lockedSSRC = ssrc
+							slog.Info("rtpconn: locked to SSRC", "ssrc", ssrc, "writeSeq", writeSeq, "nextReadSeq", nrs)
+						} else {
+							c.lockedMu.Unlock()
+							slog.Info("rtpconn: rejected SSRC (seq mismatch)", "ssrc", ssrc, "writeSeq", writeSeq, "nextReadSeq", nrs)
+							continue
+						}
+					}
+					c.lockedMu.Unlock()
+				} else if pktType == pktFEC || pktType == pktNACK {
+					if locked == 0 {
 						continue
 					}
 				}
-				c.lockedMu.Unlock()
 			}
 
+			// Copy data before sending — extractVP8Data returns a sub-slice of
+			// frameBuf which gets overwritten on the next RTP packet.
+			dataCopy := make([]byte, len(data))
+			copy(dataCopy, data)
 			select {
-			case c.readCh <- data:
+			case c.rawPktCh <- dataCopy:
 			case <-c.closeCh:
 				return
 			}
@@ -419,22 +618,9 @@ func (c *RTPConn) Write(p []byte) (int, error) {
 	default:
 	}
 
-	// Each Write is chunked into VP8 frames that fit in a single RTP packet
-	// (~1200 bytes). This avoids multi-packet VP8 frames which are fragile
-	// against RTP reordering in the SFU.
-	// Chunks include a 4-byte sequence header so the receiver can reassemble
-	// them in order even if VP8 frames arrive out of order.
 	seq := c.nextSeq()
 	totalChunks := (len(p) + maxVP8Data - 1) / maxVP8Data
 	for i := 0; i < totalChunks; i++ {
-		// Pace writes to avoid overwhelming the SFU.
-		c.seqMu.Lock()
-		elapsed := time.Since(c.lastWrite)
-		c.seqMu.Unlock()
-		if elapsed < writePace {
-			time.Sleep(writePace - elapsed)
-		}
-
 		off := i * maxVP8Data
 		end := off + maxVP8Data
 		if end > len(p) {
@@ -442,25 +628,43 @@ func (c *RTPConn) Write(p []byte) (int, error) {
 		}
 		chunk := p[off:end]
 
-		// Build chunked payload: seq(2) + idx(1) + total(1) + data
-		chunked := make([]byte, 4+len(chunk))
-		binary.BigEndian.PutUint16(chunked[0:2], seq)
-		chunked[2] = byte(i)
-		chunked[3] = byte(totalChunks)
-		copy(chunked[4:], chunk)
+		// Build chunkPayload: writeSeq(2) + idx(1) + total(1) + data
+		chunkPayload := make([]byte, 4+len(chunk))
+		binary.BigEndian.PutUint16(chunkPayload[0:2], seq)
+		chunkPayload[2] = byte(i)
+		chunkPayload[3] = byte(totalChunks)
+		copy(chunkPayload[4:], chunk)
 
-		frame := buildVP8Frame(chunked)
-		err := c.pubTrack.WriteSample(media.Sample{
-			Data:     frame,
-			Duration: 33 * time.Millisecond,
-		})
+		// Assign a packet-level sequence number.
+		pktSeq := c.nextPktSeqNum()
 
-		c.seqMu.Lock()
-		c.lastWrite = time.Now()
-		c.seqMu.Unlock()
+		// Store in retransmit buffer for NACK handling.
+		c.retxBuf.Store(pktSeq, chunkPayload)
 
-		if err != nil {
+		// Build reliability-layer packet: type(1) + pktSeq(2) + chunkPayload
+		pkt := make([]byte, 3+len(chunkPayload))
+		pkt[0] = pktDATA
+		binary.BigEndian.PutUint16(pkt[1:3], pktSeq)
+		copy(pkt[3:], chunkPayload)
+
+		// Send via paced VP8 writer.
+		if err := c.sendRawVP8(pkt); err != nil {
 			return off, fmt.Errorf("write VP8 sample: %w", err)
+		}
+
+		// Feed to FEC encoder. If a group is complete, send the parity packet.
+		xorPayload, firstSeq, count, fecReady := c.fecEncoder.AddPacket(pktSeq, chunkPayload)
+		if fecReady {
+			fecPkt := make([]byte, 5+len(xorPayload))
+			fecPkt[0] = pktFEC
+			binary.BigEndian.PutUint16(fecPkt[1:3], firstSeq)
+			fecPkt[3] = fecStride
+			fecPkt[4] = byte(count)
+			copy(fecPkt[5:], xorPayload)
+
+			if fecErr := c.sendRawVP8(fecPkt); fecErr != nil {
+				slog.Info("rtpconn: send FEC failed", "err", fecErr)
+			}
 		}
 	}
 	return len(p), nil
@@ -477,82 +681,62 @@ func (c *RTPConn) Close() error {
 var vpnMagic = []byte{0xCA, 0x11, 0xDA, 0x7A} // "call-data"
 
 // vp8Width and vp8Height are the dimensions encoded in VP8 keyframes.
-// Using realistic dimensions so the SFU treats our track as active video.
 const (
 	vp8Width  = 320
 	vp8Height = 240
 )
 
 // buildVP8Frame wraps VPN data in a VP8 keyframe.
-// Format: VP8 frame tag (3 bytes) + start code (3 bytes) + dimensions (4 bytes) +
-// magic (4 bytes) + length (2 bytes) + data + padding
 func buildVP8Frame(data []byte) []byte {
-	// VP8 keyframe frame tag:
-	// Bit 0: frame_type = 0 (keyframe)
-	// Bits 1-3: version = 0
-	// Bit 4: show_frame = 1
-	// Bits 5-23: first_partition_length (set to remaining bytes after the tag)
-	partLen := uint32(3 + 4 + 4 + 2 + len(data)) // start_code + dims + magic + len + data
+	partLen := uint32(3 + 4 + 4 + 2 + len(data))
 	tag0 := byte(0x10) | byte((partLen&0x7)<<5)
 	tag1 := byte((partLen >> 3) & 0xFF)
 	tag2 := byte((partLen >> 11) & 0xFF)
 
-	// VP8 dimensions encoding:
-	// width is 14 bits in bytes [6:7] (little-endian), top 2 bits = horizontal scale
-	// height is 14 bits in bytes [8:9] (little-endian), top 2 bits = vertical scale
 	wLo := byte(vp8Width & 0xFF)
-	wHi := byte((vp8Width >> 8) & 0x3F) // 14-bit, no scale
+	wHi := byte((vp8Width >> 8) & 0x3F)
 	hLo := byte(vp8Height & 0xFF)
-	hHi := byte((vp8Height >> 8) & 0x3F) // 14-bit, no scale
+	hHi := byte((vp8Height >> 8) & 0x3F)
 
-	totalPayload := 4 + 2 + len(data) // magic + len + data
+	totalPayload := 4 + 2 + len(data)
 
-	// All frames are padded to at least 1KB so the SFU treats them as
-	// real video and doesn't drop them. With maxVP8Data=1100, the largest
-	// frame is 16+1100=1116 bytes (fits in one RTP packet ~1200 bytes).
 	const minFrameSize = 1024
 	padLen := 0
-	if totalPayload < minFrameSize-10 { // 10 = tag+startcode+dims
+	if totalPayload < minFrameSize-10 {
 		padLen = minFrameSize - 10 - totalPayload
 	}
 
 	buf := make([]byte, 0, 3+3+4+totalPayload+padLen)
-	buf = append(buf, tag0, tag1, tag2)   // frame tag
-	buf = append(buf, 0x9d, 0x01, 0x2a)   // VP8 start code
-	buf = append(buf, wLo, wHi)           // width = 320
-	buf = append(buf, hLo, hHi)           // height = 240
-	buf = append(buf, vpnMagic...)         // magic marker
+	buf = append(buf, tag0, tag1, tag2)
+	buf = append(buf, 0x9d, 0x01, 0x2a)
+	buf = append(buf, wLo, wHi)
+	buf = append(buf, hLo, hHi)
+	buf = append(buf, vpnMagic...)
 	lenBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(lenBuf, uint16(len(data)))
-	buf = append(buf, lenBuf...)           // data length
-	buf = append(buf, data...)             // actual VPN data
+	buf = append(buf, lenBuf...)
+	buf = append(buf, data...)
 	if padLen > 0 {
-		buf = append(buf, make([]byte, padLen)...) // zero padding
+		buf = append(buf, make([]byte, padLen)...)
 	}
 	return buf
 }
 
 // extractVP8Data extracts VPN data from a reassembled VP8 bitstream.
-// The input is raw VP8 data (RTP payload descriptor already stripped).
-// Returns nil if the data is not a VPN data frame.
 func extractVP8Data(vp8 []byte) []byte {
-	// VP8 keyframe: frame tag (3 bytes) + start code (3 bytes) + dims (4 bytes) + magic (4 bytes) + len (2 bytes) + data
 	if len(vp8) < 3+3+4+4+2 {
 		return nil
 	}
 
-	// Check frame_type = keyframe (bit 0 of byte 0)
 	if vp8[0]&0x01 != 0 {
-		return nil // not a keyframe
+		return nil
 	}
 
-	// Check VP8 start code
 	if vp8[3] != 0x9d || vp8[4] != 0x01 || vp8[5] != 0x2a {
 		return nil
 	}
 
-	// Check magic
-	magicOffset := 3 + 3 + 4 // frame_tag + start_code + dimensions
+	magicOffset := 3 + 3 + 4
 	if vp8[magicOffset] != vpnMagic[0] ||
 		vp8[magicOffset+1] != vpnMagic[1] ||
 		vp8[magicOffset+2] != vpnMagic[2] ||
@@ -560,7 +744,6 @@ func extractVP8Data(vp8 []byte) []byte {
 		return nil
 	}
 
-	// Read length
 	lenOffset := magicOffset + 4
 	dataLen := int(binary.BigEndian.Uint16(vp8[lenOffset:]))
 	dataOffset := lenOffset + 2
