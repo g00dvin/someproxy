@@ -67,6 +67,9 @@ func (s *Server) Close() error {
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
+	// Set a deadline for the SOCKS5 handshake to prevent stalls.
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
 	// 1. Auth negotiation
 	if err := s.negotiate(conn); err != nil {
 		s.Logger.Debug("socks5 negotiate failed", "err", err)
@@ -106,6 +109,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	if err := s.sendReply(conn, 0x00); err != nil {
 		return
 	}
+
+	// Clear deadline before relay — tunnel stays open indefinitely.
+	conn.SetDeadline(time.Time{})
 
 	// 5. Bidirectional copy
 	s.relay(conn, remote)
@@ -188,17 +194,27 @@ func (s *Server) sendReply(conn net.Conn, rep byte) error {
 }
 
 func (s *Server) relay(client net.Conn, remote io.ReadWriteCloser) {
+	// When one direction finishes (EOF or error), close both connections
+	// to unblock the other io.Copy goroutine.
+	var once sync.Once
+	closeAll := func() {
+		client.Close()
+		remote.Close()
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		io.Copy(remote, client)
+		once.Do(closeAll)
 	}()
 
 	go func() {
 		defer wg.Done()
 		io.Copy(client, remote)
+		once.Do(closeAll)
 	}()
 
 	wg.Wait()

@@ -25,6 +25,7 @@ type WebRTCTransport struct {
 	subscriber *webrtc.PeerConnection
 	goloom     *GoloomClient
 	logger     *slog.Logger
+	obfKey     [32]byte // XOR obfuscation key for VP8 payload masking
 
 	pubVideo *webrtc.TrackLocalStaticSample // publisher video track for data
 	rtpConn  *RTPConn                       // RTP-based data transport
@@ -38,8 +39,8 @@ type WebRTCTransport struct {
 // EstablishWebRTC creates WebRTC PeerConnections through the Goloom SFU
 // and returns a bidirectional RTPConn for VPN data.
 // Blocks until the subscriber receives a video track from another participant.
-func EstablishWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger) (*RTPConn, error) {
-	t, err := SetupWebRTC(ctx, goloom, logger)
+func EstablishWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger, obfKey [32]byte) (*RTPConn, error) {
+	t, err := SetupWebRTC(ctx, goloom, logger, obfKey)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +55,7 @@ func EstablishWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Log
 
 // SetupWebRTC creates WebRTC PeerConnections, sends updateMe/setSlots,
 // and starts keepalive. Returns immediately without waiting for subscriber track.
-func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger) (*WebRTCTransport, error) {
+func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger, obfKey [32]byte) (*WebRTCTransport, error) {
 	iceServers := goloom.ICEServers()
 
 	api := webrtc.NewAPI()
@@ -62,6 +63,7 @@ func SetupWebRTC(ctx context.Context, goloom *GoloomClient, logger *slog.Logger)
 	t := &WebRTCTransport{
 		goloom:   goloom,
 		logger:   logger,
+		obfKey:   obfKey,
 		subReady: make(chan struct{}),
 	}
 
@@ -166,7 +168,7 @@ func (t *WebRTCTransport) setupPublisher(ctx context.Context, api *webrtc.API, i
 	}()
 
 	// Create RTPConn using this video track.
-	t.rtpConn = NewRTPConn(videoTrack)
+	t.rtpConn = NewRTPConn(videoTrack, t.obfKey)
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		t.logger.Info("publisher ICE state", "state", state.String())
@@ -413,7 +415,7 @@ func (t *WebRTCTransport) videoKeepAlive(ctx context.Context) {
 			if t.closed {
 				return
 			}
-			frame := buildVP8Frame(nil)
+			frame := buildVP8Frame(nil, t.obfKey)
 			t.pubVideo.WriteSample(media.Sample{
 				Data:     frame,
 				Duration: videoKeepAliveInterval,

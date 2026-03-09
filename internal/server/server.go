@@ -311,6 +311,14 @@ func (s *Server) runOneTelemostSession(ctx context.Context, svc *telemost.Servic
 
 	s.cfg.Logger.Info("Telemost WebRTC connection established")
 
+	// Validate auth token before creating MUX.
+	if s.cfg.AuthToken != "" {
+		if err := mux.ValidateAuthToken(conn, s.cfg.AuthToken); err != nil {
+			return fmt.Errorf("telemost auth: %w", err)
+		}
+		s.cfg.Logger.Info("Telemost client authenticated")
+	}
+
 	m := mux.New(s.cfg.Logger, conn)
 	defer m.Close()
 

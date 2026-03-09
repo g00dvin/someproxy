@@ -35,6 +35,7 @@ const (
 // Service implements provider.Service for Yandex Telemost.
 type Service struct {
 	meetingID string
+	obfKey    [32]byte // XOR obfuscation key for VP8 payload masking
 }
 
 // Compile-time check.
@@ -42,9 +43,13 @@ var _ provider.Service = (*Service)(nil)
 
 // NewService creates a Telemost service provider.
 // meetingURL can be a full URL (https://telemost.yandex.com/j/12345) or just the meeting ID.
-func NewService(meetingURL string) *Service {
+// authToken is used to derive the obfuscation key for VP8 payload masking.
+func NewService(meetingURL string, authToken string) *Service {
 	id := extractMeetingID(meetingURL)
-	return &Service{meetingID: id}
+	return &Service{
+		meetingID: id,
+		obfKey:    DeriveObfuscationKey(authToken),
+	}
 }
 
 func (s *Service) Name() string { return "telemost" }
@@ -150,7 +155,7 @@ func (s *Service) Setup(ctx context.Context, logger *slog.Logger) (*PendingConn,
 		return nil, fmt.Errorf("goloom connect: %w", err)
 	}
 
-	transport, err := SetupWebRTC(ctx, goloom, logger.With("component", "webrtc"))
+	transport, err := SetupWebRTC(ctx, goloom, logger.With("component", "webrtc"), s.obfKey)
 	if err != nil {
 		goloom.Close()
 		return nil, fmt.Errorf("setup webrtc: %w", err)

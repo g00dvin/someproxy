@@ -312,7 +312,7 @@ func (s *appState) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	var svc provider.Service
 	if telemost.IsTelemostLink(link) {
-		svc = telemost.NewService(link)
+		svc = telemost.NewService(link, authToken)
 	} else {
 		svc = vk.NewService(link)
 	}

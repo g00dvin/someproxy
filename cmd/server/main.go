@@ -40,7 +40,7 @@ func main() {
 	// Enable relay-to-relay mode with the appropriate service.
 	if *callLink != "" {
 		if telemost.IsTelemostLink(*callLink) {
-			cfg.Service = telemost.NewService(*callLink)
+			cfg.Service = telemost.NewService(*callLink, *authToken)
 		} else {
 			cfg.Service = vk.NewService(*callLink)
 		}

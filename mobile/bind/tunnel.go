@@ -163,7 +163,7 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	}
 	t.cfg = cfg
 	if telemost.IsTelemostLink(cfg.CallLink) {
-		t.svc = telemost.NewService(cfg.CallLink)
+		t.svc = telemost.NewService(cfg.CallLink, cfg.Token)
 	} else {
 		t.svc = vk.NewService(cfg.CallLink)
 	}

@@ -1,6 +1,7 @@
 package telemost
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -45,6 +46,7 @@ const (
 
 type RTPConn struct {
 	pubTrack *webrtc.TrackLocalStaticSample // publisher video track (write path)
+	obfKey   [32]byte                       // XOR obfuscation key for payload masking
 	once     sync.Once
 	closeCh  chan struct{}
 
@@ -83,10 +85,22 @@ type reassemblyBuf struct {
 	got    int
 }
 
+// DeriveObfuscationKey computes a 32-byte XOR key from a passphrase.
+// If passphrase is empty, a fixed default key is used so that the protocol
+// signatures (vpnMagic, pktType headers) are still masked in the VP8 stream.
+func DeriveObfuscationKey(passphrase string) [32]byte {
+	if passphrase == "" {
+		passphrase = "call-vpn-default-obfuscation"
+	}
+	return sha256.Sum256([]byte(passphrase + "\x00obfuscate"))
+}
+
 // NewRTPConn creates a bidirectional connection using RTP video tracks.
-func NewRTPConn(pubTrack *webrtc.TrackLocalStaticSample) *RTPConn {
+// obfKey is used to XOR-mask VP8 payload data (hiding protocol signatures).
+func NewRTPConn(pubTrack *webrtc.TrackLocalStaticSample, obfKey [32]byte) *RTPConn {
 	c := &RTPConn{
 		pubTrack:   pubTrack,
+		obfKey:     obfKey,
 		closeCh:    make(chan struct{}),
 		rawPktCh:   make(chan []byte, 256),
 		readCh:     make(chan []byte, 256),
@@ -417,7 +431,7 @@ func (c *RTPConn) sendRawVP8(payload []byte) error {
 		time.Sleep(writePace - elapsed)
 	}
 
-	frame := buildVP8Frame(payload)
+	frame := buildVP8Frame(payload, c.obfKey)
 	err := c.pubTrack.WriteSample(media.Sample{
 		Data:     frame,
 		Duration: 33 * time.Millisecond,
@@ -513,7 +527,7 @@ func (c *RTPConn) HandleTrack(track *webrtc.TrackRemote) {
 				continue
 			}
 
-			data := extractVP8Data(frameBuf)
+			data := extractVP8Data(frameBuf, c.obfKey)
 			if data == nil || len(data) == 0 {
 				continue
 			}
@@ -686,8 +700,18 @@ const (
 	vp8Height = 240
 )
 
-// buildVP8Frame wraps VPN data in a VP8 keyframe.
-func buildVP8Frame(data []byte) []byte {
+// obfuscateVP8Payload XORs the data area of a VP8 frame (from offset 10)
+// with a repeating 32-byte key. This hides vpnMagic, packet type headers,
+// and structured data from the SFU and any DPI on the media path.
+func obfuscateVP8Payload(buf []byte, key [32]byte) {
+	const vp8HeaderLen = 10 // 3 (tag) + 3 (start code) + 4 (dimensions)
+	for i := vp8HeaderLen; i < len(buf); i++ {
+		buf[i] ^= key[(i-vp8HeaderLen)%32]
+	}
+}
+
+// buildVP8Frame wraps VPN data in a VP8 keyframe and XOR-obfuscates the payload.
+func buildVP8Frame(data []byte, key [32]byte) []byte {
 	partLen := uint32(3 + 4 + 4 + 2 + len(data))
 	tag0 := byte(0x10) | byte((partLen&0x7)<<5)
 	tag1 := byte((partLen >> 3) & 0xFF)
@@ -719,11 +743,16 @@ func buildVP8Frame(data []byte) []byte {
 	if padLen > 0 {
 		buf = append(buf, make([]byte, padLen)...)
 	}
+
+	// XOR-obfuscate everything after the VP8 header.
+	obfuscateVP8Payload(buf, key)
+
 	return buf
 }
 
 // extractVP8Data extracts VPN data from a reassembled VP8 bitstream.
-func extractVP8Data(vp8 []byte) []byte {
+// The payload area is XOR-deobfuscated before checking the magic marker.
+func extractVP8Data(vp8 []byte, key [32]byte) []byte {
 	if len(vp8) < 3+3+4+4+2 {
 		return nil
 	}
@@ -735,6 +764,9 @@ func extractVP8Data(vp8 []byte) []byte {
 	if vp8[3] != 0x9d || vp8[4] != 0x01 || vp8[5] != 0x2a {
 		return nil
 	}
+
+	// Deobfuscate the payload area (from offset 10) in-place.
+	obfuscateVP8Payload(vp8, key)
 
 	magicOffset := 3 + 3 + 4
 	if vp8[magicOffset] != vpnMagic[0] ||

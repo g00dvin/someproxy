@@ -54,7 +54,7 @@ func main() {
 	// Create call service provider (auto-detect from link).
 	var svc provider.Service
 	if telemost.IsTelemostLink(*callLink) {
-		svc = telemost.NewService(*callLink)
+		svc = telemost.NewService(*callLink, *authToken)
 	} else {
 		svc = vk.NewService(*callLink)
 	}
@@ -118,6 +118,24 @@ func runTelemost(ctx context.Context, logger *slog.Logger, siren *monitoring.Sir
 	if len(muxConns) == 0 {
 		logger.Error("no Telemost connections established")
 		os.Exit(1)
+	}
+
+	// Send auth token on each connection before MUX takes over.
+	if authToken != "" {
+		var authed []io.ReadWriteCloser
+		for i, conn := range muxConns {
+			if err := mux.WriteAuthToken(conn, authToken); err != nil {
+				logger.Warn("write auth token failed (telemost)", "index", i, "err", err)
+				conn.Close()
+				continue
+			}
+			authed = append(authed, conn)
+		}
+		muxConns = authed
+		if len(muxConns) == 0 {
+			logger.Error("all Telemost connections failed auth handshake")
+			os.Exit(1)
+		}
 	}
 
 	m := mux.New(logger, muxConns...)
