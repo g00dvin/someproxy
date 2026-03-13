@@ -897,14 +897,25 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 			return 0, err
 		}
 
-		ch := m.RawPackets()
-		if ch == nil {
+		rb := m.RawPackets()
+		if rb == nil {
 			return 0, fmt.Errorf("raw packet mode not enabled")
 		}
 
+		// Try to pop a frame without blocking first.
+		if f, ok := rb.Pop(); ok {
+			if len(f.Payload) == 0 {
+				continue
+			}
+			n := copy(buf, f.Payload)
+			return n, nil
+		}
+
+		// Wait for data or shutdown.
 		select {
-		case frame, ok := <-ch:
+		case _, ok := <-rb.Ready():
 			if !ok {
+				// Ring buffer closed (mux died). Retry with new mux.
 				select {
 				case <-t.rootCtx.Done():
 					return 0, fmt.Errorf("tunnel stopped")
@@ -912,11 +923,14 @@ func (t *Tunnel) ReadPacket(buf []byte) (int, error) {
 					continue
 				}
 			}
-			if len(frame.Payload) == 0 {
-				continue
+			// Signaled — pop again.
+			if f, ok := rb.Pop(); ok {
+				if len(f.Payload) == 0 {
+					continue
+				}
+				n := copy(buf, f.Payload)
+				return n, nil
 			}
-			n := copy(buf, frame.Payload)
-			return n, nil
 		case <-t.rootCtx.Done():
 			return 0, fmt.Errorf("tunnel stopped")
 		}
@@ -1006,6 +1020,18 @@ func (t *Tunnel) OnNetworkChanged() {
 	if t.networkDebounce != nil {
 		t.networkDebounce.Stop()
 	}
+
+	// Drain stale packets immediately — during a phone call or network
+	// stall, TCP retransmits buffer old data that apps have already
+	// timed out on. Clearing the buffer ensures fresh responses get through.
+	if m := t.m; m != nil {
+		if rb := m.RawPackets(); rb != nil {
+			if n := rb.Drain(); n > 0 {
+				t.logger.Info("drained stale raw packets on network change", "count", n)
+			}
+		}
+	}
+
 	force := t.networkForce
 	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
 		t.logger.Info("network change debounce fired, forcing full reconnect")

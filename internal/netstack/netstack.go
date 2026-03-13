@@ -124,17 +124,25 @@ func (ns *Stack) Close() {
 // inboundLoop reads raw IP packets from the mux and injects them into gVisor.
 func (ns *Stack) inboundLoop() {
 	defer ns.wg.Done()
-	rawCh := ns.m.RawPackets()
-	if rawCh == nil {
+	rb := ns.m.RawPackets()
+	if rb == nil {
 		return
 	}
 	for {
+		// Drain all available frames before waiting.
+		for {
+			f, ok := rb.Pop()
+			if !ok {
+				break
+			}
+			ns.injectPacket(f.Payload)
+		}
+
 		select {
-		case f, ok := <-rawCh:
+		case _, ok := <-rb.Ready():
 			if !ok {
 				return
 			}
-			ns.injectPacket(f.Payload)
 		case <-ns.ctx.Done():
 			return
 		}

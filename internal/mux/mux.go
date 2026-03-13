@@ -117,8 +117,7 @@ type Mux struct {
 	closeInFrames  sync.Once
 	idleTimeout    time.Duration // 0 = no idle timeout
 
-	rawPackets   chan *Frame // if set, StreamID=0 FrameData is routed here by DispatchLoop
-	closeRawOnce sync.Once
+	rawPackets   *RawRingBuffer // if set, StreamID=0 FrameData is routed here by DispatchLoop
 
 	acceptedStreams   chan *Stream // DispatchLoop pushes FrameOpen streams here
 	closeAcceptOnce  sync.Once
@@ -329,17 +328,18 @@ func (m *Mux) RecvFrames() <-chan *Frame {
 	return m.inFrames
 }
 
-// EnableRawPackets creates a dedicated channel for raw IP packets
+// EnableRawPackets creates a ring buffer for raw IP packets
 // (StreamID=0, FrameData). DispatchLoop routes matching frames here
-// instead of dispatching them as stream data. Must be called before
-// DispatchLoop is started.
+// instead of dispatching them as stream data. When the buffer is full,
+// the oldest frame is evicted (not the newest), so fresh responses
+// take priority over stale data. Must be called before DispatchLoop.
 func (m *Mux) EnableRawPackets(bufSize int) {
-	m.rawPackets = make(chan *Frame, bufSize)
+	m.rawPackets = NewRawRingBuffer(bufSize)
 }
 
-// RawPackets returns the channel for raw IP packets, or nil if
+// RawPackets returns the ring buffer for raw IP packets, or nil if
 // EnableRawPackets was not called.
-func (m *Mux) RawPackets() <-chan *Frame {
+func (m *Mux) RawPackets() *RawRingBuffer {
 	return m.rawPackets
 }
 
@@ -519,7 +519,7 @@ func (m *Mux) Close() error {
 	m.cancel()
 	m.closeInFrames.Do(func() { close(m.inFrames) })
 	if m.rawPackets != nil {
-		m.closeRawOnce.Do(func() { close(m.rawPackets) })
+		m.rawPackets.Close()
 	}
 	if m.acceptedStreams != nil {
 		m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
@@ -624,7 +624,7 @@ func (m *Mux) dispatch(f *Frame) {
 func (m *Mux) DispatchLoop(ctx context.Context) {
 	defer func() {
 		if m.rawPackets != nil {
-			m.closeRawOnce.Do(func() { close(m.rawPackets) })
+			m.rawPackets.Close()
 		}
 		if m.acceptedStreams != nil {
 			m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
@@ -667,12 +667,10 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 				}
 				continue
 			}
-			// Route raw IP packets to dedicated channel.
+			// Route raw IP packets to ring buffer (evicts oldest on overflow).
 			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
-				select {
-				case m.rawPackets <- f:
-				default:
-					m.logger.Warn("raw packet buffer full, dropping frame")
+				if evicted := m.rawPackets.Push(f); evicted > 0 {
+					m.logger.Warn("raw packet buffer full, evicted oldest frame")
 				}
 				continue
 			}
