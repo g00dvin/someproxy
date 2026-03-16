@@ -873,21 +873,27 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
 
     // Load installed apps in background
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
+        val apps = withContext(Dispatchers.IO) {
             val pm = context.packageManager
-            val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
-                .mapNotNull { appInfo ->
-                    // Skip apps without a launcher intent (system services)
-                    if (pm.getLaunchIntentForPackage(appInfo.packageName) == null) return@mapNotNull null
-                    AppInfo(
-                        packageName = appInfo.packageName,
-                        label = appInfo.loadLabel(pm).toString(),
-                    )
-                }
-                .sortedBy { it.label.lowercase() }
-            allApps = apps
-            loading = false
+            try {
+                pm.getInstalledApplications(0)
+                    .mapNotNull { appInfo ->
+                        try {
+                            val intent = pm.getLaunchIntentForPackage(appInfo.packageName)
+                            if (intent == null) return@mapNotNull null
+                            AppInfo(
+                                packageName = appInfo.packageName,
+                                label = try { appInfo.loadLabel(pm).toString() } catch (_: Exception) { appInfo.packageName },
+                            )
+                        } catch (_: Exception) { null }
+                    }
+                    .sortedBy { it.label.lowercase() }
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
+        allApps = apps
+        loading = false
     }
 
     val filteredApps = remember(allApps, searchQuery) {
@@ -955,15 +961,11 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
                             .fillMaxWidth(),
                         contentAlignment = Alignment.Center
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator()
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                "Загрузка приложений...",
-                                fontSize = 13.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
+                        Text(
+                            "Загрузка приложений...",
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 } else {
                     LazyColumn(
