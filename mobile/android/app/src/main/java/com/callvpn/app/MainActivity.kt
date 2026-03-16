@@ -16,6 +16,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -39,8 +42,11 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 enum class VpnState { Disconnected, Connecting, Connected }
 
@@ -242,6 +248,9 @@ fun CallVpnScreen(
     var showEditor by remember { mutableStateOf(false) }
     var editingProfile by remember { mutableStateOf<Profile?>(null) }
 
+    // Excluded apps
+    var showExcludedApps by remember { mutableStateOf(false) }
+
     // Root detection for WiFi hotspot routing
     val rootManager = remember { RootManager(context) }
     var rootAvailable by remember { mutableStateOf(false) }
@@ -428,6 +437,20 @@ fun CallVpnScreen(
             )
         }
 
+        // Excluded apps button
+        OutlinedButton(
+            onClick = { showExcludedApps = true },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+        ) {
+            Text(
+                text = "Исключённые приложения",
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+
         // WiFi Hotspot routing toggle (only visible if root is available)
         if (rootAvailable) {
             Spacer(modifier = Modifier.height(16.dp))
@@ -533,6 +556,11 @@ fun CallVpnScreen(
                 }
             }
         }
+    }
+
+    // Excluded apps dialog
+    if (showExcludedApps) {
+        ExcludedAppsDialog(onDismiss = { showExcludedApps = false })
     }
 
     // Profile editor dialog
@@ -824,5 +852,196 @@ fun ProfileEditorDialog(
                 }
             }
         )
+    }
+}
+
+data class AppInfo(
+    val packageName: String,
+    val label: String,
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ExcludedAppsDialog(onDismiss: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val excludedAppsManager = remember { ExcludedAppsManager(context) }
+
+    var allApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var excludedPackages by remember { mutableStateOf(excludedAppsManager.getExcludedPackages()) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    // Load installed apps in background
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) {
+            val pm = context.packageManager
+            val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+                .mapNotNull { appInfo ->
+                    // Skip apps without a launcher intent (system services)
+                    if (pm.getLaunchIntentForPackage(appInfo.packageName) == null) return@mapNotNull null
+                    AppInfo(
+                        packageName = appInfo.packageName,
+                        label = appInfo.loadLabel(pm).toString(),
+                    )
+                }
+                .sortedBy { it.label.lowercase() }
+            allApps = apps
+            loading = false
+        }
+    }
+
+    val filteredApps = remember(allApps, searchQuery) {
+        if (searchQuery.isBlank()) allApps
+        else {
+            val q = searchQuery.lowercase()
+            allApps.filter {
+                it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q)
+            }
+        }
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.95f)
+                .fillMaxHeight(0.85f),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // Header
+                Text(
+                    text = "Исключённые приложения",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(start = 24.dp, top = 24.dp, end = 24.dp, bottom = 8.dp)
+                )
+                Text(
+                    text = "Отмеченные приложения не используют VPN",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Search field
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Поиск приложений") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(20.dp))
+                    },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    shape = RoundedCornerShape(12.dp)
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                // App list
+                if (loading) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator()
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                "Загрузка приложений...",
+                                fontSize = 13.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        items(filteredApps, key = { it.packageName }) { app ->
+                            val isForced = app.packageName in ExcludedAppsManager.FORCED_PACKAGES
+                            val isExcluded = app.packageName in excludedPackages
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = !isForced) {
+                                        excludedPackages = if (isExcluded) {
+                                            excludedPackages - app.packageName
+                                        } else {
+                                            excludedPackages + app.packageName
+                                        }
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = app.label,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = app.packageName,
+                                        fontSize = 11.sp,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Checkbox(
+                                    checked = isExcluded,
+                                    onCheckedChange = if (isForced) null else { checked ->
+                                        excludedPackages = if (checked) {
+                                            excludedPackages + app.packageName
+                                        } else {
+                                            excludedPackages - app.packageName
+                                        }
+                                    },
+                                    enabled = !isForced,
+                                    colors = CheckboxDefaults.colors(
+                                        checkedColor = Color(0xFF4CAF50),
+                                        checkmarkColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Bottom buttons
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text("Отмена")
+                    }
+                    Button(
+                        onClick = {
+                            excludedAppsManager.setExcludedPackages(excludedPackages)
+                            onDismiss()
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF4CAF50)
+                        )
+                    ) {
+                        Text("Сохранить", color = Color.White)
+                    }
+                }
+            }
+        }
     }
 }
