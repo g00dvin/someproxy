@@ -113,7 +113,11 @@ func (s *Server) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	<-s.done
+	select {
+	case <-s.done:
+	case <-time.After(30 * time.Second):
+		s.cfg.Logger.Warn("server stop timed out after 30s")
+	}
 }
 
 // Done returns a channel that's closed when the server stops.
@@ -262,15 +266,6 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 			case <-sessCtx.Done():
 				return
 			}
-		}
-	}()
-
-	go func() {
-		timer := time.NewTimer(5 * time.Minute)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-sessCtx.Done():
 		}
 	}()
 
