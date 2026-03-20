@@ -667,10 +667,10 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 				}
 				continue
 			}
-			// Route raw IP packets to ring buffer (evicts oldest on overflow).
+			// Route raw IP packets to ring buffer (blocks when full for backpressure).
 			if f.StreamID == 0 && f.Type == FrameData && m.rawPackets != nil {
-				if evicted := m.rawPackets.Push(f); evicted > 0 {
-					m.logger.Warn("raw packet buffer full, evicted oldest frame")
+				if err := m.rawPackets.Push(ctx, f); err != nil {
+					return
 				}
 				continue
 			}

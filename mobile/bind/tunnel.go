@@ -504,7 +504,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 	ready := t.muxReady
 	t.mu.Unlock()
 
-	state.m.EnableRawPackets(256)
+	state.m.EnableRawPackets(2048)
 	state.m.SetIdleTimeout(15 * time.Second)
 	go state.m.DispatchLoop(muxCtx)
 	go state.m.StartPingLoop(muxCtx, 5*time.Second)
