@@ -115,7 +115,7 @@ type Mux struct {
 	allDead        chan struct{}
 	allDeadOnce    sync.Once
 	closeInFrames  sync.Once
-	idleTimeout    time.Duration // 0 = no idle timeout
+	idleTimeoutNs  atomic.Int64  // nanoseconds, 0 = no idle timeout
 
 	rawPackets   *RawRingBuffer // if set, StreamID=0 FrameData is routed here by DispatchLoop
 
@@ -167,7 +167,7 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 // If no data arrives within the timeout, the readLoop closes.
 // The peer's ping loop (default 30s) prevents false triggers.
 func (m *Mux) SetIdleTimeout(d time.Duration) {
-	m.idleTimeout = d
+	m.idleTimeoutNs.Store(int64(d))
 }
 
 // SetMaxStreams sets the maximum number of concurrent streams.
@@ -196,9 +196,9 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 	}()
 	br := bufio.NewReaderSize(mc.conn, 16384)
 	for {
-		if m.idleTimeout > 0 {
+		if ns := m.idleTimeoutNs.Load(); ns > 0 {
 			if d, ok := mc.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-				d.SetReadDeadline(time.Now().Add(m.idleTimeout))
+				d.SetReadDeadline(time.Now().Add(time.Duration(ns)))
 			}
 		}
 		f, err := ReadFrame(br)
