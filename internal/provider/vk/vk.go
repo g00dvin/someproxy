@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
-	internalsignal "github.com/call-vpn/call-vpn/internal/signal"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
 )
@@ -112,7 +111,7 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 
 // ConnectSignaling connects to VK WebSocket signaling.
 func (s *Service) ConnectSignaling(ctx context.Context, info *provider.JoinInfo, logger *slog.Logger) (provider.SignalingClient, error) {
-	return internalsignal.Connect(ctx, info.WSEndpoint, logger)
+	return ConnectSignaling(ctx, info.WSEndpoint, logger)
 }
 
 // --- VK auth chain (private) ---
