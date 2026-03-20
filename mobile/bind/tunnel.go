@@ -443,6 +443,8 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			results <- dtlsResult{index: i, err: err}
 			continue
 		}
+		// Store peer address for TURN keepalive (relay-level WriteTo).
+		allocs[i].PeerAddr = serverUDP
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
 			internaldtls.PunchRelay(relayConn, addr)
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
@@ -855,7 +857,6 @@ func (t *Tunnel) OnNetworkChanged() {
 	const (
 		debounceDelay = 2 * time.Second
 		gracePeriod   = 15 * time.Second // WiFi DHCP/IPv6 SLAAC can take 10-20s to settle
-		healthProbe   = 8 * time.Second  // recent pong within this window = healthy
 	)
 
 	t.mu.Lock()
@@ -889,16 +890,7 @@ func (t *Tunnel) OnNetworkChanged() {
 	}
 
 	force := t.networkForce
-	mux := t.m
 	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
-		// Check if connections are still healthy before tearing down.
-		// A spurious network event (e.g. WiFi DHCP renewal) should not
-		// kill a working tunnel.
-		if mux != nil && mux.ActiveConns() > 0 && mux.IsHealthy(healthProbe) {
-			t.logger.Info("network change debounce fired but tunnel is healthy, skipping reconnect",
-				"active", mux.ActiveConns())
-			return
-		}
 		t.logger.Info("network change debounce fired, forcing full reconnect")
 		t.teardownMux()
 		select {

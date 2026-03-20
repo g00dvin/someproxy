@@ -236,6 +236,7 @@ func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan []byt
 	if err != nil {
 		return fmt.Errorf("resolve server addr: %w", err)
 	}
+	alloc.PeerAddr = serverUDP
 
 	// Punch and DTLS dial.
 	punchCtx, punchCancel := context.WithCancel(ctx)
