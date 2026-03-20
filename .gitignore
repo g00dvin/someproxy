@@ -8,6 +8,7 @@
 /client
 /tmp
 /logs
+/docs
 # Test
 *.test
 *.out
@@ -47,3 +48,7 @@ test/integration/.env
 *.p12
 *.mobileprovision
 *.jks
+
+.serena
+.claude
+CLAUDE.md
