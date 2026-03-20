@@ -203,6 +203,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 	m.EnableRawPackets(2048)
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
+	m.SetMaxStreams(10000)
 
 	sess := &session{
 		m:      m,
@@ -587,6 +588,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	m.EnableRawPackets(2048)
 	m.EnableStreamAccept(64)
 	m.SetIdleTimeout(90 * time.Second)
+	m.SetMaxStreams(10000)
 
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()

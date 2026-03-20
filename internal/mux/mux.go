@@ -126,6 +126,9 @@ type Mux struct {
 	reconnecting atomic.Int32   // active reconnect count; prevents premature allDead close
 
 	lastPongAt atomic.Int64 // unix nano of last received Pong on any connection
+
+	maxStreams   int          // 0 = unlimited
+	streamCount atomic.Int32 // current active stream count
 }
 
 type muxConn struct {
@@ -165,6 +168,12 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 // The peer's ping loop (default 30s) prevents false triggers.
 func (m *Mux) SetIdleTimeout(d time.Duration) {
 	m.idleTimeout = d
+}
+
+// SetMaxStreams sets the maximum number of concurrent streams.
+// 0 means unlimited (default). Must be called before DispatchLoop.
+func (m *Mux) SetMaxStreams(n int) {
+	m.maxStreams = n
 }
 
 // readLoop reads frames from a single underlying connection.
@@ -555,6 +564,7 @@ func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 		recv:         make(chan []byte, 1024),
 		assignedConn: assigned,
 	}
+	m.streamCount.Add(1)
 	m.streams.Store(id, s)
 
 	err := m.sendFrameOn(assigned, &Frame{
@@ -564,6 +574,7 @@ func (m *Mux) OpenStream(id uint32) (*Stream, error) {
 	})
 	if err != nil {
 		m.streams.Delete(id)
+		m.streamCount.Add(-1)
 		return nil, err
 	}
 	return s, nil
@@ -578,11 +589,16 @@ func (m *Mux) AcceptStream(ctx context.Context) (*Stream, error) {
 				return nil, ErrMuxClosed
 			}
 			if f.Type == FrameOpen {
+				if m.maxStreams > 0 && int(m.streamCount.Load()) >= m.maxStreams {
+					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
+					continue
+				}
 				s := &Stream{
 					ID:   f.StreamID,
 					mux:  m,
 					recv: make(chan []byte, 1024),
 				}
+				m.streamCount.Add(1)
 				m.streams.Store(f.StreamID, s)
 				return s, nil
 			}
@@ -612,6 +628,7 @@ func (m *Mux) dispatch(f *Frame) {
 		s.closed.Store(true)
 		close(s.recv)
 		m.streams.Delete(f.StreamID)
+		m.streamCount.Add(-1)
 	}
 }
 
@@ -675,12 +692,17 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 				continue
 			}
 			if f.Type == FrameOpen {
+				if m.maxStreams > 0 && int(m.streamCount.Load()) >= m.maxStreams {
+					m.logger.Warn("max streams reached, rejecting", "stream", f.StreamID, "max", m.maxStreams)
+					continue
+				}
 				s := &Stream{
 					ID:           f.StreamID,
 					mux:          m,
 					recv:         make(chan []byte, 1024),
 					assignedConn: m.selectConn(),
 				}
+				m.streamCount.Add(1)
 				m.streams.Store(f.StreamID, s)
 
 				if m.acceptedStreams != nil {
@@ -761,6 +783,7 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.mux.streams.Delete(s.ID)
+	s.mux.streamCount.Add(-1)
 	return s.mux.sendFrameOn(s.assignedConn, &Frame{
 		StreamID: s.ID,
 		Type:     FrameClose,
