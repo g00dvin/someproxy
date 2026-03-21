@@ -473,7 +473,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
 				_ = sigClient.SendPunchReady(ctx, nonce, idx)
 				_ = sigClient.WaitPunchReady(punchReadyCtx, nonce, idx)
 				prc()

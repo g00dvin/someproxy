@@ -366,7 +366,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
 				_ = sigClient.SendPunchReady(ctx, nonce, idx)
 				_ = sigClient.WaitPunchReady(punchReadyCtx, nonce, idx)
 				prc()

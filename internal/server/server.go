@@ -555,7 +555,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
 				_ = sigClient.SendPunchReady(ctx, clientNonce, idx)
 				_ = sigClient.WaitPunchReady(punchReadyCtx, clientNonce, idx)
 				prc()
@@ -779,7 +779,7 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 	go internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, clientUDP)
 	time.Sleep(200 * time.Millisecond)
 
-	reconnCtx, reconnCancel := context.WithTimeout(ctx, 10*time.Second)
+	reconnCtx, reconnCancel := context.WithTimeout(ctx, 3*time.Second)
 	defer reconnCancel()
 	dtlsConn, _, err := internaldtls.AcceptOverTURN(reconnCtx, alloc.RelayConn, clientUDP)
 	if err != nil {
