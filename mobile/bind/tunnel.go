@@ -5,6 +5,7 @@ package bind
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -355,6 +356,10 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 // signaling, and establishes DTLS connections to the server's relay addresses.
 // Returns a tunnelState without mutating t.
 func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
+	if cfg.Token == "" {
+		return nil, fmt.Errorf("token is required for relay-to-relay mode")
+	}
+
 	t.mu.Lock()
 	svc := t.svc
 	t.mu.Unlock()
@@ -374,8 +379,24 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
-	// Tell server to kill any existing session so it's ready for us.
-	_ = sigClient.SendDisconnect(ctx)
+	// Generate session nonce for filtering ghost messages.
+	nonceBytes := make([]byte, 8)
+	rand.Read(nonceBytes)
+	nonce := hex.EncodeToString(nonceBytes)
+
+	// Tell server to kill any existing session (disconnect-req + ack handshake).
+	const disconnectRetries = 3
+	for i := 0; i < disconnectRetries; i++ {
+		_ = sigClient.SendDisconnectReq(ctx, nonce)
+		ackCtx, ackCancel := context.WithTimeout(ctx, 2*time.Second)
+		err := sigClient.WaitDisconnectAck(ackCtx, nonce)
+		ackCancel()
+		if err == nil {
+			t.logger.Info("disconnect ack received", "nonce", nonce)
+			break
+		}
+		t.logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
+	}
 
 	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
 	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
@@ -395,7 +416,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	go func() {
 		defer close(sendDone)
 		for {
-			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client"); err != nil {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client", nonce); err != nil {
 				return
 			}
 			select {
@@ -406,7 +427,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		}
 	}()
 
-	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "client")
+	serverAddrs, _, _, err := sigClient.RecvRelayAddrs(ctx, "client", nonce)
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -444,13 +465,34 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			continue
 		}
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
-			internaldtls.PunchRelay(relayConn, addr)
-			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
-			time.Sleep(500 * time.Millisecond)
+			var dtlsConn io.ReadWriteCloser
+			var cleanup context.CancelFunc
+			var lastErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+				internaldtls.PunchRelay(relayConn, addr)
+				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
-			if err != nil {
-				results <- dtlsResult{index: idx, err: err}
+				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				_ = sigClient.SendPunchReady(ctx, nonce, idx)
+				_ = sigClient.WaitPunchReady(punchReadyCtx, nonce, idx)
+				prc()
+
+				var c net.Conn
+				c, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
+				punchLoopCancel()
+
+				if lastErr == nil {
+					dtlsConn = c
+					break
+				}
+				t.logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				}
+			}
+			if lastErr != nil {
+				results <- dtlsResult{index: idx, err: lastErr}
 				return
 			}
 
@@ -541,7 +583,7 @@ func (t *Tunnel) applyState(state *tunnelState) {
 			OnFullReconnect: func() { t.teardownMux() },
 		}, state.sigClient, state.mgr, state.m).Run(muxCtx)
 		go func() {
-			reason := state.sigClient.WaitForSessionEnd(muxCtx)
+			reason, _ := state.sigClient.WaitForSessionEnd(muxCtx)
 			if reason == provider.SessionEndHungup {
 				t.logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
 				t.teardownMux()

@@ -2,6 +2,8 @@ package dtls
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -9,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
@@ -22,7 +25,11 @@ type Listener struct {
 // Listen creates a DTLS listener on the given UDP address.
 // Uses a self-signed certificate with ECDSA-AES128-GCM-SHA256.
 func Listen(addr string) (*Listener, error) {
-	certificate, err := selfsign.GenerateSelfSigned()
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("rsa key: %w", err)
+	}
+	certificate, err := selfsign.SelfSign(rsaKey)
 	if err != nil {
 		return nil, fmt.Errorf("generate self-signed cert: %w", err)
 	}
@@ -33,9 +40,22 @@ func Listen(addr string) (*Listener, error) {
 	}
 
 	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		Certificates:         []tls.Certificate{certificate},
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		CipherSuites: []dtls.CipherSuiteID{
+			dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			dtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		},
+		EllipticCurves: []elliptic.Curve{
+			elliptic.X25519,
+			elliptic.P256,
+			elliptic.P384,
+		},
+		PaddingLength: 512,
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
+			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
+		},
 		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
 	}
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -205,7 +206,7 @@ func (rm *ReconnectManager) Run(ctx context.Context) {
 
 // reconnectOne creates a single new TURN allocation, exchanges relay addresses
 // via signaling, performs DTLS handshake, and adds the connection to the mux.
-func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan []byte) error {
+func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan provider.SignalMessage) error {
 	allocs, err := rm.mgr.Allocate(ctx, 1)
 	if err != nil {
 		return fmt.Errorf("allocate TURN: %w", err)
@@ -221,9 +222,13 @@ func (rm *ReconnectManager) reconnectOne(ctx context.Context, ackCh <-chan []byt
 	// Wait for server's relay address (timeout 15s).
 	var serverAddr string
 	select {
-	case payload, ok := <-ackCh:
+	case msg, ok := <-ackCh:
 		if !ok {
 			return fmt.Errorf("ack channel closed")
+		}
+		payload, err := base64.StdEncoding.DecodeString(msg.Payload)
+		if err != nil {
+			return fmt.Errorf("decode ack payload: %w", err)
 		}
 		serverAddr = string(payload)
 	case <-time.After(15 * time.Second):

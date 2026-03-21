@@ -150,26 +150,138 @@ func (ns *Stack) inboundLoop() {
 }
 
 // injectPacket parses the IP version and injects the packet into the stack.
+// ICMP echo requests are handled directly without entering gVisor.
 func (ns *Stack) injectPacket(data []byte) {
 	if len(data) == 0 {
 		return
 	}
 
-	var proto tcpip.NetworkProtocolNumber
 	switch header.IPVersion(data) {
 	case 4:
-		proto = header.IPv4ProtocolNumber
+		if ns.handleICMPv4Echo(data) {
+			return
+		}
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithData(data),
+		})
+		ns.ep.InjectInbound(header.IPv4ProtocolNumber, pkt)
+		pkt.DecRef()
 	case 6:
-		proto = header.IPv6ProtocolNumber
-	default:
-		return
+		if ns.handleICMPv6Echo(data) {
+			return
+		}
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithData(data),
+		})
+		ns.ep.InjectInbound(header.IPv6ProtocolNumber, pkt)
+		pkt.DecRef()
+	}
+}
+
+// handleICMPv4Echo intercepts ICMPv4 echo requests and generates replies
+// directly, without forwarding to a real destination. This verifies VPN
+// tunnel connectivity and works without CAP_NET_RAW.
+func (ns *Stack) handleICMPv4Echo(data []byte) bool {
+	if len(data) < header.IPv4MinimumSize {
+		return false
+	}
+	ipHdr := header.IPv4(data)
+	if ipHdr.TransportProtocol() != header.ICMPv4ProtocolNumber {
+		return false
+	}
+	hdrLen := int(ipHdr.HeaderLength())
+	if len(data) < hdrLen+header.ICMPv4MinimumSize {
+		return false
+	}
+	icmpHdr := header.ICMPv4(data[hdrLen:])
+	if icmpHdr.Type() != header.ICMPv4Echo {
+		return false
 	}
 
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(data),
+	reply := make([]byte, len(data))
+	copy(reply, data)
+
+	replyIP := header.IPv4(reply)
+	replyICMP := header.ICMPv4(reply[hdrLen:])
+
+	// Swap src ↔ dst.
+	src := ipHdr.SourceAddress()
+	dst := ipHdr.DestinationAddress()
+	replyIP.SetSourceAddress(dst)
+	replyIP.SetDestinationAddress(src)
+	replyIP.SetTTL(64)
+
+	// Echo → EchoReply.
+	replyICMP.SetType(header.ICMPv4EchoReply)
+	replyICMP.SetChecksum(0)
+	replyICMP.SetChecksum(header.ICMPv4Checksum(replyICMP, 0))
+
+	// Recalculate IP checksum.
+	replyIP.SetChecksum(0)
+	replyIP.SetChecksum(^replyIP.CalculateChecksum())
+
+	_ = ns.m.SendRawPacket(&mux.Frame{
+		StreamID: 0,
+		Type:     mux.FrameData,
+		Sequence: ns.m.NextSeq(),
+		Length:   uint32(len(reply)),
+		Payload:  reply,
 	})
-	ns.ep.InjectInbound(proto, pkt)
-	pkt.DecRef()
+	return true
+}
+
+// handleICMPv6Echo intercepts ICMPv6 echo requests and generates replies.
+func (ns *Stack) handleICMPv6Echo(data []byte) bool {
+	if len(data) < header.IPv6MinimumSize {
+		return false
+	}
+	ipHdr := header.IPv6(data)
+	if ipHdr.TransportProtocol() != header.ICMPv6ProtocolNumber {
+		return false
+	}
+	hdrLen := header.IPv6MinimumSize
+	if len(data) < hdrLen+header.ICMPv6MinimumSize {
+		return false
+	}
+	icmpHdr := header.ICMPv6(data[hdrLen:])
+	if icmpHdr.Type() != header.ICMPv6EchoRequest {
+		return false
+	}
+
+	reply := make([]byte, len(data))
+	copy(reply, data)
+
+	replyIP := header.IPv6(reply)
+	replyICMP := header.ICMPv6(reply[hdrLen:])
+
+	// Swap src ↔ dst.
+	src := ipHdr.SourceAddress()
+	dst := ipHdr.DestinationAddress()
+	replyIP.SetSourceAddress(dst)
+	replyIP.SetDestinationAddress(src)
+	replyIP.SetHopLimit(64)
+
+	// EchoRequest → EchoReply.
+	replyICMP.SetType(header.ICMPv6EchoReply)
+
+	// ICMPv6 checksum includes pseudo-header.
+	replyICMP.SetChecksum(0)
+	replyICMP.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
+		Header:      replyICMP,
+		Src:         dst,
+		Dst:         src,
+		PayloadCsum: 0,
+		PayloadLen:  len(replyICMP) - header.ICMPv6MinimumSize,
+	}))
+
+	_ = ns.m.SendRawPacket(&mux.Frame{
+		StreamID: 0,
+		Type:     mux.FrameData,
+		Sequence: ns.m.NextSeq(),
+		Length:   uint32(len(reply)),
+		Payload:  reply,
+	})
+	return true
 }
 
 // outboundLoop reads packets from the gVisor stack and sends them via mux.

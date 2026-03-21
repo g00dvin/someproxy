@@ -24,6 +24,14 @@ type JoinInfo struct {
 	DeviceIdx   int
 }
 
+// SignalMessage represents a decoded signaling message delivered to subscribers.
+type SignalMessage struct {
+	Type    string // wire-level tag (e.g. "av-conn-new")
+	Payload string // base64-encoded payload
+	Nonce   string // session nonce (empty for legacy messages)
+	Index   int    // connection index (used by punch-ready signals)
+}
+
 // SessionEndReason indicates why a signaling session ended.
 type SessionEndReason int
 
@@ -50,13 +58,17 @@ type SessionProvider interface {
 // to exchange TURN relay addresses between peers.
 type SignalingClient interface {
 	SetKey(token string) error
-	SendRelayAddrs(ctx context.Context, addrs []string, role string) error
-	RecvRelayAddrs(ctx context.Context, skipRole string) (addrs []string, role string, err error)
-	SendDisconnect(ctx context.Context) error
-	WaitForSessionEnd(ctx context.Context) SessionEndReason
+	SendRelayAddrs(ctx context.Context, addrs []string, role string, nonce string) error
+	RecvRelayAddrs(ctx context.Context, skipRole string, nonce string) (addrs []string, role string, recvNonce string, err error)
+	SendDisconnectReq(ctx context.Context, nonce string) error
+	WaitDisconnectAck(ctx context.Context, nonce string) error
+	SendDisconnectAck(ctx context.Context, nonce string) error
+	SendPunchReady(ctx context.Context, nonce string, index int) error
+	WaitPunchReady(ctx context.Context, nonce string, index int) error
+	WaitForSessionEnd(ctx context.Context) (SessionEndReason, string)
 	SendPayload(ctx context.Context, tag string, data []byte) error
 	RecvPayload(ctx context.Context, tag string) ([]byte, error)
-	Subscribe(tag string, bufSize int) (<-chan []byte, func())
+	Subscribe(tag string, bufSize int) (<-chan SignalMessage, func())
 	Drain()
 	DrainAndRoute(ctx context.Context)
 	Done() <-chan struct{}

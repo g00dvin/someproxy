@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -237,6 +239,10 @@ func (rs *relaySession) Close() {
 func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monitoring.Siren,
 	svc provider.Service, numConns int, useTCP bool, authToken string, expectedFP []byte) (*relaySession, error) {
 
+	if authToken == "" {
+		return nil, fmt.Errorf("token is required for relay-to-relay mode")
+	}
+
 	// 1. Join conference to get TURN creds and signaling endpoint.
 	jr, err := svc.FetchJoinInfo(ctx)
 	if err != nil {
@@ -255,8 +261,24 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
-	// Tell server to kill any existing session so it's ready for us.
-	_ = sigClient.SendDisconnect(ctx)
+	// Generate session nonce for filtering ghost messages.
+	nonceBytes := make([]byte, 8)
+	rand.Read(nonceBytes)
+	nonce := hex.EncodeToString(nonceBytes)
+
+	// Tell server to kill any existing session (disconnect-req + ack handshake).
+	const disconnectRetries = 3
+	for i := 0; i < disconnectRetries; i++ {
+		_ = sigClient.SendDisconnectReq(ctx, nonce)
+		ackCtx, ackCancel := context.WithTimeout(ctx, 2*time.Second)
+		err := sigClient.WaitDisconnectAck(ackCtx, nonce)
+		ackCancel()
+		if err == nil {
+			logger.Info("disconnect ack received", "nonce", nonce)
+			break
+		}
+		logger.Debug("disconnect ack timeout, retrying", "attempt", i+1, "nonce", nonce)
+	}
 
 	// 3. Create TURN allocations.
 	mgr := turn.NewManager(svc, useTCP, logger)
@@ -282,7 +304,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	go func() {
 		defer close(sendDone)
 		for {
-			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client"); err != nil {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client", nonce); err != nil {
 				return
 			}
 			select {
@@ -293,7 +315,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		}
 	}()
 
-	serverAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "client")
+	serverAddrs, _, _, err := sigClient.RecvRelayAddrs(ctx, "client", nonce)
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -336,13 +358,32 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			continue
 		}
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
-			internaldtls.PunchRelay(relayConn, addr)
-			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
-			time.Sleep(500 * time.Millisecond)
+			var dtlsConn net.Conn
+			var cleanup context.CancelFunc
+			var lastErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+				internaldtls.PunchRelay(relayConn, addr)
+				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-			dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)
-			if err != nil {
-				results <- dtlsResult{index: idx, err: err}
+				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				_ = sigClient.SendPunchReady(ctx, nonce, idx)
+				_ = sigClient.WaitPunchReady(punchReadyCtx, nonce, idx)
+				prc()
+
+				dtlsConn, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)
+				punchLoopCancel()
+
+				if lastErr == nil {
+					break
+				}
+				logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				}
+			}
+			if lastErr != nil {
+				results <- dtlsResult{index: idx, err: lastErr}
 				return
 			}
 
@@ -440,7 +481,7 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 
 	// Monitor signaling for session end -- trigger full reconnect on hungup.
 	go func() {
-		reason := sess.sigClient.WaitForSessionEnd(ctx)
+		reason, _ := sess.sigClient.WaitForSessionEnd(ctx)
 		if reason == provider.SessionEndHungup {
 			logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
 			select {
@@ -529,7 +570,7 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 
 				// Restart hungup monitor for new session.
 				go func() {
-					reason := sess.sigClient.WaitForSessionEnd(ctx)
+					reason, _ := sess.sigClient.WaitForSessionEnd(ctx)
 					if reason == provider.SessionEndHungup {
 						logger.Warn("VK terminated the call (hungup), triggering full session reconnect")
 						select {

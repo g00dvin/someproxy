@@ -26,10 +26,12 @@ import (
 
 const (
 	// Wire-level identifiers intentionally neutral.
-	wireType       = "av-sync"
-	wireDisconnect = "av-reset" // explicit session teardown signal
-	wireRoleServer = "pub"
-	wireRoleClient = "sub"
+	wireType          = "av-sync"
+	wireDisconnect    = "av-reset"     // explicit session teardown signal
+	wireDisconnectAck = "av-reset-ack" // acknowledgement of disconnect
+	wirePunchReady    = "av-punch"     // punch-ready signal per connection index
+	wireRoleServer    = "pub"
+	wireRoleClient    = "sub"
 )
 
 // Compile-time check: SignalingClient implements provider.SignalingClient.
@@ -48,7 +50,7 @@ type SignalingClient struct {
 	aead       cipher.AEAD // nil = no encryption (base64 only)
 
 	subsMu sync.Mutex
-	subs   map[string]chan []byte // tag -> subscriber channel
+	subs   map[string]chan provider.SignalMessage // tag -> subscriber channel
 }
 
 // SetKey derives an AES-256-GCM key from the shared token.
@@ -111,8 +113,10 @@ type command struct {
 
 type relayData struct {
 	Type    string `json:"type"`
-	Payload string `json:"payload"` // base64-encoded comma-separated addresses
-	Mode    string `json:"mode"`    // "pub" or "sub"
+	Payload string `json:"payload"`           // base64-encoded comma-separated addresses
+	Mode    string `json:"mode"`              // "pub" or "sub"
+	Nonce   string `json:"nonce,omitempty"`   // session nonce for filtering ghost messages
+	Index   int    `json:"index,omitempty"`   // connection index for punch-ready signals
 }
 
 func encodeAddrs(addrs []string) string {
@@ -149,7 +153,7 @@ func ConnectSignaling(ctx context.Context, wsEndpoint string, logger *slog.Logge
 	if !strings.Contains(wsEndpoint, "?") {
 		sep = "?"
 	}
-	wsEndpoint += sep + "platform=WEB&appVersion=1.1&version=5&device=browser&clientType=PORTAL&deviceIdx=0"
+	wsEndpoint += sep + randomJoinParams()
 
 	dialer := websocket.Dialer{}
 	conn, _, err := dialer.DialContext(ctx, wsEndpoint, nil)
@@ -286,20 +290,13 @@ func (c *SignalingClient) WaitForPeer(ctx context.Context, skipCount int) (strin
 	}
 }
 
-// SendRelayAddrs sends our TURN relay addresses to the remote peer
-// via a custom-data command. The entire payload is base64-encoded so
-// VK only sees an opaque string in the data field.
-func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, role string) error {
+// sendInner marshals a relayData, encrypts, and sends it as a custom-data command.
+func (c *SignalingClient) sendInner(ctx context.Context, inner relayData) error {
 	c.mu.Lock()
 	c.seq++
 	seq := c.seq
 	c.mu.Unlock()
 
-	inner := relayData{
-		Type:    wireType,
-		Payload: encodeAddrs(addrs),
-		Mode:    toWireRole(role),
-	}
 	innerJSON, err := json.Marshal(inner)
 	if err != nil {
 		return fmt.Errorf("marshal inner: %w", err)
@@ -322,8 +319,23 @@ func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, ro
 	if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 		return fmt.Errorf("write command: %w", err)
 	}
+	return nil
+}
 
-	c.logger.Info("sent relay addresses", "count", len(addrs), "role", role)
+// SendRelayAddrs sends our TURN relay addresses to the remote peer
+// via a custom-data command. The entire payload is base64-encoded so
+// VK only sees an opaque string in the data field.
+func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, role string, nonce string) error {
+	inner := relayData{
+		Type:    wireType,
+		Payload: encodeAddrs(addrs),
+		Mode:    toWireRole(role),
+		Nonce:   nonce,
+	}
+	if err := c.sendInner(ctx, inner); err != nil {
+		return err
+	}
+	c.logger.Info("sent relay addresses", "count", len(addrs), "role", role, "nonce", nonce)
 	return nil
 }
 
@@ -331,13 +343,15 @@ func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, ro
 // the remote peer's relay addresses. The data field is a base64 blob
 // wrapping the inner JSON structure. Messages whose role matches
 // skipRole are silently discarded (filters out our own echoed broadcasts).
-func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string) (addrs []string, role string, err error) {
+// When filterNonce is non-empty, only messages with a matching nonce are accepted.
+// Returns the received nonce as the third string value.
+func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string, filterNonce string) (addrs []string, role string, recvNonce string, err error) {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, "", ctx.Err()
+			return nil, "", "", ctx.Err()
 		case <-c.done:
-			return nil, "", fmt.Errorf("signaling connection closed")
+			return nil, "", "", fmt.Errorf("signaling connection closed")
 		case notif := <-c.incoming:
 			if notif.Name == "custom-data" {
 				// Try notif.Data first; fall back to top-level "data" from Raw.
@@ -370,6 +384,10 @@ func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string) (
 				if data.Type != wireType {
 					continue
 				}
+				if filterNonce != "" && data.Nonce != filterNonce {
+					c.logger.Debug("skipping relay addrs with wrong nonce", "got", data.Nonce, "want", filterNonce)
+					continue
+				}
 				addrs, err := decodeAddrs(data.Payload)
 				if err != nil {
 					c.logger.Warn("decode relay addrs", "err", err)
@@ -380,13 +398,13 @@ func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string) (
 					c.logger.Debug("skipping own echoed relay addrs", "role", role)
 					continue
 				}
-				c.logger.Info("received relay addresses", "count", len(addrs), "role", role)
+				c.logger.Info("received relay addresses", "count", len(addrs), "role", role, "nonce", data.Nonce)
 
 				// Remember the sender's participantId so we can filter
 				// hungup notifications later (ignore anonymous TURN users).
 				c.setRemotePeerFromNotif(notif)
 
-				return addrs, role, nil
+				return addrs, role, data.Nonce, nil
 			}
 		}
 	}
@@ -421,11 +439,121 @@ func (c *SignalingClient) WaitForHungup(ctx context.Context) {
 	}
 }
 
-// SendDisconnect sends an explicit disconnect signal to the remote peer
-// via VK signaling. The server uses this to tear down the old session
-// immediately instead of waiting for idle timeout.
-func (c *SignalingClient) SendDisconnect(ctx context.Context) error {
-	return c.SendPayload(ctx, wireDisconnect, nil)
+// SendDisconnectReq sends a disconnect request with a session nonce.
+func (c *SignalingClient) SendDisconnectReq(ctx context.Context, nonce string) error {
+	return c.sendInner(ctx, relayData{Type: wireDisconnect, Nonce: nonce})
+}
+
+// SendDisconnectAck sends a disconnect acknowledgement with a session nonce.
+func (c *SignalingClient) SendDisconnectAck(ctx context.Context, nonce string) error {
+	return c.sendInner(ctx, relayData{Type: wireDisconnectAck, Nonce: nonce})
+}
+
+// WaitDisconnectAck subscribes to disconnect-ack messages and waits for one
+// matching the given nonce. Returns nil on match, ctx.Err() on timeout.
+func (c *SignalingClient) WaitDisconnectAck(ctx context.Context, nonce string) error {
+	ch, unsub := c.Subscribe(wireDisconnectAck, 4)
+	defer unsub()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return fmt.Errorf("signaling connection closed")
+		case msg := <-ch:
+			if msg.Nonce == nonce {
+				return nil
+			}
+		}
+	}
+}
+
+// SendPunchReady signals that a specific connection index is ready for punching.
+func (c *SignalingClient) SendPunchReady(ctx context.Context, nonce string, index int) error {
+	return c.sendInner(ctx, relayData{Type: wirePunchReady, Nonce: nonce, Index: index})
+}
+
+// punchDispatcher fans out "av-punch" messages to per-index waiters.
+type punchDispatcher struct {
+	mu      sync.Mutex
+	waiters map[int]chan struct{} // index -> signal channel
+	cancel  context.CancelFunc
+}
+
+// initPunchDispatcher starts a goroutine that subscribes to wirePunchReady
+// and dispatches signals to per-index waiters matching the given nonce.
+func (c *SignalingClient) initPunchDispatcher(ctx context.Context, nonce string) *punchDispatcher {
+	dctx, cancel := context.WithCancel(ctx)
+	pd := &punchDispatcher{
+		waiters: make(map[int]chan struct{}),
+		cancel:  cancel,
+	}
+	ch, unsub := c.Subscribe(wirePunchReady, 32)
+	go func() {
+		defer unsub()
+		for {
+			select {
+			case <-dctx.Done():
+				return
+			case <-c.done:
+				return
+			case msg := <-ch:
+				if msg.Nonce != nonce {
+					continue
+				}
+				pd.mu.Lock()
+				if w, ok := pd.waiters[msg.Index]; ok {
+					select {
+					case w <- struct{}{}:
+					default:
+					}
+				}
+				pd.mu.Unlock()
+			}
+		}
+	}()
+	return pd
+}
+
+func (pd *punchDispatcher) Close() {
+	pd.cancel()
+}
+
+func (pd *punchDispatcher) wait(ctx context.Context, index int) error {
+	ch := make(chan struct{}, 1)
+	pd.mu.Lock()
+	pd.waiters[index] = ch
+	pd.mu.Unlock()
+	defer func() {
+		pd.mu.Lock()
+		delete(pd.waiters, index)
+		pd.mu.Unlock()
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ch:
+		return nil
+	}
+}
+
+// WaitPunchReady blocks until a punch-ready signal for the given index
+// and nonce is received. Uses a punch dispatcher internally.
+func (c *SignalingClient) WaitPunchReady(ctx context.Context, nonce string, index int) error {
+	ch, unsub := c.Subscribe(wirePunchReady, 8)
+	defer unsub()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.done:
+			return fmt.Errorf("signaling connection closed")
+		case msg := <-ch:
+			if msg.Nonce == nonce && msg.Index == index {
+				return nil
+			}
+		}
+	}
 }
 
 // WaitForSessionEnd blocks until one of the following occurs:
@@ -437,17 +565,17 @@ func (c *SignalingClient) SendDisconnect(ctx context.Context) error {
 // identities) are ignored -- only a hungup matching remotePeer triggers
 // session end.
 // It also routes custom-data to subscribers to keep reconnect signaling alive.
-func (c *SignalingClient) WaitForSessionEnd(ctx context.Context) provider.SessionEndReason {
+func (c *SignalingClient) WaitForSessionEnd(ctx context.Context) (provider.SessionEndReason, string) {
 	for {
 		select {
 		case <-ctx.Done():
-			return provider.SessionEndClosed
+			return provider.SessionEndClosed, ""
 		case <-c.done:
-			return provider.SessionEndClosed
+			return provider.SessionEndClosed, ""
 		case notif := <-c.incoming:
 			if notif.Name == "hungup" {
 				if c.isRemotePeerHungup(notif) {
-					return provider.SessionEndHungup
+					return provider.SessionEndHungup, ""
 				}
 				continue
 			}
@@ -456,8 +584,8 @@ func (c *SignalingClient) WaitForSessionEnd(ctx context.Context) provider.Sessio
 				if c.routeToSubscriber(notif) {
 					continue
 				}
-				if c.isDisconnectSignal(notif) {
-					return provider.SessionEndDisconnect
+				if nonce, ok := c.isDisconnectSignal(notif); ok {
+					return provider.SessionEndDisconnect, nonce
 				}
 			}
 		}
@@ -534,8 +662,8 @@ func (c *SignalingClient) DrainAndRoute(ctx context.Context) {
 }
 
 // isDisconnectSignal checks if a custom-data notification contains
-// an explicit disconnect signal ("av-reset").
-func (c *SignalingClient) isDisconnectSignal(notif notification) bool {
+// an explicit disconnect signal ("av-reset"). Returns the nonce and true if found.
+func (c *SignalingClient) isDisconnectSignal(notif notification) (string, bool) {
 	dataField := notif.Data
 	if len(dataField) == 0 || string(dataField) == "null" {
 		var raw struct {
@@ -547,55 +675,32 @@ func (c *SignalingClient) isDisconnectSignal(notif notification) bool {
 	}
 	var blob string
 	if err := json.Unmarshal(dataField, &blob); err != nil {
-		return false
+		return "", false
 	}
 	innerJSON, err := c.open(blob)
 	if err != nil {
-		return false
+		return "", false
 	}
 	var data relayData
 	if err := json.Unmarshal(innerJSON, &data); err != nil {
-		return false
+		return "", false
 	}
-	return data.Type == wireDisconnect
+	if data.Type == wireDisconnect {
+		return data.Nonce, true
+	}
+	return "", false
 }
 
 // SendPayload sends arbitrary data with a given tag via custom-data command.
 // Tag distinguishes payload types ("sdp-offer", "sdp-answer", "ice", "sync", etc.).
 func (c *SignalingClient) SendPayload(ctx context.Context, tag string, data []byte) error {
-	c.mu.Lock()
-	c.seq++
-	seq := c.seq
-	c.mu.Unlock()
-
 	inner := relayData{
 		Type:    tag,
 		Payload: base64.StdEncoding.EncodeToString(data),
-		Mode:    "",
 	}
-	innerJSON, err := json.Marshal(inner)
-	if err != nil {
-		return fmt.Errorf("marshal inner: %w", err)
+	if err := c.sendInner(ctx, inner); err != nil {
+		return err
 	}
-	blob := c.seal(innerJSON)
-
-	cmd := command{
-		Command:  "custom-data",
-		Sequence: seq,
-		Data:     blob,
-	}
-
-	msg, err := json.Marshal(cmd)
-	if err != nil {
-		return fmt.Errorf("marshal command: %w", err)
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-		return fmt.Errorf("write command: %w", err)
-	}
-
 	c.logger.Debug("sent payload", "tag", tag, "size", len(data))
 	return nil
 }
@@ -650,11 +755,11 @@ func (c *SignalingClient) RecvPayload(ctx context.Context, tag string) ([]byte, 
 // Subscribe registers a subscriber for custom-data messages with the
 // given tag. Returns a receive-only channel and an unsubscribe function.
 // Only one subscriber per tag is supported; duplicate tags overwrite.
-func (c *SignalingClient) Subscribe(tag string, bufSize int) (<-chan []byte, func()) {
-	ch := make(chan []byte, bufSize)
+func (c *SignalingClient) Subscribe(tag string, bufSize int) (<-chan provider.SignalMessage, func()) {
+	ch := make(chan provider.SignalMessage, bufSize)
 	c.subsMu.Lock()
 	if c.subs == nil {
-		c.subs = make(map[string]chan []byte)
+		c.subs = make(map[string]chan provider.SignalMessage)
 	}
 	c.subs[tag] = ch
 	c.subsMu.Unlock()
@@ -667,8 +772,8 @@ func (c *SignalingClient) Subscribe(tag string, bufSize int) (<-chan []byte, fun
 	}
 }
 
-// extractTag decodes a custom-data notification and returns its relayData.Type.
-func (c *SignalingClient) extractTag(notif notification) (string, []byte, bool) {
+// extractTag decodes a custom-data notification and returns the parsed relayData.
+func (c *SignalingClient) extractTag(notif notification) (string, relayData, bool) {
 	dataField := notif.Data
 	if len(dataField) == 0 || string(dataField) == "null" {
 		var raw struct {
@@ -680,27 +785,23 @@ func (c *SignalingClient) extractTag(notif notification) (string, []byte, bool) 
 	}
 	var blob string
 	if err := json.Unmarshal(dataField, &blob); err != nil {
-		return "", nil, false
+		return "", relayData{}, false
 	}
 	innerJSON, err := c.open(blob)
 	if err != nil {
-		return "", nil, false
+		return "", relayData{}, false
 	}
 	var data relayData
 	if err := json.Unmarshal(innerJSON, &data); err != nil {
-		return "", nil, false
+		return "", relayData{}, false
 	}
-	payload, err := base64.StdEncoding.DecodeString(data.Payload)
-	if err != nil {
-		return data.Type, nil, true
-	}
-	return data.Type, payload, true
+	return data.Type, data, true
 }
 
 // routeToSubscriber checks if a custom-data notification matches any
-// subscriber. If so, it sends the payload and returns true.
+// subscriber. If so, it sends the parsed message and returns true.
 func (c *SignalingClient) routeToSubscriber(notif notification) bool {
-	tag, payload, ok := c.extractTag(notif)
+	tag, data, ok := c.extractTag(notif)
 	if !ok {
 		return false
 	}
@@ -710,8 +811,14 @@ func (c *SignalingClient) routeToSubscriber(notif notification) bool {
 	if !exists {
 		return false
 	}
+	msg := provider.SignalMessage{
+		Type:    data.Type,
+		Payload: data.Payload,
+		Nonce:   data.Nonce,
+		Index:   data.Index,
+	}
 	select {
-	case ch <- payload:
+	case ch <- msg:
 	default:
 		c.logger.Warn("subscriber buffer full", "tag", tag)
 	}

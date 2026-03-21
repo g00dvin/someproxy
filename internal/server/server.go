@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -464,6 +465,10 @@ func (s *Server) runRelayMode(ctx context.Context) {
 }
 
 func (s *Server) runOneRelaySession(ctx context.Context) error {
+	if s.cfg.AuthToken == "" {
+		return fmt.Errorf("token is required for relay-to-relay mode")
+	}
+
 	svc := s.cfg.Service
 
 	jr, err := svc.FetchJoinInfo(ctx)
@@ -485,11 +490,11 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	defer mgr.CloseAll()
 
-	clientAddrs, _, err := sigClient.RecvRelayAddrs(ctx, "server")
+	clientAddrs, _, clientNonce, err := sigClient.RecvRelayAddrs(ctx, "server", "")
 	if err != nil {
 		return fmt.Errorf("recv relay addrs: %w", err)
 	}
-	s.cfg.Logger.Info("received client relay addresses", "count", len(clientAddrs))
+	s.cfg.Logger.Info("received client relay addresses", "count", len(clientAddrs), "nonce", clientNonce)
 
 	pairCount := len(clientAddrs)
 	allocs, err := mgr.Allocate(ctx, pairCount)
@@ -509,7 +514,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	go func() {
 		defer close(sendDone)
 		for {
-			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "server"); err != nil {
+			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "server", clientNonce); err != nil {
 				return
 			}
 			select {
@@ -542,12 +547,31 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 			continue
 		}
 		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
-			internaldtls.PunchRelay(relayConn, addr)
-			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
-			time.Sleep(500 * time.Millisecond)
+			var dtlsConn net.Conn
+			var cleanup context.CancelFunc
+			var lastErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+				internaldtls.PunchRelay(relayConn, addr)
+				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-			dtlsConn, cleanup, err := internaldtls.AcceptOverTURN(ctx, relayConn, addr)
-			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: err}
+				punchReadyCtx, prc := context.WithTimeout(ctx, 10*time.Second)
+				_ = sigClient.SendPunchReady(ctx, clientNonce, idx)
+				_ = sigClient.WaitPunchReady(punchReadyCtx, clientNonce, idx)
+				prc()
+
+				dtlsConn, cleanup, lastErr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)
+				punchLoopCancel()
+
+				if lastErr == nil {
+					break
+				}
+				s.cfg.Logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				}
+			}
+			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: lastErr}
 		}(i, allocs[i].RelayConn, clientUDP)
 	}
 
@@ -658,10 +682,11 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	go s.handleReconnections(sessCtx, sigClient, mgr, m)
 
 	go func() {
-		reason := sigClient.WaitForSessionEnd(sessCtx)
+		reason, disconnectNonce := sigClient.WaitForSessionEnd(sessCtx)
 		switch reason {
 		case provider.SessionEndDisconnect:
-			s.cfg.Logger.Info("client sent disconnect signal, cancelling session")
+			s.cfg.Logger.Info("client sent disconnect signal, sending ack", "nonce", disconnectNonce)
+			_ = sigClient.SendDisconnectAck(sessCtx, disconnectNonce)
 			sessCancel()
 		case provider.SessionEndHungup:
 			s.cfg.Logger.Info("signaling hungup, stopping pings and reducing idle timeout")
@@ -704,9 +729,14 @@ func (s *Server) handleReconnections(ctx context.Context, sigClient provider.Sig
 		select {
 		case <-ctx.Done():
 			return
-		case payload, ok := <-ch:
+		case msg, ok := <-ch:
 			if !ok {
 				return
+			}
+			payload, err := base64.StdEncoding.DecodeString(msg.Payload)
+			if err != nil {
+				s.cfg.Logger.Warn("decode reconnect payload", "err", err)
+				continue
 			}
 			clientAddr := string(payload)
 			go func() {

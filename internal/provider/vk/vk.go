@@ -25,7 +25,6 @@ const (
 	vkAPIVersion   = "5.264"
 	okAppKey       = "CGMMEJLGDIHBABABA"
 	httpTimeout    = 20 * time.Second
-	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 )
 
 // Service implements provider.Service for VK Calls.
@@ -57,6 +56,9 @@ func (s *Service) FetchCredentials(ctx context.Context) (*provider.Credentials, 
 // FetchJoinInfo performs the full 6-step VK authentication chain and returns
 // TURN credentials, WebSocket endpoint, and conversation info.
 func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error) {
+	// Select a random User-Agent once per session so all requests look consistent.
+	ua := randomUserAgent()
+
 	client := &http.Client{
 		Timeout: httpTimeout,
 		Transport: &http.Transport{
@@ -65,38 +67,38 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 	}
 
 	// Step 1: Get anonymous token
-	token1, err := vkAnonToken(ctx, client)
+	token1, err := vkAnonToken(ctx, client, ua)
 	if err != nil {
 		return nil, fmt.Errorf("step1 anon token: %w", err)
 	}
 
 	// Step 2: Get anonymous payload
-	token2, err := vkAnonPayload(ctx, client, token1)
+	token2, err := vkAnonPayload(ctx, client, ua, token1)
 	if err != nil {
 		return nil, fmt.Errorf("step2 anon payload: %w", err)
 	}
 
 	// Step 3: Get messages token
-	token3, err := vkMessagesToken(ctx, client, token2)
+	token3, err := vkMessagesToken(ctx, client, ua, token2)
 	if err != nil {
 		return nil, fmt.Errorf("step3 messages token: %w", err)
 	}
 
 	// Step 4: Get join token
-	token4, err := vkJoinToken(ctx, client, s.callLink, token3)
+	token4, err := vkJoinToken(ctx, client, ua, s.callLink, token3)
 	if err != nil {
 		return nil, fmt.Errorf("step4 join token: %w", err)
 	}
 
 	// Step 5: OK anonymous login
 	deviceID := uuid.New().String()
-	token5, err := okAnonLogin(ctx, client, deviceID)
+	token5, err := okAnonLogin(ctx, client, ua, deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("step5 ok login: %w", err)
 	}
 
 	// Step 6: Join conference and extract TURN credentials + WS info
-	result, err := okJoinConference(ctx, client, s.callLink, token4, token5)
+	result, err := okJoinConference(ctx, client, ua, s.callLink, token4, token5)
 	if err != nil {
 		return nil, fmt.Errorf("step6 join conference: %w", err)
 	}
@@ -116,7 +118,7 @@ func (s *Service) ConnectSignaling(ctx context.Context, info *provider.JoinInfo,
 
 // --- VK auth chain (private) ---
 
-func vkAnonToken(ctx context.Context, client *http.Client) (string, error) {
+func vkAnonToken(ctx context.Context, client *http.Client, ua string) (string, error) {
 	data := url.Values{
 		"client_secret":           {vkClientSecret},
 		"client_id":               {vkClientID},
@@ -125,7 +127,7 @@ func vkAnonToken(ctx context.Context, client *http.Client) (string, error) {
 		"version":                 {"1"},
 		"app_id":                  {vkClientID},
 	}
-	body, err := httpPost(ctx, client, "https://login.vk.ru/?act=get_anonym_token", data)
+	body, err := httpPost(ctx, client, ua, "https://login.vk.ru/?act=get_anonym_token", data)
 	if err != nil {
 		return "", err
 	}
@@ -143,10 +145,10 @@ func vkAnonToken(ctx context.Context, client *http.Client) (string, error) {
 	return resp.Data.AccessToken, nil
 }
 
-func vkAnonPayload(ctx context.Context, client *http.Client, token1 string) (string, error) {
+func vkAnonPayload(ctx context.Context, client *http.Client, ua string, token1 string) (string, error) {
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=%s&client_id=%s", vkAPIVersion, vkClientID)
 	data := url.Values{"access_token": {token1}}
-	body, err := httpPost(ctx, client, endpoint, data)
+	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +166,7 @@ func vkAnonPayload(ctx context.Context, client *http.Client, token1 string) (str
 	return resp.Response.Payload, nil
 }
 
-func vkMessagesToken(ctx context.Context, client *http.Client, token2 string) (string, error) {
+func vkMessagesToken(ctx context.Context, client *http.Client, ua string, token2 string) (string, error) {
 	data := url.Values{
 		"client_id":     {vkClientID},
 		"token_type":    {"messages"},
@@ -173,7 +175,7 @@ func vkMessagesToken(ctx context.Context, client *http.Client, token2 string) (s
 		"version":       {"1"},
 		"app_id":        {vkClientID},
 	}
-	body, err := httpPost(ctx, client, "https://login.vk.ru/?act=get_anonym_token", data)
+	body, err := httpPost(ctx, client, ua, "https://login.vk.ru/?act=get_anonym_token", data)
 	if err != nil {
 		return "", err
 	}
@@ -191,14 +193,14 @@ func vkMessagesToken(ctx context.Context, client *http.Client, token2 string) (s
 	return resp.Data.AccessToken, nil
 }
 
-func vkJoinToken(ctx context.Context, client *http.Client, link, token3 string) (string, error) {
+func vkJoinToken(ctx context.Context, client *http.Client, ua string, link, token3 string) (string, error) {
 	data := url.Values{
 		"vk_join_link": {fmt.Sprintf("https://vk.com/call/join/%s", link)},
 		"name":         {provider.RandomDisplayName()},
 		"access_token": {token3},
 	}
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
-	body, err := httpPost(ctx, client, endpoint, data)
+	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
@@ -216,7 +218,7 @@ func vkJoinToken(ctx context.Context, client *http.Client, link, token3 string) 
 	return resp.Response.Token, nil
 }
 
-func okAnonLogin(ctx context.Context, client *http.Client, deviceID string) (string, error) {
+func okAnonLogin(ctx context.Context, client *http.Client, ua string, deviceID string) (string, error) {
 	sessionData := fmt.Sprintf(`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`, deviceID)
 	data := url.Values{
 		"session_data":    {sessionData},
@@ -224,7 +226,7 @@ func okAnonLogin(ctx context.Context, client *http.Client, deviceID string) (str
 		"format":          {"JSON"},
 		"application_key": {okAppKey},
 	}
-	body, err := httpPost(ctx, client, "https://calls.okcdn.ru/fb.do", data)
+	body, err := httpPost(ctx, client, ua, "https://calls.okcdn.ru/fb.do", data)
 	if err != nil {
 		return "", err
 	}
@@ -247,7 +249,7 @@ type joinConferenceResult struct {
 	deviceIdx int
 }
 
-func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, sessionKey string) (*joinConferenceResult, error) {
+func okJoinConference(ctx context.Context, client *http.Client, ua string, link, vkToken, sessionKey string) (*joinConferenceResult, error) {
 	data := url.Values{
 		"joinLink":        {link},
 		"isVideo":         {"false"},
@@ -258,7 +260,7 @@ func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, s
 		"application_key": {okAppKey},
 		"session_key":     {sessionKey},
 	}
-	body, err := httpPost(ctx, client, "https://calls.okcdn.ru/fb.do", data)
+	body, err := httpPost(ctx, client, ua, "https://calls.okcdn.ru/fb.do", data)
 	if err != nil {
 		return nil, err
 	}
@@ -293,12 +295,12 @@ func okJoinConference(ctx context.Context, client *http.Client, link, vkToken, s
 	}, nil
 }
 
-func httpPost(ctx context.Context, client *http.Client, endpoint string, data url.Values) ([]byte, error) {
+func httpPost(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := client.Do(req)

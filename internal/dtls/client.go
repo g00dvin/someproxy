@@ -3,6 +3,8 @@ package dtls
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/cbeuw/connutil"
 	"github.com/pion/dtls/v3"
+	"github.com/pion/dtls/v3/pkg/crypto/elliptic"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 )
 
@@ -23,7 +26,11 @@ import (
 // for plugging directly into the MUX as a stream-oriented connection.
 // The returned CancelFunc must be called to stop the bridge goroutines.
 func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net.UDPAddr, expectedFP []byte) (net.Conn, context.CancelFunc, error) {
-	certificate, err := selfsign.GenerateSelfSigned()
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, fmt.Errorf("rsa key: %w", err)
+	}
+	certificate, err := selfsign.SelfSign(rsaKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate self-signed cert: %w", err)
 	}
@@ -97,10 +104,23 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 
 	// DTLS client handshake over conn1 (the other end of the pipe).
 	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		InsecureSkipVerify:    true,
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
+		Certificates:         []tls.Certificate{certificate},
+		InsecureSkipVerify:   true,
+		ExtendedMasterSecret: dtls.RequireExtendedMasterSecret,
+		CipherSuites: []dtls.CipherSuiteID{
+			dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			dtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		},
+		EllipticCurves: []elliptic.Curve{
+			elliptic.X25519,
+			elliptic.P256,
+			elliptic.P384,
+		},
+		PaddingLength: 512,
+		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
+			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
+		},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
 		VerifyConnection: func(state *dtls.State) error {
 			if len(expectedFP) == 0 {
@@ -118,7 +138,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		},
 	}
 
-	hsCtx, hsCancel := context.WithTimeout(ctx, 30*time.Second)
+	hsCtx, hsCancel := context.WithTimeout(ctx, 45*time.Second)
 	defer hsCancel()
 
 	dtlsConn, err := dtls.Client(conn1, serverAddr, config)

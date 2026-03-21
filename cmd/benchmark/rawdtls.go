@@ -67,7 +67,7 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig pr
 	go func() {
 		defer close(sendDone)
 		for {
-			_ = sig.SendRelayAddrs(sendCtx, ourAddrs, role)
+			_ = sig.SendRelayAddrs(sendCtx, ourAddrs, role, "")
 			select {
 			case <-sendCtx.Done():
 				return
@@ -76,7 +76,7 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig pr
 		}
 	}()
 
-	peerAddrs, _, err := sig.RecvRelayAddrs(ctx, skipRole)
+	peerAddrs, _, _, err := sig.RecvRelayAddrs(ctx, skipRole, "")
 	if err != nil {
 		sendCancel()
 		<-sendDone
@@ -109,7 +109,6 @@ func runOneRawDTLS(ctx context.Context, cfg *config, logger *slog.Logger, sig pr
 		go func(relayConn net.PacketConn, addr *net.UDPAddr) {
 			internaldtls.PunchRelay(relayConn, addr)
 			go internaldtls.StartPunchLoop(punchCtx, relayConn, addr)
-			time.Sleep(500 * time.Millisecond)
 
 			var conn net.Conn
 			var cleanup context.CancelFunc
