@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -153,7 +154,7 @@ func NewTunnel() *Tunnel {
 	lb := NewLogBuffer(500)
 	return &Tunnel{
 		logBuf: lb,
-		logger: slog.New(slog.NewTextHandler(lb, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		logger: slog.New(slog.NewTextHandler(io.MultiWriter(lb, os.Stderr), &slog.HandlerOptions{Level: slog.LevelInfo})),
 	}
 }
 
@@ -644,7 +645,12 @@ func (t *Tunnel) teardownMux() {
 	t.cleanups = nil
 	t.mgr = nil
 	t.sigClient = nil
-	t.muxReady = make(chan struct{})
+	// Only create a new muxReady if there was something to tear down.
+	// Repeated calls with nothing to tear down must not replace the channel
+	// (getMux may already be waiting on it).
+	if m != nil || muxCancel != nil {
+		t.muxReady = make(chan struct{})
+	}
 	t.mu.Unlock()
 
 	if muxCancel != nil {
@@ -951,24 +957,24 @@ func (t *Tunnel) OnNetworkChanged() {
 		t.networkDebounce = nil
 	}
 
-	// Drain stale packets immediately — during a phone call or network
-	// stall, TCP retransmits buffer old data that apps have already
-	// timed out on. Clearing the buffer ensures fresh responses get through.
-	if m := t.m; m != nil {
+	m := t.m
+	force := t.networkForce
+
+	// Drain stale packets before teardown.
+	if m != nil {
 		if rb := m.RawPackets(); rb != nil {
 			if n := rb.Drain(); n > 0 {
 				t.logger.Info("drained stale raw packets on network change", "count", n)
 			}
 		}
 	}
-
-	force := t.networkForce
 	t.mu.Unlock()
 
-	// Tear down immediately — dead TCP sockets cause ReconnectManager to
-	// waste time on per-connection reconnects through dead signaling WS.
-	// The reconnectLoop already has its own backoff for rapid network changes.
-	t.logger.Info("network change detected, tearing down immediately")
+	// Always tear down — even if reconnect is in progress, the underlying
+	// TCP/TURN connections are bound to the old IP and will timeout slowly.
+	// teardownMux is idempotent and only creates a new muxReady when there's
+	// something to tear down.
+	t.logger.Info("network change detected, tearing down", "had_mux", m != nil)
 	t.teardownMux()
 
 	// Signal reconnect loop (non-blocking).

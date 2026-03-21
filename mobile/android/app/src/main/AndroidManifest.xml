@@ -47,5 +47,14 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name=".DebugReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.callvpn.DEBUG_CONNECT" />
+                <action android:name="com.callvpn.DEBUG_DISCONNECT" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>
