@@ -899,10 +899,7 @@ func (t *Tunnel) Stop() {
 // OnNetworkChanged should be called by the mobile platform when the network
 // connectivity changes (e.g. WiFi→cellular).
 func (t *Tunnel) OnNetworkChanged() {
-	const (
-		debounceDelay = 2 * time.Second
-		gracePeriod   = 10 * time.Second // WiFi DHCP/IPv6 SLAAC settling period
-	)
+	const gracePeriod = 10 * time.Second // WiFi DHCP/IPv6 SLAAC settling period
 
 	t.mu.Lock()
 	running := t.running
@@ -921,6 +918,7 @@ func (t *Tunnel) OnNetworkChanged() {
 
 	if t.networkDebounce != nil {
 		t.networkDebounce.Stop()
+		t.networkDebounce = nil
 	}
 
 	// Drain stale packets immediately — during a phone call or network
@@ -935,17 +933,19 @@ func (t *Tunnel) OnNetworkChanged() {
 	}
 
 	force := t.networkForce
-	t.networkDebounce = time.AfterFunc(debounceDelay, func() {
-		t.logger.Info("network change debounce fired, forcing full reconnect")
-		t.teardownMux()
-		select {
-		case force <- struct{}{}:
-		default:
-		}
-	})
 	t.mu.Unlock()
 
-	t.logger.Info("network change detected, debouncing")
+	// Tear down immediately — dead TCP sockets cause ReconnectManager to
+	// waste time on per-connection reconnects through dead signaling WS.
+	// The reconnectLoop already has its own backoff for rapid network changes.
+	t.logger.Info("network change detected, tearing down immediately")
+	t.teardownMux()
+
+	// Signal reconnect loop (non-blocking).
+	select {
+	case force <- struct{}{}:
+	default:
+	}
 }
 
 // IsRunning returns whether the tunnel is active.
