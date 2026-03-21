@@ -559,8 +559,9 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
 				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
+				waitPunch := sigClient.PreparePunchWait(punchReadyCtx, clientNonce, idx)
 				_ = sigClient.SendPunchReady(ctx, clientNonce, idx)
-				_ = sigClient.WaitPunchReady(punchReadyCtx, clientNonce, idx)
+				_ = waitPunch()
 				prc()
 
 				dtlsConn, cleanup, lastErr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)

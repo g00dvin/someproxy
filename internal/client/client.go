@@ -393,8 +393,9 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
 				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
+				waitPunch := sigClient.PreparePunchWait(punchReadyCtx, nonce, idx)
 				_ = sigClient.SendPunchReady(ctx, nonce, idx)
-				_ = sigClient.WaitPunchReady(punchReadyCtx, nonce, idx)
+				_ = waitPunch()
 				prc()
 
 				dtlsConn, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)

@@ -554,17 +554,43 @@ func (c *SignalingClient) StopPunchDispatcher() {
 	}
 }
 
+// PreparePunchWait registers a waiter for the given index BEFORE sending
+// SendPunchReady to avoid the race where the peer's response arrives before
+// the waiter is registered. Returns a function that blocks until the signal.
+func (c *SignalingClient) PreparePunchWait(ctx context.Context, nonce string, index int) func() error {
+	pd := c.punchDisp
+	if pd == nil {
+		return func() error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+	// Register waiter NOW, before peer can respond.
+	ch := make(chan struct{}, 1)
+	pd.mu.Lock()
+	pd.waiters[index] = ch
+	pd.mu.Unlock()
+	return func() error {
+		defer func() {
+			pd.mu.Lock()
+			delete(pd.waiters, index)
+			pd.mu.Unlock()
+		}()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ch:
+			return nil
+		}
+	}
+}
+
 // WaitPunchReady blocks until a punch-ready signal for the given index
 // and nonce is received. Uses the shared punch dispatcher if started,
 // otherwise falls back to waiting on the context (old peer without dispatcher).
 func (c *SignalingClient) WaitPunchReady(ctx context.Context, nonce string, index int) error {
-	pd := c.punchDisp
-	if pd == nil {
-		// Fallback: no dispatcher = old peer, just wait the timeout.
-		<-ctx.Done()
-		return ctx.Err()
-	}
-	return pd.wait(ctx, index)
+	wait := c.PreparePunchWait(ctx, nonce, index)
+	return wait()
 }
 
 // WaitForSessionEnd blocks until one of the following occurs:

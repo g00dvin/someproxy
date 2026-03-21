@@ -64,6 +64,7 @@ type SignalingClient interface {
 	WaitDisconnectAck(ctx context.Context, nonce string) error
 	SendDisconnectAck(ctx context.Context, nonce string) error
 	SendPunchReady(ctx context.Context, nonce string, index int) error
+	PreparePunchWait(ctx context.Context, nonce string, index int) func() error
 	WaitPunchReady(ctx context.Context, nonce string, index int) error
 	StartPunchDispatcher(ctx context.Context, nonce string)
 	StopPunchDispatcher()
