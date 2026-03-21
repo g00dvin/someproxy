@@ -138,7 +138,8 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		},
 	}
 
-	hsCtx, hsCancel := context.WithTimeout(ctx, 45*time.Second)
+	// Use 20s default handshake timeout; if ctx has an earlier deadline, honour it.
+	hsCtx, hsCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer hsCancel()
 
 	dtlsConn, err := dtls.Client(conn1, serverAddr, config)

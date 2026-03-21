@@ -468,7 +468,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			var dtlsConn io.ReadWriteCloser
 			var cleanup context.CancelFunc
 			var lastErr error
-			for attempt := 1; attempt <= 3; attempt++ {
+			for attempt := 1; attempt <= 2; attempt++ {
 				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
@@ -487,8 +487,8 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 					break
 				}
 				t.logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
-				if attempt < 3 {
-					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				if attempt < 2 {
+					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 			}
 			if lastErr != nil {
@@ -516,6 +516,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		}(i, allocs[i].RelayConn, serverUDP)
 	}
 
+	var m *mux.Mux
 	var muxConns []io.ReadWriteCloser
 	var cleanups []context.CancelFunc
 	for j := 0; j < pairCount; j++ {
@@ -525,11 +526,16 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			continue
 		}
 		cleanups = append(cleanups, r.cleanup)
+		if m == nil {
+			// First successful connection — create MUX immediately.
+			m = mux.New(t.logger)
+			t.logger.Info("first relay connection ready, MUX created", "index", r.index)
+		}
 		muxConns = append(muxConns, r.conn)
 	}
 	punchCancel()
 
-	if len(muxConns) == 0 {
+	if m == nil {
 		mgr.CloseAll()
 		for _, c := range cleanups {
 			c()
@@ -537,7 +543,6 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		return nil, fmt.Errorf("no relay DTLS connections established")
 	}
 
-	m := mux.New(t.logger)
 	t.logger.Info("tunnel connected (relay-to-relay)",
 		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
@@ -633,7 +638,7 @@ func (t *Tunnel) teardownMux() {
 // and re-establishes the tunnel with exponential backoff (1s → 60s).
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
-	const attemptTimeout = 30 * time.Second
+	const attemptTimeout = 20 * time.Second
 	backoff := time.Second
 
 	for {

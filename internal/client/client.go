@@ -361,7 +361,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			var dtlsConn net.Conn
 			var cleanup context.CancelFunc
 			var lastErr error
-			for attempt := 1; attempt <= 3; attempt++ {
+			for attempt := 1; attempt <= 2; attempt++ {
 				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
@@ -378,8 +378,8 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 					break
 				}
 				logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
-				if attempt < 3 {
-					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				if attempt < 2 {
+					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 			}
 			if lastErr != nil {
@@ -409,6 +409,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 
 	var cleanups []context.CancelFunc
 	var muxConns []io.ReadWriteCloser
+	var m *mux.Mux
 	for j := 0; j < pairCount; j++ {
 		r := <-results
 		if r.err != nil {
@@ -417,11 +418,18 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		}
 		cleanups = append(cleanups, r.cleanup)
 		muxConns = append(muxConns, r.conn)
+		if m == nil {
+			// First successful connection — create MUX immediately.
+			m = mux.New(logger, r.conn)
+			logger.Info("first relay connection ready, MUX created", "index", r.index)
+		} else {
+			m.AddConn(r.conn)
+		}
 		logger.Info("relay DTLS connection established", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(muxConns), pairCount))
 	}
 	punchCancel()
 
-	if len(muxConns) == 0 {
+	if m == nil {
 		sigClient.Close()
 		mgr.CloseAll()
 		for _, c := range cleanups {
@@ -430,7 +438,6 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		return nil, fmt.Errorf("no relay DTLS connections established")
 	}
 
-	m := mux.New(logger, muxConns...)
 	return &relaySession{
 		sigClient: sigClient,
 		mgr:       mgr,

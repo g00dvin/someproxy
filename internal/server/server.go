@@ -550,7 +550,7 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 			var dtlsConn net.Conn
 			var cleanup context.CancelFunc
 			var lastErr error
-			for attempt := 1; attempt <= 3; attempt++ {
+			for attempt := 1; attempt <= 2; attempt++ {
 				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
 				internaldtls.PunchRelay(relayConn, addr)
 				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
@@ -567,8 +567,8 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 					break
 				}
 				s.cfg.Logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
-				if attempt < 3 {
-					time.Sleep(time.Duration(attempt) * 2 * time.Second)
+				if attempt < 2 {
+					time.Sleep(time.Duration(attempt) * time.Second)
 				}
 			}
 			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: lastErr}
@@ -583,6 +583,8 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		}
 	}()
 
+	m := mux.New(s.cfg.Logger)
+	var firstConn bool
 	for j := 0; j < pairCount; j++ {
 		r := <-results
 		if r.err != nil {
@@ -591,17 +593,20 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		}
 		cleanups = append(cleanups, r.cleanup)
 		dtlsConns = append(dtlsConns, r.conn)
+		if !firstConn {
+			firstConn = true
+			s.cfg.Logger.Info("first relay connection ready", "index", r.index)
+		}
 		s.cfg.Logger.Info("relay DTLS connection accepted", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(dtlsConns), pairCount))
 	}
 	punchCancel()
 
-	if len(dtlsConns) == 0 {
+	if !firstConn {
+		m.Close()
 		return fmt.Errorf("no relay DTLS connections established")
 	}
 
 	s.cfg.Logger.Info("relay-to-relay mode active", "connections", len(dtlsConns))
-
-	m := mux.New(s.cfg.Logger)
 	defer m.Close()
 
 	m.EnableRawPackets(4096)

@@ -155,7 +155,8 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
 	}
 
-	hsCtx, hsCancel := context.WithTimeout(ctx, 45*time.Second)
+	// Use 20s default handshake timeout; if ctx has an earlier deadline, honour it.
+	hsCtx, hsCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer hsCancel()
 
 	dtlsConn, err := dtls.Server(conn1, clientRelayAddr, config)
