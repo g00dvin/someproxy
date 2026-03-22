@@ -120,6 +120,58 @@ class CallVpnService : VpnService() {
 
             val t = Tunnel()
             tunnel = t
+
+            // Start stage+log poller BEFORE t.start() so UI sees connection stages.
+            val mgr = getSystemService(NotificationManager::class.java)
+            Thread {
+                while (running) {
+                    try {
+                        val logs = tunnel?.readLogs() ?: ""
+                        if (logs.isNotEmpty()) {
+                            val logIntent = Intent(ACTION_LOG).apply {
+                                putExtra(EXTRA_LOG_TEXT, logs)
+                            }
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(logIntent)
+                        }
+
+                        val stage = tunnel?.stage() ?: ""
+                        val stageIntent = Intent(ACTION_STAGE).apply {
+                            putExtra(EXTRA_STAGE_TEXT, stage)
+                        }
+                        LocalBroadcastManager.getInstance(this@CallVpnService)
+                            .sendBroadcast(stageIntent)
+
+                        // Update notification with stage during connecting
+                        if (lastBroadcastState == "connecting" && stage.isNotEmpty()) {
+                            mgr.notify(NOTIFICATION_ID, buildNotification(stage))
+                        }
+
+                        val isConnected = tunnel?.isConnected ?: false
+                        if (!isConnected && lastBroadcastState == "connected") {
+                            broadcastState("connecting")
+                            mgr.notify(NOTIFICATION_ID, buildNotification("Переподключение..."))
+                        } else if (isConnected && lastBroadcastState == "connecting") {
+                            broadcastState("connected")
+                            mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
+                        }
+
+                        val active = tunnel?.activeConns()?.toInt() ?: 0
+                        val total = tunnel?.totalConns()?.toInt() ?: 0
+                        val connIntent = Intent(ACTION_CONN_COUNT).apply {
+                            putExtra(EXTRA_ACTIVE_CONNS, active)
+                            putExtra(EXTRA_TOTAL_CONNS, total)
+                        }
+                        LocalBroadcastManager.getInstance(this@CallVpnService)
+                            .sendBroadcast(connIntent)
+
+                        Thread.sleep(300)
+                    } catch (_: InterruptedException) {
+                        break
+                    } catch (_: Exception) { }
+                }
+            }.start()
+
             try {
                 t.start(config)
             } catch (e: Exception) {
@@ -209,62 +261,7 @@ class CallVpnService : VpnService() {
             // Register network change callback for fast reconnect.
             registerNetworkCallback()
 
-            val mgr = getSystemService(NotificationManager::class.java)
             mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
-
-            // Log poller: reads logs from Go tunnel, broadcasts to UI,
-            // and monitors tunnel connection state for reconnect awareness.
-            Thread {
-                while (running) {
-                    try {
-                        // ReadLogs atomically reads and clears the buffer.
-                        val logs = tunnel?.readLogs() ?: ""
-                        if (logs.isNotEmpty()) {
-                            val logIntent = Intent(ACTION_LOG).apply {
-                                putExtra(EXTRA_LOG_TEXT, logs)
-                            }
-                            LocalBroadcastManager.getInstance(this@CallVpnService)
-                                .sendBroadcast(logIntent)
-                        }
-
-                        // Monitor tunnel connection state for reconnect.
-                        val isConnected = tunnel?.isConnected ?: false
-                        if (!isConnected && lastBroadcastState == "connected") {
-                            broadcastState("connecting")
-                            mgr.notify(NOTIFICATION_ID, buildNotification("Переподключение..."))
-                        } else if (isConnected && lastBroadcastState == "connecting") {
-                            broadcastState("connected")
-                            mgr.notify(NOTIFICATION_ID, buildNotification("Подключён"))
-                        }
-
-                        // Broadcast connection stage.
-                        val stage = tunnel?.stage() ?: ""
-                        if (stage.isNotEmpty()) {
-                            val stageIntent = Intent(ACTION_STAGE).apply {
-                                putExtra(EXTRA_STAGE_TEXT, stage)
-                            }
-                            LocalBroadcastManager.getInstance(this@CallVpnService)
-                                .sendBroadcast(stageIntent)
-                        }
-
-                        // Broadcast connection count.
-                        val active = tunnel?.activeConns()?.toInt() ?: 0
-                        val total = tunnel?.totalConns()?.toInt() ?: 0
-                        val connIntent = Intent(ACTION_CONN_COUNT).apply {
-                            putExtra(EXTRA_ACTIVE_CONNS, active)
-                            putExtra(EXTRA_TOTAL_CONNS, total)
-                        }
-                        LocalBroadcastManager.getInstance(this@CallVpnService)
-                            .sendBroadcast(connIntent)
-
-                        Thread.sleep(500)
-                    } catch (_: InterruptedException) {
-                        break
-                    } catch (_: Exception) {
-                        // ignore
-                    }
-                }
-            }.start()
 
             // Read from TUN -> write to tunnel
             Thread {
