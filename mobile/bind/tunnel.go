@@ -433,6 +433,15 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		if ar.mgr != nil {
 			ar.mgr.CloseAll()
 		}
+		// If we used cached JoinInfo and signaling failed, retry with fresh fetch.
+		if cachedJI != nil {
+			t.logger.Warn("cached JoinInfo stale, fetching fresh", "err", err)
+			t.mu.Lock()
+			t.cachedJoinInfo = nil
+			t.cachedCreds = nil
+			t.mu.Unlock()
+			return t.connectRelay(ctx, cfg)
+		}
 		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
 	if err := sigClient.SetKey(cfg.Token); err != nil {
