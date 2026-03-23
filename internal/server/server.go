@@ -445,15 +445,14 @@ func (s *Server) runRelayMode(ctx context.Context) {
 			return
 		}
 
-		s.cfg.Logger.Info("waiting for client session...")
-		err := s.runOneRelaySession(ctx)
+		// Outer loop: maintain a persistent VK session.
+		// Only re-join VK when signaling dies.
+		err := s.runPersistentRelaySession(ctx)
 		if ctx.Err() != nil {
 			return
 		}
 		if err != nil {
-			s.cfg.Logger.Warn("relay session failed", "err", err)
-		} else {
-			s.cfg.Logger.Info("relay session ended")
+			s.cfg.Logger.Warn("persistent relay session failed", "err", err)
 		}
 
 		select {
@@ -464,7 +463,10 @@ func (s *Server) runRelayMode(ctx context.Context) {
 	}
 }
 
-func (s *Server) runOneRelaySession(ctx context.Context) error {
+// runPersistentRelaySession joins VK once and serves multiple client
+// connections without leaving the call. It only returns when the
+// signaling WebSocket dies or context is cancelled.
+func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 	if s.cfg.AuthToken == "" {
 		return fmt.Errorf("token is required for relay-to-relay mode")
 	}
@@ -475,7 +477,8 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("join conference: %w", err)
 	}
-	s.cfg.Logger.Info("joined conference", "service", svc.Name(), "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
+	s.cfg.Logger.Info("joined conference", "service", svc.Name(),
+		"ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
 	sigClient, err := svc.ConnectSignaling(ctx, jr, s.cfg.Logger.With("component", "signaling"))
 	if err != nil {
@@ -487,6 +490,41 @@ func (s *Server) runOneRelaySession(ctx context.Context) error {
 		return fmt.Errorf("set signaling key: %w", err)
 	}
 
+	s.cfg.Logger.Info("waiting for client session...")
+
+	// Inner loop: accept client sessions on the same VK signaling.
+	// If too many consecutive errors occur (e.g. credentials expired but
+	// signaling still alive), force a VK rejoin to get fresh credentials.
+	const maxConsecErrors = 3
+	consecErrors := 0
+	for {
+		err := s.acceptOneClient(ctx, sigClient, svc)
+		if ctx.Err() != nil {
+			return nil
+		}
+		if !sigClient.IsAlive() {
+			s.cfg.Logger.Warn("signaling died, will rejoin VK")
+			return fmt.Errorf("signaling connection lost")
+		}
+		if err != nil {
+			consecErrors++
+			s.cfg.Logger.Warn("client session failed", "err", err, "consec_errors", consecErrors)
+			if consecErrors >= maxConsecErrors {
+				s.cfg.Logger.Warn("too many consecutive failures, rejoining VK to refresh credentials")
+				return fmt.Errorf("consecutive client session failures: %d", consecErrors)
+			}
+		} else {
+			consecErrors = 0
+			s.cfg.Logger.Info("client session ended, waiting for next client...")
+		}
+	}
+}
+
+// acceptOneClient waits for a single client to connect on the existing
+// signaling channel, serves its session, and returns when the client
+// disconnects. The caller (runPersistentRelaySession) keeps the VK
+// session alive across multiple client connections.
+func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service) error {
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	defer mgr.CloseAll()
 

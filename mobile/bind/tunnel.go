@@ -706,6 +706,13 @@ func (t *Tunnel) teardownMux() {
 	}
 	t.mu.Unlock()
 
+	// Close signaling FIRST — while the WebSocket may still be alive,
+	// send hangup to remove our participant from the VK call.
+	// This prevents ghost participants when the network is degraded
+	// but not yet fully dead.
+	if sig != nil {
+		sig.Close()
+	}
 	if muxCancel != nil {
 		muxCancel()
 	}
@@ -717,9 +724,6 @@ func (t *Tunnel) teardownMux() {
 	}
 	if mgr != nil {
 		mgr.CloseAll()
-	}
-	if sig != nil {
-		sig.Close()
 	}
 }
 
@@ -992,48 +996,84 @@ func (t *Tunnel) Stop() {
 }
 
 // OnNetworkChanged should be called by the mobile platform when the network
-// connectivity changes (e.g. WiFi→cellular).
+// connectivity changes (e.g. WiFi→cellular, tower handoff).
+//
+// Uses a three-level strategy to minimize unnecessary teardowns:
+//   Level 0 — MUX still healthy after settling: do nothing (tower handoff).
+//   Level 1 — MUX unhealthy but signaling alive: probe connections so
+//             ReconnectManager replaces dead ones (brief signal loss).
+//   Level 2 — everything dead: full teardown + reconnect (WiFi↔cellular).
 func (t *Tunnel) OnNetworkChanged() {
-	const gracePeriod = 10 * time.Second // WiFi DHCP/IPv6 SLAAC settling period
+	const gracePeriod = 10 * time.Second  // ignore events right after connect
+	const settleDelay = 1500 * time.Millisecond // wait for network to settle
+	const healthProbe = 3 * time.Second   // MUX ping timeout after settling
 
 	t.mu.Lock()
-	running := t.running
-	connAge := time.Since(t.connectedAt)
-
-	if !running {
+	if !t.running {
 		t.mu.Unlock()
 		return
 	}
 
+	connAge := time.Since(t.connectedAt)
 	if connAge < gracePeriod {
 		t.mu.Unlock()
 		t.logger.Info("ignoring network change during grace period", "conn_age", connAge)
 		return
 	}
 
+	// Debounce: cancel any pending check from a previous event.
 	if t.networkDebounce != nil {
 		t.networkDebounce.Stop()
-		t.networkDebounce = nil
 	}
+	t.networkDebounce = time.AfterFunc(settleDelay, func() {
+		t.networkSettled(healthProbe)
+	})
+	t.mu.Unlock()
+}
 
+// networkSettled runs after the settle delay. It determines the reconnect
+// level and takes the minimum action needed.
+func (t *Tunnel) networkSettled(healthProbe time.Duration) {
+	t.mu.Lock()
+	if !t.running {
+		t.mu.Unlock()
+		return
+	}
 	m := t.m
+	sig := t.sigClient
 	force := t.networkForce
-
-	// Drain stale packets before teardown.
-	if m != nil {
-		if rb := m.RawPackets(); rb != nil {
-			if n := rb.Drain(); n > 0 {
-				t.logger.Info("drained stale raw packets on network change", "count", n)
-			}
-		}
-	}
 	t.mu.Unlock()
 
-	// Always tear down — even if reconnect is in progress, the underlying
-	// TCP/TURN connections are bound to the old IP and will timeout slowly.
-	// teardownMux is idempotent and only creates a new muxReady when there's
-	// something to tear down.
-	t.logger.Info("network change detected, tearing down", "had_mux", m != nil)
+	// No active tunnel — nothing to check.
+	if m == nil {
+		return
+	}
+
+	// Level 0: MUX still healthy — tower handoff, connections survived.
+	if m.IsHealthy(healthProbe) {
+		t.logger.Info("network change: MUX still healthy, no action needed (level 0)")
+		return
+	}
+
+	// MUX unhealthy — check signaling.
+	if sig != nil && sig.IsAlive() {
+		// Level 1: signaling alive — probe connections so ReconnectManager
+		// detects dead ones and replaces them individually.
+		t.logger.Info("network change: MUX unhealthy but signaling alive, probing connections (level 1)")
+		m.ProbeConnections(3 * time.Second)
+		return
+	}
+
+	// Level 2: everything dead — full teardown.
+	t.logger.Info("network change: full teardown (level 2)", "sig_alive", sig != nil && sig.IsAlive())
+
+	// Drain stale packets before teardown.
+	if rb := m.RawPackets(); rb != nil {
+		if n := rb.Drain(); n > 0 {
+			t.logger.Info("drained stale raw packets on network change", "count", n)
+		}
+	}
+
 	t.teardownMux()
 
 	// Signal reconnect loop (non-blocking).
