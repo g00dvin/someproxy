@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/gorilla/websocket"
@@ -882,6 +883,107 @@ func (c *SignalingClient) IsAlive() bool {
 // PeerID returns our peer ID assigned by the signaling server.
 func (c *SignalingClient) PeerID() string {
 	return c.myPeerID
+}
+
+// StartSignalingKeepAlive sends periodic signaling commands to prevent VK
+// from kicking us as idle. Sends accept-call once, then periodically sends
+// transmit-data (fake SDP) and change-media-settings to simulate call activity.
+func (c *SignalingClient) StartSignalingKeepAlive(ctx context.Context, logger *slog.Logger) {
+	// Initial accept-call.
+	if err := c.SendAcceptCall(); err != nil {
+		logger.Warn("failed to send accept-call", "err", err)
+	}
+
+	// Minimal SDP offer to make VK think we're negotiating WebRTC.
+	fakeSDP := `{"type":"offer","sdp":"v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=sendrecv\r\na=rtpmap:111 opus/48000/2\r\n"}`
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-c.done:
+				return
+			case <-ticker.C:
+				if err := c.sendCommand("transmit-data", fakeSDP); err != nil {
+					logger.Debug("transmit-data keepalive failed", "err", err)
+					return
+				}
+				if err := c.sendCommand("change-media-settings", nil); err != nil {
+					logger.Debug("change-media-settings keepalive failed", "err", err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// sendCommand sends an arbitrary VK signaling command.
+func (c *SignalingClient) sendCommand(cmdName string, data interface{}) error {
+	c.mu.Lock()
+	c.seq++
+	seq := c.seq
+	c.mu.Unlock()
+
+	type rawCmd struct {
+		Command  string      `json:"command"`
+		Sequence int         `json:"sequence"`
+		Data     interface{} `json:"data,omitempty"`
+	}
+	cmd := rawCmd{Command: cmdName, Sequence: seq, Data: data}
+	msg, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", cmdName, err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(websocket.TextMessage, msg)
+}
+
+// SendAcceptCall sends an "accept-call" command to VK signaling.
+// This tells VK that the participant has "accepted the call" and moves
+// it through the call state machine (JOIN→START). Without this, VK
+// considers the participant idle and kicks it after ~60-120 seconds.
+func (c *SignalingClient) SendAcceptCall() error {
+	c.mu.Lock()
+	c.seq++
+	seq := c.seq
+	c.mu.Unlock()
+
+	type mediaSettings struct {
+		IsAudioEnabled              bool `json:"isAudioEnabled"`
+		IsVideoEnabled              bool `json:"isVideoEnabled"`
+		IsScreenSharingEnabled      bool `json:"isScreenSharingEnabled"`
+		IsFastScreenSharingEnabled  bool `json:"isFastScreenSharingEnabled"`
+		IsAudioSharingEnabled       bool `json:"isAudioSharingEnabled"`
+		IsAnimojiEnabled            bool `json:"isAnimojiEnabled"`
+	}
+	type acceptCallCmd struct {
+		Command       string        `json:"command"`
+		Sequence      int           `json:"sequence"`
+		MediaSettings mediaSettings `json:"mediaSettings"`
+	}
+
+	cmd := acceptCallCmd{
+		Command:  "accept-call",
+		Sequence: seq,
+		MediaSettings: mediaSettings{
+			IsAudioEnabled: true,
+			IsVideoEnabled: false,
+		},
+	}
+
+	msg, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("marshal accept-call: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(websocket.TextMessage, msg)
 }
 
 // SendHangup sends a "hangup" command to VK signaling to explicitly

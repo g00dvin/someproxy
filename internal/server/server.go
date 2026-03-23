@@ -490,6 +490,13 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 		return fmt.Errorf("set signaling key: %w", err)
 	}
 
+	// Start signaling keepalive to prevent VK from kicking us as idle.
+	if ka, ok := sigClient.(interface {
+		StartSignalingKeepAlive(context.Context, *slog.Logger)
+	}); ok {
+		ka.StartSignalingKeepAlive(ctx, s.cfg.Logger)
+	}
+
 	s.cfg.Logger.Info("waiting for client session...")
 
 	// Inner loop: accept client sessions on the same VK signaling.
