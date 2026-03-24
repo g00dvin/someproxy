@@ -326,12 +326,13 @@ class CallVpnService : VpnService() {
         stopSelf()
     }
 
-    /** Detects the TUN interface name by scanning /sys/class/net/ */
+    /** Detects the VPN TUN interface name by scanning /sys/class/net/ */
     private fun detectTunName(): String? {
+        val tunRegex = Regex("^tun\\d+$")
         val netDir = java.io.File("/sys/class/net/")
         return netDir.listFiles()
             ?.map { it.name }
-            ?.firstOrNull { it.startsWith("tun") }
+            ?.firstOrNull { tunRegex.matches(it) }
     }
 
     override fun onDestroy() {

@@ -107,8 +107,8 @@ class RootManager(context: Context) {
     private fun buildSetupCommands(tunName: String): List<String> {
         val cmds = mutableListOf<String>()
 
-        // 1. Enable IP forwarding
-        cmds += "echo 1 > /proc/sys/net/ipv4/ip_forward"
+        // 1. Enable IP forwarding (sysctl works reliably under su, echo > /proc does not)
+        cmds += "sysctl -w net.ipv4.ip_forward=1"
 
         // 2. Mark packets from tethering interfaces (fwmark 2)
         for (iface in TETHER_INTERFACES) {
@@ -131,6 +131,14 @@ class RootManager(context: Context) {
         // 6. Fix TTL to 64 on all outgoing packets (hides tethering from operator)
         cmds += "iptables -t mangle -I POSTROUTING -j TTL --ttl-set 64"
 
+        // 7. Block IPv6 forwarding for tethered devices — forces fallback to IPv4
+        //    which is routed through VPN. Without this, sites that prefer IPv6 (e.g.
+        //    whatsmyipaddress.com, linkmeter.net) leak the real operator IP.
+        for (iface in TETHER_INTERFACES) {
+            cmds += "ip6tables -I FORWARD -i $iface -j DROP"
+            cmds += "ip6tables -I FORWARD -o $iface -j DROP"
+        }
+
         return cmds
     }
 
@@ -138,6 +146,11 @@ class RootManager(context: Context) {
         val cmds = mutableListOf<String>()
 
         // Reverse order of setup. Use -D (delete). 2>/dev/null for tolerance.
+        for (iface in TETHER_INTERFACES) {
+            cmds += "ip6tables -D FORWARD -o $iface -j DROP 2>/dev/null"
+            cmds += "ip6tables -D FORWARD -i $iface -j DROP 2>/dev/null"
+        }
+
         cmds += "iptables -t mangle -D POSTROUTING -j TTL --ttl-set 64 2>/dev/null"
 
         for (iface in TETHER_INTERFACES) {
@@ -154,19 +167,25 @@ class RootManager(context: Context) {
             cmds += "iptables -t mangle -D PREROUTING -i $iface -j MARK --set-mark 2 2>/dev/null"
         }
 
-        cmds += "echo 0 > /proc/sys/net/ipv4/ip_forward"
+        cmds += "sysctl -w net.ipv4.ip_forward=0"
 
         return cmds
     }
 
     /**
-     * Executes all commands in a single su session for efficiency.
-     * This avoids multiple root permission popups and is faster.
+     * Executes all commands in a single su session by piping them to stdin.
+     * This is more reliable than `su -c "script"` across different su
+     * implementations (Magisk, KernelSU, SuperSU) and avoids issues with
+     * shell redirection and multi-line argument parsing.
      */
     private fun executeRootCommands(commands: List<String>): Boolean {
         return try {
-            val script = commands.joinToString("\n")
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", script))
+            val process = Runtime.getRuntime().exec(arrayOf("su"))
+            val stdin = process.outputStream
+            val script = commands.joinToString("\n") + "\nexit\n"
+            stdin.write(script.toByteArray())
+            stdin.flush()
+            stdin.close()
             val exitCode = process.waitFor()
             exitCode == 0
         } catch (_: Exception) {
