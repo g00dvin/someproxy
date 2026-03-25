@@ -4,6 +4,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 )
 
@@ -40,6 +42,26 @@ const (
 	SessionEndDisconnect                         // peer sent explicit disconnect
 	SessionEndClosed                             // connection closed or context cancelled
 )
+
+// RateLimitError is returned by providers when the upstream API throttles requests.
+// Code contains the provider-specific error code (e.g. VK codes 6, 9, 14, 29, 1105).
+type RateLimitError struct {
+	Code    int
+	Message string
+}
+
+func (e *RateLimitError) Error() string {
+	return fmt.Sprintf("rate limit (code %d): %s", e.Code, e.Message)
+}
+
+// IsRateLimitError checks whether err is a RateLimitError and returns it.
+func IsRateLimitError(err error) (*RateLimitError, bool) {
+	var rle *RateLimitError
+	if errors.As(err, &rle) {
+		return rle, true
+	}
+	return nil, false
+}
 
 // CredentialsProvider fetches TURN credentials for individual allocations.
 // Each call may return fresh credentials (e.g. new anonymous identity).
