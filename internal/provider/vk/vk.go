@@ -144,6 +144,10 @@ func vkAnonToken(ctx context.Context, client *http.Client, ua string) (string, e
 	if err != nil {
 		return "", err
 	}
+	if rle := checkLoginRateLimit(body); rle != nil {
+		slog.Warn("VK login rate limit", "code", rle.Code, "msg", rle.Message)
+		return "", rle
+	}
 	var resp struct {
 		Data struct {
 			AccessToken string `json:"access_token"`
@@ -161,7 +165,7 @@ func vkAnonToken(ctx context.Context, client *http.Client, ua string) (string, e
 func vkAnonPayload(ctx context.Context, client *http.Client, ua string, token1 string) (string, error) {
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=%s&client_id=%s", vkAPIVersion, vkClientID)
 	data := url.Values{"access_token": {token1}}
-	body, err := httpPost(ctx, client, ua, endpoint, data)
+	body, err := vkAPIPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
@@ -192,6 +196,10 @@ func vkMessagesToken(ctx context.Context, client *http.Client, ua string, token2
 	if err != nil {
 		return "", err
 	}
+	if rle := checkLoginRateLimit(body); rle != nil {
+		slog.Warn("VK login rate limit", "code", rle.Code, "msg", rle.Message)
+		return "", rle
+	}
 	var resp struct {
 		Data struct {
 			AccessToken string `json:"access_token"`
@@ -213,7 +221,7 @@ func vkJoinToken(ctx context.Context, client *http.Client, ua string, link, toke
 		"access_token": {token3},
 	}
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
-	body, err := httpPost(ctx, client, ua, endpoint, data)
+	body, err := vkAPIPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
@@ -306,6 +314,70 @@ func okJoinConference(ctx context.Context, client *http.Client, ua string, link,
 		convID:    resp.ID,
 		deviceIdx: resp.DeviceIdx,
 	}, nil
+}
+
+// vkErrorResponse represents a VK API JSON error envelope.
+type vkErrorResponse struct {
+	Error *struct {
+		Code int    `json:"error_code"`
+		Msg  string `json:"error_msg"`
+	} `json:"error"`
+}
+
+// vkRateLimitCodes are VK API error codes that indicate rate limiting.
+var vkRateLimitCodes = map[int]bool{
+	6:  true, // Too many requests per second
+	9:  true, // Flood control
+	14: true, // Captcha needed
+	29: true, // Rate limit reached
+}
+
+// checkVKRateLimit parses the response body for VK API error codes.
+func checkVKRateLimit(body []byte) *provider.RateLimitError {
+	var resp vkErrorResponse
+	if err := json.Unmarshal(body, &resp); err != nil || resp.Error == nil {
+		return nil
+	}
+	if vkRateLimitCodes[resp.Error.Code] {
+		return &provider.RateLimitError{
+			Code:    resp.Error.Code,
+			Message: resp.Error.Msg,
+		}
+	}
+	return nil
+}
+
+// checkLoginRateLimit parses login.vk.ru response for auth flood errors.
+func checkLoginRateLimit(body []byte) *provider.RateLimitError {
+	var resp struct {
+		Error     string `json:"error"`
+		ErrorCode int    `json:"error_code"`
+		ErrorDesc string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil
+	}
+	if resp.ErrorCode == 1105 || strings.Contains(resp.ErrorDesc, "Too many") {
+		return &provider.RateLimitError{
+			Code:    1105,
+			Message: resp.ErrorDesc,
+		}
+	}
+	return nil
+}
+
+// vkAPIPost performs an HTTP POST to a VK API endpoint and checks
+// the response for rate limit errors before returning.
+func vkAPIPost(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values) ([]byte, error) {
+	body, err := httpPost(ctx, client, ua, endpoint, data)
+	if err != nil {
+		return nil, err
+	}
+	if rle := checkVKRateLimit(body); rle != nil {
+		slog.Warn("VK API rate limit", "code", rle.Code, "msg", rle.Message, "endpoint", endpoint)
+		return nil, rle
+	}
+	return body, nil
 }
 
 func httpPost(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values) ([]byte, error) {
