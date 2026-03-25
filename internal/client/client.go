@@ -250,35 +250,14 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	}
 	logger.Info("joined conference", "ws_endpoint", jr.WSEndpoint, "conv_id", jr.ConvID)
 
-	// 2. Start TURN allocations in background — independent of signaling setup.
-	type allocResult struct {
-		allocs []*turn.Allocation
-		mgr    *turn.Manager
-		err    error
-	}
-	allocCh := make(chan allocResult, 1)
-	go func() {
-		mgr := turn.NewManager(svc, useTCP, logger)
-		allocs, err := mgr.Allocate(ctx, numConns)
-		allocCh <- allocResult{allocs, mgr, err}
-	}()
-
-	// Meanwhile, set up signaling (connect + SetKey + disconnect handshake).
+	// 2. Setup signaling (connect + SetKey + disconnect handshake + keepalive).
 	sigClient, err := svc.ConnectSignaling(ctx, jr, logger.With("component", "signaling"))
 	if err != nil {
-		ar := <-allocCh
-		if ar.mgr != nil {
-			ar.mgr.CloseAll()
-		}
 		return nil, fmt.Errorf("signaling connect: %w", err)
 	}
 
 	if err := sigClient.SetKey(authToken); err != nil {
 		sigClient.Close()
-		ar := <-allocCh
-		if ar.mgr != nil {
-			ar.mgr.CloseAll()
-		}
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
@@ -309,160 +288,146 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		ka.StartSignalingKeepAlive(ctx, logger)
 	}
 
-	// 3. Wait for TURN allocations to complete.
-	ar := <-allocCh
-	if ar.err != nil {
-		siren.AlertTURNAuthFailure(ctx, ar.err)
-		sigClient.Close()
-		if ar.mgr != nil {
-			ar.mgr.CloseAll()
-		}
-		return nil, fmt.Errorf("allocate TURN: %w", ar.err)
-	}
-	mgr := ar.mgr
-	allocs := ar.allocs
-	logger.Info("TURN allocations created", "count", len(allocs))
+	// 3. Start batched TURN allocations.
+	mgr := turn.NewManager(svc, useTCP, logger)
+	batchCh := mgr.AllocateGradual(ctx, numConns, turn.GradualOpts{})
 
-	// Collect our relay addresses.
-	ourAddrs := make([]string, len(allocs))
-	for i, a := range allocs {
-		ourAddrs[i] = a.RelayAddr.String()
-	}
-
-	// 4. Exchange relay addresses with retry.
-	sendDone := make(chan struct{})
-	sendCtx, sendCancel := context.WithCancel(ctx)
-	go func() {
-		defer close(sendDone)
-		for {
-			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "client", nonce); err != nil {
-				return
-			}
-			select {
-			case <-sendCtx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
-		}
-	}()
-
-	serverAddrs, _, _, err := sigClient.RecvRelayAddrs(ctx, "client", nonce)
-	if err != nil {
-		sendCancel()
-		<-sendDone
-		sigClient.Close()
-		mgr.CloseAll()
-		return nil, fmt.Errorf("recv relay addrs: %w", err)
-	}
-
-	// Keep sending our addrs for a few more seconds so the peer receives them.
-	go func() {
-		time.Sleep(5 * time.Second)
-		sendCancel()
-		<-sendDone
-	}()
-
-	// Match allocations to server addresses.
-	pairCount := len(allocs)
-	if len(serverAddrs) < pairCount {
-		pairCount = len(serverAddrs)
-	}
-
-	// 5. Punch relay and establish DTLS in parallel.
+	// 4. Process batches: allocate → signaling → DTLS → MUX.
 	sessionID := uuid.New()
 	logger.Info("session (relay-to-relay mode)", "id", sessionID.String())
 
+	var cleanups []context.CancelFunc
+	var m *mux.Mux
+
+	sigClient.StartPunchDispatcher(ctx, nonce)
+
 	type dtlsResult struct {
-		index   int
 		conn    io.ReadWriteCloser
 		cleanup context.CancelFunc
 		err     error
 	}
-	results := make(chan dtlsResult, pairCount)
-	punchCtx, punchCancel := context.WithCancel(ctx)
 
-	sigClient.StartPunchDispatcher(ctx, nonce)
-	defer sigClient.StopPunchDispatcher()
+	batchIdx := 0
+	punchIdx := 0 // global punch index across all batches
 
-	for i := 0; i < pairCount; i++ {
-		serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
-		if err != nil {
-			logger.Warn("resolve server relay addr", "index", i, "addr", serverAddrs[i], "err", err)
-			results <- dtlsResult{index: i, err: err}
+	for br := range batchCh {
+		if len(br.Allocs) == 0 {
+			if br.Final {
+				break
+			}
 			continue
 		}
-		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
-			var dtlsConn net.Conn
-			var cleanup context.CancelFunc
-			var lastErr error
-			for attempt := 1; attempt <= 2; attempt++ {
-				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
-				internaldtls.PunchRelay(relayConn, addr)
-				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
-				waitPunch := sigClient.PreparePunchWait(punchReadyCtx, nonce, idx)
-				_ = sigClient.SendPunchReady(ctx, nonce, idx)
-				_ = waitPunch()
-				prc()
+		// Collect relay addresses for this batch.
+		addrs := make([]string, len(br.Allocs))
+		for i, a := range br.Allocs {
+			addrs[i] = a.RelayAddr.String()
+		}
+		logger.Info("batch ready", "batch", batchIdx, "allocs", len(br.Allocs), "final", br.Final)
 
-				dtlsConn, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)
-				punchLoopCancel()
+		// Exchange batch addresses with server via signaling.
+		if err := sigClient.SendRelayBatch(ctx, addrs, "client", nonce, batchIdx, br.Final); err != nil {
+			logger.Error("send relay batch", "batch", batchIdx, "err", err)
+			break
+		}
+		serverAddrs, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
+		if err != nil {
+			logger.Error("recv relay batch", "batch", batchIdx, "err", err)
+			break
+		}
 
-				if lastErr == nil {
-					break
-				}
-				logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
-				if attempt < 2 {
-					time.Sleep(time.Duration(attempt) * time.Second)
-				}
+		pairCount := len(br.Allocs)
+		if len(serverAddrs) < pairCount {
+			pairCount = len(serverAddrs)
+		}
+
+		// DTLS handshake for each pair in this batch (parallel).
+		results := make(chan dtlsResult, pairCount)
+		punchCtx, punchCancel := context.WithCancel(ctx)
+
+		for i := 0; i < pairCount; i++ {
+			currentPunchIdx := punchIdx + i
+			serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
+			if err != nil {
+				logger.Warn("resolve server relay addr", "batch", batchIdx, "index", i, "addr", serverAddrs[i], "err", err)
+				results <- dtlsResult{err: err}
+				continue
 			}
-			if lastErr != nil {
-				results <- dtlsResult{index: idx, err: lastErr}
-				return
-			}
+			go func(relayConn net.PacketConn, addr *net.UDPAddr, pIdx int) {
+				var dtlsConn net.Conn
+				var cleanup context.CancelFunc
+				var lastErr error
+				for attempt := 1; attempt <= 2; attempt++ {
+					punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+					internaldtls.PunchRelay(relayConn, addr)
+					go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
 
-			if authToken != "" {
-				if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
-					cleanup()
-					results <- dtlsResult{index: idx, err: fmt.Errorf("write auth token: %w", err)}
+					punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
+					waitPunch := sigClient.PreparePunchWait(punchReadyCtx, nonce, pIdx)
+					_ = sigClient.SendPunchReady(ctx, nonce, pIdx)
+					_ = waitPunch()
+					prc()
+
+					dtlsConn, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, expectedFP)
+					punchLoopCancel()
+
+					if lastErr == nil {
+						break
+					}
+					logger.Warn("DTLS handshake failed", "attempt", attempt, "punch_idx", pIdx, "err", lastErr)
+					if attempt < 2 {
+						time.Sleep(time.Duration(attempt) * time.Second)
+					}
+				}
+				if lastErr != nil {
+					results <- dtlsResult{err: lastErr}
 					return
 				}
-			}
 
-			var sid [16]byte
-			copy(sid[:], sessionID[:])
-			if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-				cleanup()
-				results <- dtlsResult{index: idx, err: fmt.Errorf("write session id: %w", err)}
-				return
-			}
+				if authToken != "" {
+					if err := mux.WriteAuthToken(dtlsConn, authToken); err != nil {
+						cleanup()
+						results <- dtlsResult{err: fmt.Errorf("write auth token: %w", err)}
+						return
+					}
+				}
 
-			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup}
-		}(i, allocs[i].RelayConn, serverUDP)
+				var sid [16]byte
+				copy(sid[:], sessionID[:])
+				if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+					cleanup()
+					results <- dtlsResult{err: fmt.Errorf("write session id: %w", err)}
+					return
+				}
+
+				results <- dtlsResult{conn: dtlsConn, cleanup: cleanup}
+			}(br.Allocs[i].RelayConn, serverUDP, currentPunchIdx)
+		}
+
+		for j := 0; j < pairCount; j++ {
+			r := <-results
+			if r.err != nil {
+				logger.Warn("relay DTLS failed in batch", "batch", batchIdx, "err", r.err)
+				continue
+			}
+			cleanups = append(cleanups, r.cleanup)
+			if m == nil {
+				m = mux.New(logger, r.conn)
+				logger.Info("first relay connection ready, MUX created", "batch", batchIdx)
+			} else {
+				m.AddConn(r.conn)
+			}
+		}
+		punchCancel()
+
+		punchIdx += pairCount
+		batchIdx++
+		if br.Final {
+			break
+		}
 	}
 
-	var cleanups []context.CancelFunc
-	var muxConns []io.ReadWriteCloser
-	var m *mux.Mux
-	for j := 0; j < pairCount; j++ {
-		r := <-results
-		if r.err != nil {
-			logger.Warn("relay DTLS failed", "index", r.index, "err", r.err)
-			continue
-		}
-		cleanups = append(cleanups, r.cleanup)
-		muxConns = append(muxConns, r.conn)
-		if m == nil {
-			// First successful connection — create MUX immediately.
-			m = mux.New(logger, r.conn)
-			logger.Info("first relay connection ready, MUX created", "index", r.index)
-		} else {
-			m.AddConn(r.conn)
-		}
-		logger.Info("relay DTLS connection established", "index", r.index, "progress", fmt.Sprintf("%d/%d", len(muxConns), pairCount))
-	}
-	punchCancel()
+	sigClient.StopPunchDispatcher()
 
 	if m == nil {
 		sigClient.Close()
