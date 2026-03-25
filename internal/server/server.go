@@ -535,86 +535,96 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	defer mgr.CloseAll()
 
-	clientAddrs, _, clientNonce, err := sigClient.RecvRelayAddrs(ctx, "server", "")
-	if err != nil {
-		return fmt.Errorf("recv relay addrs: %w", err)
-	}
-	s.cfg.Logger.Info("received client relay addresses", "count", len(clientAddrs), "nonce", clientNonce)
-
-	pairCount := len(clientAddrs)
-	allocs, err := mgr.Allocate(ctx, pairCount)
-	if err != nil {
-		s.cfg.Siren.AlertTURNAuthFailure(ctx, err)
-		return fmt.Errorf("allocate TURN connections: %w", err)
-	}
-	s.cfg.Logger.Info("TURN allocations created on demand", "count", len(allocs))
-
-	ourAddrs := make([]string, len(allocs))
-	for i, a := range allocs {
-		ourAddrs[i] = a.RelayAddr.String()
-	}
-
-	sendDone := make(chan struct{})
-	sendCtx, sendCancel := context.WithCancel(ctx)
-	go func() {
-		defer close(sendDone)
-		for {
-			if err := sigClient.SendRelayAddrs(sendCtx, ourAddrs, "server", clientNonce); err != nil {
-				return
-			}
-			select {
-			case <-sendCtx.Done():
-				return
-			case <-time.After(2 * time.Second):
-			}
-		}
-	}()
-	go func() {
-		time.Sleep(5 * time.Second)
-		sendCancel()
-		<-sendDone
-	}()
-
 	type dtlsResult struct {
 		index   int
 		conn    net.Conn
 		cleanup context.CancelFunc
 		err     error
 	}
-	results := make(chan dtlsResult, len(allocs))
+	results := make(chan dtlsResult, 16)
 	punchCtx, punchCancel := context.WithCancel(ctx)
 
-	for i := 0; i < len(allocs); i++ {
-		clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
+	// Receive client relay batches and allocate matching server connections.
+	var clientNonce string
+	totalPairs := 0
+
+	for {
+		clientAddrs, _, isFinal, batchNonce, err := sigClient.RecvRelayBatch(ctx, "server", clientNonce)
 		if err != nil {
-			s.cfg.Logger.Warn("resolve client relay addr", "index", i, "addr", clientAddrs[i], "err", err)
-			results <- dtlsResult{index: i, err: err}
+			punchCancel()
+			return fmt.Errorf("recv relay batch: %w", err)
+		}
+		if clientNonce == "" {
+			clientNonce = batchNonce
+		}
+
+		if len(clientAddrs) == 0 {
+			if isFinal {
+				break
+			}
 			continue
 		}
-		go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
-			var dtlsConn net.Conn
-			var cleanup context.CancelFunc
-			var lastErr error
-			for attempt := 1; attempt <= 2; attempt++ {
-				punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
-				internaldtls.PunchRelay(relayConn, addr)
-				go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
-				time.Sleep(200 * time.Millisecond) // let TURN permissions establish
 
-				dtlsConn, cleanup, lastErr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)
-				punchLoopCancel()
+		s.cfg.Logger.Info("received client batch", "count", len(clientAddrs), "final", isFinal)
 
-				if lastErr == nil {
-					break
-				}
-				s.cfg.Logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
-				if attempt < 2 {
-					time.Sleep(time.Duration(attempt) * time.Second)
-				}
+		allocs, err := mgr.Allocate(ctx, len(clientAddrs))
+		if err != nil {
+			s.cfg.Logger.Error("allocate for batch failed", "err", err)
+			_ = sigClient.SendRelayBatch(ctx, nil, "server", clientNonce, totalPairs, isFinal)
+			if isFinal {
+				break
 			}
-			results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: lastErr}
-		}(i, allocs[i].RelayConn, clientUDP)
+			continue
+		}
+
+		serverAddrs := make([]string, len(allocs))
+		for i, a := range allocs {
+			serverAddrs[i] = a.RelayAddr.String()
+		}
+		if err := sigClient.SendRelayBatch(ctx, serverAddrs, "server", clientNonce, totalPairs, isFinal); err != nil {
+			punchCancel()
+			return fmt.Errorf("send relay batch: %w", err)
+		}
+
+		batchPairs := min(len(allocs), len(clientAddrs))
+		for i := 0; i < batchPairs; i++ {
+			clientUDP, err := net.ResolveUDPAddr("udp", clientAddrs[i])
+			if err != nil {
+				s.cfg.Logger.Warn("resolve client relay addr", "addr", clientAddrs[i], "err", err)
+				results <- dtlsResult{index: totalPairs + i, err: err}
+				continue
+			}
+			go func(idx int, relayConn net.PacketConn, addr *net.UDPAddr) {
+				var dtlsConn net.Conn
+				var cleanup context.CancelFunc
+				var lastErr error
+				for attempt := 1; attempt <= 2; attempt++ {
+					punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+					internaldtls.PunchRelay(relayConn, addr)
+					go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
+					time.Sleep(200 * time.Millisecond)
+
+					dtlsConn, cleanup, lastErr = internaldtls.AcceptOverTURN(ctx, relayConn, addr)
+					punchLoopCancel()
+
+					if lastErr == nil {
+						break
+					}
+					s.cfg.Logger.Warn("DTLS handshake failed", "attempt", attempt, "index", idx, "err", lastErr)
+					if attempt < 2 {
+						time.Sleep(time.Duration(attempt) * time.Second)
+					}
+				}
+				results <- dtlsResult{index: idx, conn: dtlsConn, cleanup: cleanup, err: lastErr}
+			}(totalPairs+i, allocs[i].RelayConn, clientUDP)
+		}
+		totalPairs += batchPairs
+
+		if isFinal {
+			break
+		}
 	}
+	pairCount := totalPairs
 
 	var cleanups []context.CancelFunc
 	defer func() {

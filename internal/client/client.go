@@ -330,7 +330,7 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 			logger.Error("send relay batch", "batch", batchIdx, "err", err)
 			break
 		}
-		serverAddrs, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
+		serverAddrs, _, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
 		if err != nil {
 			logger.Error("recv relay batch", "batch", batchIdx, "err", err)
 			break

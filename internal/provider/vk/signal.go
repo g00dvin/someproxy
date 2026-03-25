@@ -442,17 +442,17 @@ func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string, f
 
 // RecvRelayBatch waits for a batch relay data message and returns
 // the addresses, batch number, and whether this is the final batch.
-func (c *SignalingClient) RecvRelayBatch(ctx context.Context, skipRole string, filterNonce string) ([]string, int, bool, error) {
+func (c *SignalingClient) RecvRelayBatch(ctx context.Context, skipRole string, filterNonce string) ([]string, int, bool, string, error) {
 	data, err := c.recvRelayData(ctx, skipRole, filterNonce)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, false, "", err
 	}
 	addrs, err := decodeAddrs(data.Payload)
 	if err != nil {
-		return nil, 0, false, fmt.Errorf("decode relay batch: %w", err)
+		return nil, 0, false, "", fmt.Errorf("decode relay batch: %w", err)
 	}
 	c.logger.Info("received relay batch", "count", len(addrs), "batch", data.Batch, "final", data.Final)
-	return addrs, data.Batch, data.Final, nil
+	return addrs, data.Batch, data.Final, data.Nonce, nil
 }
 
 // Drain discards all buffered notifications from the incoming channel.
