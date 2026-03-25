@@ -82,6 +82,8 @@ type SignalingClient interface {
 	SetKey(token string) error
 	SendRelayAddrs(ctx context.Context, addrs []string, role string, nonce string) error
 	RecvRelayAddrs(ctx context.Context, skipRole string, nonce string) (addrs []string, role string, recvNonce string, err error)
+	SendRelayBatch(ctx context.Context, addrs []string, role string, nonce string, batch int, final bool) error
+	RecvRelayBatch(ctx context.Context, skipRole string, filterNonce string) (addrs []string, batch int, final bool, err error)
 	SendDisconnectReq(ctx context.Context, nonce string) error
 	WaitDisconnectAck(ctx context.Context, nonce string) error
 	SendDisconnectAck(ctx context.Context, nonce string) error

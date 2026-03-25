@@ -120,6 +120,8 @@ type relayData struct {
 	Mode    string `json:"mode"`              // "pub" or "sub"
 	Nonce   string `json:"nonce,omitempty"`   // session nonce for filtering ghost messages
 	Index   int    `json:"index,omitempty"`   // connection index for punch-ready signals
+	Batch   int    `json:"batch,omitempty"`   // batch sequence number for gradual allocation
+	Final   bool   `json:"final,omitempty"`   // true if this is the last batch
 }
 
 func encodeAddrs(addrs []string) string {
@@ -342,6 +344,82 @@ func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, ro
 	return nil
 }
 
+// SendRelayBatch sends a batch of TURN relay addresses with batch metadata.
+func (c *SignalingClient) SendRelayBatch(ctx context.Context, addrs []string, role string, nonce string, batch int, final bool) error {
+	inner := relayData{
+		Type:    wireType,
+		Payload: encodeAddrs(addrs),
+		Mode:    toWireRole(role),
+		Nonce:   nonce,
+		Batch:   batch,
+		Final:   final,
+	}
+	if err := c.sendInner(ctx, inner); err != nil {
+		return err
+	}
+	c.logger.Info("sent relay batch", "count", len(addrs), "role", role, "batch", batch, "final", final)
+	return nil
+}
+
+// recvRelayData waits for the next relay data message, applying role/nonce filters.
+func (c *SignalingClient) recvRelayData(ctx context.Context, skipRole string, filterNonce string) (*relayData, error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.done:
+			return nil, fmt.Errorf("signaling connection closed")
+		case notif := <-c.incoming:
+			if notif.Name != "custom-data" {
+				continue
+			}
+			// Try notif.Data first; fall back to top-level "data" from Raw.
+			dataField := notif.Data
+			if len(dataField) == 0 || string(dataField) == "null" {
+				var raw struct {
+					Data json.RawMessage `json:"data"`
+				}
+				if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
+					dataField = raw.Data
+				}
+			}
+			c.logger.Debug("custom-data received", "data_len", len(dataField))
+
+			var blob string
+			if err := json.Unmarshal(dataField, &blob); err != nil {
+				c.logger.Debug("custom-data not a string, skip", "data", string(dataField), "err", err)
+				continue
+			}
+			innerJSON, err := c.open(blob)
+			if err != nil {
+				c.logger.Debug("custom-data decode/decrypt failed", "err", err)
+				continue
+			}
+			var data relayData
+			if err := json.Unmarshal(innerJSON, &data); err != nil {
+				c.logger.Warn("parse inner data", "err", err)
+				continue
+			}
+			if data.Type != wireType {
+				continue
+			}
+			if filterNonce != "" && data.Nonce != filterNonce {
+				c.logger.Debug("skipping relay data with wrong nonce", "got", data.Nonce, "want", filterNonce)
+				continue
+			}
+			role := fromWireRole(data.Mode)
+			if skipRole != "" && role == skipRole {
+				c.logger.Debug("skipping own echoed relay data", "role", role)
+				continue
+			}
+			// Remember the sender's participantId so we can filter
+			// hungup notifications later (ignore anonymous TURN users).
+			c.setRemotePeerFromNotif(notif)
+			return &data, nil
+		}
+	}
+}
+
 // RecvRelayAddrs waits for a custom-data notification containing
 // the remote peer's relay addresses. The data field is a base64 blob
 // wrapping the inner JSON structure. Messages whose role matches
@@ -349,68 +427,32 @@ func (c *SignalingClient) SendRelayAddrs(ctx context.Context, addrs []string, ro
 // When filterNonce is non-empty, only messages with a matching nonce are accepted.
 // Returns the received nonce as the third string value.
 func (c *SignalingClient) RecvRelayAddrs(ctx context.Context, skipRole string, filterNonce string) (addrs []string, role string, recvNonce string, err error) {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, "", "", ctx.Err()
-		case <-c.done:
-			return nil, "", "", fmt.Errorf("signaling connection closed")
-		case notif := <-c.incoming:
-			if notif.Name == "custom-data" {
-				// Try notif.Data first; fall back to top-level "data" from Raw.
-				dataField := notif.Data
-				if len(dataField) == 0 || string(dataField) == "null" {
-					var raw struct {
-						Data json.RawMessage `json:"data"`
-					}
-					if err := json.Unmarshal(notif.Raw, &raw); err == nil && len(raw.Data) > 0 {
-						dataField = raw.Data
-					}
-				}
-				c.logger.Debug("custom-data received", "data_len", len(dataField))
-
-				var blob string
-				if err := json.Unmarshal(dataField, &blob); err != nil {
-					c.logger.Debug("custom-data not a string, skip", "data", string(dataField), "err", err)
-					continue
-				}
-				innerJSON, err := c.open(blob)
-				if err != nil {
-					c.logger.Debug("custom-data decode/decrypt failed", "err", err)
-					continue
-				}
-				var data relayData
-				if err := json.Unmarshal(innerJSON, &data); err != nil {
-					c.logger.Warn("parse inner data", "err", err)
-					continue
-				}
-				if data.Type != wireType {
-					continue
-				}
-				if filterNonce != "" && data.Nonce != filterNonce {
-					c.logger.Debug("skipping relay addrs with wrong nonce", "got", data.Nonce, "want", filterNonce)
-					continue
-				}
-				addrs, err := decodeAddrs(data.Payload)
-				if err != nil {
-					c.logger.Warn("decode relay addrs", "err", err)
-					continue
-				}
-				role := fromWireRole(data.Mode)
-				if skipRole != "" && role == skipRole {
-					c.logger.Debug("skipping own echoed relay addrs", "role", role)
-					continue
-				}
-				c.logger.Info("received relay addresses", "count", len(addrs), "role", role, "nonce", data.Nonce)
-
-				// Remember the sender's participantId so we can filter
-				// hungup notifications later (ignore anonymous TURN users).
-				c.setRemotePeerFromNotif(notif)
-
-				return addrs, role, data.Nonce, nil
-			}
-		}
+	data, err := c.recvRelayData(ctx, skipRole, filterNonce)
+	if err != nil {
+		return nil, "", "", err
 	}
+	addrs, err = decodeAddrs(data.Payload)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("decode relay addrs: %w", err)
+	}
+	role = fromWireRole(data.Mode)
+	c.logger.Info("received relay addresses", "count", len(addrs), "role", role, "nonce", data.Nonce)
+	return addrs, role, data.Nonce, nil
+}
+
+// RecvRelayBatch waits for a batch relay data message and returns
+// the addresses, batch number, and whether this is the final batch.
+func (c *SignalingClient) RecvRelayBatch(ctx context.Context, skipRole string, filterNonce string) ([]string, int, bool, error) {
+	data, err := c.recvRelayData(ctx, skipRole, filterNonce)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	addrs, err := decodeAddrs(data.Payload)
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("decode relay batch: %w", err)
+	}
+	c.logger.Info("received relay batch", "count", len(addrs), "batch", data.Batch, "final", data.Final)
+	return addrs, data.Batch, data.Final, nil
 }
 
 // Drain discards all buffered notifications from the incoming channel.
