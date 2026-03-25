@@ -257,3 +257,178 @@ func (m *Manager) CloseAll() {
 		}
 	}
 }
+
+const (
+	DefaultBatchSize    = 2
+	DefaultBatchDelay   = 2 * time.Second
+	MaxImmediateRetries = 3
+	ImmediateRetryDelay = 1 * time.Second
+	MaxBatchDelay       = 5 * time.Minute
+	FloodRetryDelay     = 5 * time.Minute
+	MaxNonRLRetries     = 5
+)
+
+// GradualOpts configures the batching behavior of AllocateGradual.
+type GradualOpts struct {
+	BatchSize  int
+	BatchDelay time.Duration
+}
+
+func (o GradualOpts) withDefaults() GradualOpts {
+	if o.BatchSize <= 0 {
+		o.BatchSize = DefaultBatchSize
+	}
+	if o.BatchDelay <= 0 {
+		o.BatchDelay = DefaultBatchDelay
+	}
+	return o
+}
+
+// BatchResult contains the allocations created in a single batch.
+type BatchResult struct {
+	Allocs []*Allocation
+	Final  bool
+}
+
+func (m *Manager) createAllocationWithRetry(ctx context.Context, idx int) (*Allocation, error) {
+	for attempt := 0; attempt <= MaxImmediateRetries; attempt++ {
+		alloc, err := m.createAllocation(ctx, idx)
+		if err == nil {
+			return alloc, nil
+		}
+		rle, isRL := provider.IsRateLimitError(err)
+		if !isRL || attempt == MaxImmediateRetries {
+			return nil, err
+		}
+		if rle.Code != 6 && rle.Code != 1105 {
+			return nil, err
+		}
+		m.logger.Warn("rate limit, retrying allocation",
+			"index", idx, "attempt", attempt+1, "code", rle.Code, "delay", ImmediateRetryDelay)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(ImmediateRetryDelay):
+		}
+	}
+	return nil, fmt.Errorf("unreachable")
+}
+
+// AllocateGradual creates n allocations in batches and sends each completed batch
+// to the returned channel. Failed allocations are retried with increasing delay
+// until all n are created or ctx is cancelled. The channel is closed when done.
+// The caller MUST drain the channel.
+func (m *Manager) AllocateGradual(ctx context.Context, n int, opts GradualOpts) <-chan BatchResult {
+	opts = opts.withDefaults()
+	ch := make(chan BatchResult, 1)
+
+	go func() {
+		defer close(ch)
+		currentDelay := opts.BatchDelay
+
+		type pendingItem struct {
+			idx     int
+			retries int
+		}
+
+		pending := make([]pendingItem, n)
+		for i := range pending {
+			pending[i] = pendingItem{idx: i}
+		}
+		created := 0
+
+		for len(pending) > 0 {
+			batchSize := opts.BatchSize
+			if batchSize > len(pending) {
+				batchSize = len(pending)
+			}
+			batch := pending[:batchSize]
+			pending = pending[batchSize:]
+
+			m.logger.Info("starting allocation batch",
+				"batch_size", len(batch), "pending", len(pending), "created", created, "delay", currentDelay)
+
+			type result struct {
+				item  pendingItem
+				alloc *Allocation
+				err   error
+			}
+			results := make(chan result, len(batch))
+			for _, item := range batch {
+				go func(item pendingItem) {
+					alloc, err := m.createAllocationWithRetry(ctx, item.idx)
+					results <- result{item, alloc, err}
+				}(item)
+			}
+
+			var batchAllocs []*Allocation
+			var retryItems []pendingItem
+			escalateDelay := false
+			for range batch {
+				r := <-results
+				if r.err != nil {
+					rle, isRL := provider.IsRateLimitError(r.err)
+					if isRL {
+						m.logger.Warn("allocation rate-limited, will retry",
+							"index", r.item.idx, "code", rle.Code, "msg", rle.Message)
+						if rle.Code == 14 {
+							currentDelay = FloodRetryDelay
+							m.logger.Warn("captcha required, setting max delay", "delay", currentDelay)
+						} else if rle.Code == 9 || rle.Code == 29 {
+							escalateDelay = true
+						}
+						retryItems = append(retryItems, r.item)
+					} else {
+						r.item.retries++
+						if r.item.retries <= MaxNonRLRetries {
+							m.logger.Warn("allocation failed, will retry",
+								"index", r.item.idx, "attempt", r.item.retries, "err", r.err)
+							retryItems = append(retryItems, r.item)
+						} else {
+							m.logger.Error("allocation permanently failed",
+								"index", r.item.idx, "err", r.err)
+						}
+					}
+					continue
+				}
+				m.mu.Lock()
+				m.allocations = append(m.allocations, r.alloc)
+				m.mu.Unlock()
+				created++
+				batchAllocs = append(batchAllocs, r.alloc)
+				m.logger.Info("allocation ready", "index", r.item.idx, "created", created, "total", n)
+			}
+
+			pending = append(pending, retryItems...)
+
+			if escalateDelay {
+				currentDelay = currentDelay * 2
+				if currentDelay > MaxBatchDelay {
+					currentDelay = MaxBatchDelay
+				}
+				m.logger.Warn("escalating batch delay", "new_delay", currentDelay)
+			}
+
+			isFinal := len(pending) == 0
+			select {
+			case ch <- BatchResult{Allocs: batchAllocs, Final: isFinal}:
+			case <-ctx.Done():
+				m.logger.Info("allocation stopped by context", "created", created, "total", n)
+				return
+			}
+
+			if !isFinal {
+				select {
+				case <-ctx.Done():
+					m.logger.Info("allocation stopped by context", "created", created, "total", n)
+					return
+				case <-time.After(currentDelay):
+				}
+			}
+		}
+
+		m.logger.Info("all allocations complete", "created", created, "total", n)
+	}()
+
+	return ch
+}
