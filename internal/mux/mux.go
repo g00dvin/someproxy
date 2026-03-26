@@ -165,7 +165,7 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 		cancel:          cancel,
 		allDead:         make(chan struct{}),
 		connDied:        make(chan int, 32),
-		disableStriping: os.Getenv("NO_STRIPING") == "1",
+		disableStriping: os.Getenv("ENABLE_STRIPING") != "1",
 	}
 	for _, c := range conns {
 		mc := &muxConn{
@@ -198,10 +198,10 @@ func (m *Mux) SetMaxStreams(n int) {
 	m.maxStreams = n
 }
 
-// DisableStriping prevents stream frame distribution across connections.
-// Streams will be pinned to a single conn even with >1 conn (old behavior).
-func (m *Mux) DisableStriping() {
-	m.disableStriping = true
+// EnableStriping allows stream frame distribution across connections.
+// By default striping is off (use ENABLE_STRIPING=1 env var or this method).
+func (m *Mux) EnableStriping() {
+	m.disableStriping = false
 }
 
 // readLoop reads frames from a single underlying connection.

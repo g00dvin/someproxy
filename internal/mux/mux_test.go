@@ -108,6 +108,7 @@ func TestFrameClose_DeferredWithPendingReorder(t *testing.T) {
 }
 
 func TestStripedStream_E2E(t *testing.T) {
+	t.Setenv("ENABLE_STRIPING", "1")
 	// Create two Mux instances connected by 2 in-memory pipe pairs
 	sender := New(slog.Default())
 	receiver := New(slog.Default())
