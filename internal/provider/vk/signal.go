@@ -927,15 +927,12 @@ func (c *SignalingClient) PeerID() string {
 	return c.myPeerID
 }
 
-// StartSignalingKeepAlive sends periodic signaling commands to prevent VK
-// from kicking us as idle. Sends accept-call once, then periodically sends
-// transmit-data (fake SDP) and change-media-settings to simulate call activity.
+// StartSignalingKeepAlive starts the periodic keepalive ticker to prevent VK
+// from kicking us as idle. Sends transmit-data (fake SDP) and
+// change-media-settings every 30s to simulate call activity.
+// NOTE: accept-call is now sent earlier, immediately after SetKey, before the
+// disconnect handshake. This method only starts the periodic ticker.
 func (c *SignalingClient) StartSignalingKeepAlive(ctx context.Context, logger *slog.Logger) {
-	// Initial accept-call.
-	if err := c.SendAcceptCall(); err != nil {
-		logger.Warn("failed to send accept-call", "err", err)
-	}
-
 	// Minimal SDP offer to make VK think we're negotiating WebRTC.
 	fakeSDP := `{"type":"offer","sdp":"v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=sendrecv\r\na=rtpmap:111 opus/48000/2\r\n"}`
 

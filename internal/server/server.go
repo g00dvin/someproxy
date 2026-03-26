@@ -491,6 +491,15 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 		return fmt.Errorf("set signaling key: %w", err)
 	}
 
+	// Send accept-call immediately to prevent VK from kicking us as idle.
+	// Must be before StartSignalingKeepAlive — authenticated participants
+	// get kicked after ~7s without accept-call.
+	if ac, ok := sigClient.(interface{ SendAcceptCall() error }); ok {
+		if err := ac.SendAcceptCall(); err != nil {
+			s.cfg.Logger.Warn("failed to send accept-call", "err", err)
+		}
+	}
+
 	// Start signaling keepalive to prevent VK from kicking us as idle.
 	if ka, ok := sigClient.(interface {
 		StartSignalingKeepAlive(context.Context, *slog.Logger)

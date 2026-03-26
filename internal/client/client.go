@@ -276,6 +276,15 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 		return nil, fmt.Errorf("set signaling key: %w", err)
 	}
 
+	// Send accept-call immediately to prevent VK from kicking us as idle.
+	// Must be before disconnect handshake (which takes 6s) — authenticated
+	// participants get kicked after ~7s without accept-call.
+	if ac, ok := sigClient.(interface{ SendAcceptCall() error }); ok {
+		if err := ac.SendAcceptCall(); err != nil {
+			logger.Warn("failed to send accept-call", "err", err)
+		}
+	}
+
 	// Generate session nonce for filtering ghost messages.
 	nonceBytes := make([]byte, 8)
 	rand.Read(nonceBytes)
