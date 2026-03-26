@@ -125,12 +125,12 @@ func (m *Manager) dialAndAllocate(ctx context.Context, creds *provider.Credentia
 		if err != nil {
 			return nil, fmt.Errorf("dial TURN server: %w", err)
 		}
-		// Reduce TCP write buffer to provide backpressure when the TURN relay
-		// can't forward data fast enough. Default OS buffers (128-256KB) absorb
-		// burst writes, causing the inter-server UDP relay to overflow and drop
-		// packets. A small buffer forces the bridge goroutine to block earlier.
+		// Moderate TCP write buffer for backpressure. Too large (OS default
+		// 128-256KB) absorbs bursts and causes TURN relay packet loss. Too
+		// small (16KB) bottlenecks throughput. 64KB balances backpressure
+		// with throughput — adaptive bridge pacing handles the rest.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetWriteBuffer(16384)
+			tcpConn.SetWriteBuffer(65536)
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		}
