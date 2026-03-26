@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1126,11 +1127,21 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 	}
 }
 
-// MaxFramePayload limits the payload per MUX frame to stay within safe
-// DTLS record sizes for TURN relay transport. VK TURN relays use UDP
-// internally between peers, so frames must fit within path MTU (~1400)
-// minus DTLS overhead (~41 bytes) and MUX header (13 bytes).
-const MaxFramePayload = 1200
+// DefaultFramePayload is the safe payload size for UDP TURN relays
+// (path MTU ~1400 minus DTLS overhead ~41 bytes and MUX header 13 bytes).
+const DefaultFramePayload = 1200
+
+// MaxFramePayload is the active payload limit per MUX frame.
+// Configurable via MUX_FRAME_SIZE env var (bytes). For TCP TURN there is no
+// MTU constraint so larger frames (e.g. 65535) reduce framing overhead.
+var MaxFramePayload = func() int {
+	if v := os.Getenv("MUX_FRAME_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= maxPayload {
+			return n
+		}
+	}
+	return DefaultFramePayload
+}()
 
 // Write sends data on the stream, chunking into multiple frames if needed.
 func (s *Stream) Write(p []byte) (int, error) {
