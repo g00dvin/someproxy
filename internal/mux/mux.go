@@ -187,6 +187,7 @@ func (m *Mux) SetMaxStreams(n int) {
 func (m *Mux) readLoop(idx int, mc *muxConn) {
 	defer func() {
 		mc.conn.Close() // close DTLS connection immediately to free resources
+		m.RemoveConn(idx) // retransmit buffered frames + check reorder gaps
 
 		// Notify about dead connection (non-blocking).
 		select {
@@ -581,12 +582,50 @@ func (m *Mux) TotalConns() int {
 
 // RemoveConn sets the connection at the given index to nil.
 // The slot is reused by subsequent AddConn calls.
+// When a connection dies, its retransmit ring is drained and
+// frames are resent via surviving connections (best-effort).
 func (m *Mux) RemoveConn(idx int) {
 	m.mu.Lock()
+	var deadConn *muxConn
 	if idx >= 0 && idx < len(m.conns) {
+		deadConn = m.conns[idx]
 		m.conns[idx] = nil
 	}
 	m.mu.Unlock()
+
+	if deadConn == nil {
+		return
+	}
+
+	// Optimistic retransmit: resend buffered frames via surviving conns
+	frames := deadConn.rtxRing.Drain()
+	for _, data := range frames {
+		mc := m.selectConn()
+		if mc == nil {
+			break // no surviving conns
+		}
+		mc.mu.Lock()
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		}
+		mc.conn.Write(data) // best-effort, ignore errors
+		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			d.SetWriteDeadline(time.Time{})
+		}
+		mc.mu.Unlock()
+	}
+
+	// Check all streams' reorder buffers for stale gaps
+	m.streams.Range(func(key, val any) bool {
+		s := val.(*Stream)
+		if s.reorder != nil && s.reorder.Len() > 0 {
+			if s.reorder.GapTimedOut(reorderGapTimeout) {
+				m.logger.Warn("conn died, reorder gap timed out", "stream", s.ID)
+				m.closeStream(s)
+			}
+		}
+		return true
+	})
 }
 
 // BeginReconnect increments the reconnecting counter, preventing
