@@ -347,3 +347,42 @@ Implementation is complete only after ALL of these pass:
 - [ ] `go build ./...` clean
 - [ ] `go test ./...` all pass
 - [ ] `go test ./internal/tunnel/...` new tests pass
+
+### 8. Android E2E testing
+Android device connected via USB. Install APK via adb root, grant VPN permission via adb.
+
+**Test matrix (server runs on PC, client on Android):**
+
+| Test | Server | Android | Total conns | Expected |
+|------|--------|---------|-------------|----------|
+| Baseline | `--link=L1 --n=1` | 1 link, 1 conn | 1 | Working, ~100 KB/s |
+| Single call | `--link=L1 --n=4` | 1 link, 4 conns | 4 | Working, stable |
+| Multi 2×1 | `--link=L1 --link=L2 --n=1` | 2 links, 1 conn | 2 | Working, fault tolerant |
+| Multi 2×2 | `--link=L1 --link=L2 --n=2` | 2 links, 2 conns | 4 | Working, stable |
+| Multi 4×1 | `--link=L1..L4 --n=1` | 4 links, 1 conn | 4 | Working, max fault tolerance |
+| Multi 4×4 | `--link=L1..L4 --n=4` | 4 links, 4 conns | 16 | Working or graceful degrade |
+| With VK tokens | Add `--vk-token` both sides | Same | Same | Faster allocation |
+| Without VK tokens | No `--vk-token` | Same | Same | Slower but working |
+
+**Call links in .env:**
+```
+VK_CALL_LINK_1=fnKPjrFaF_zYGbvO3g-PHoXgWTnJfz-kbOJ_B3xyRyQ
+VK_CALL_LINK_2=S9g0wkMelQAUiBLQDWCrNHnHtlnRFWfjKkJ6jIWWrGQ
+VK_CALL_LINK_3=l6emjaxz_kTGWvTMtdslqxrg_wrcRlM7Vsen58uMQHA
+VK_CALL_LINK_4=dGJAPYvQMkENuDZkdVymuowiha6qEaExYEoPzXaZ7ks
+```
+
+**Android test procedure:**
+1. Build APK: `cd mobile && gomobile bind && gradle assembleDebug`
+2. Install: `adb install -r app/build/outputs/apk/debug/app-debug.apk`
+3. Grant VPN permission: `adb shell cmd appops set <package> ACTIVATE_VPN allow`
+4. Create test profile in app with links + token
+5. Connect VPN, open browser, navigate to test URL
+6. Verify: page loads, speed acceptable, stable for 2+ minutes
+7. Kill one call (exit from browser tab): verify VPN stays connected
+
+**Pass criteria:**
+- [ ] All matrix rows pass basic connectivity (page loads)
+- [ ] Multi-call survives single call death (fault tolerance)
+- [ ] No crash, no ANR on Android
+- [ ] VPN disconnect/reconnect cycle works cleanly
