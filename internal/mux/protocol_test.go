@@ -3,6 +3,7 @@ package mux
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestMarshalUnmarshalFrame(t *testing.T) {
@@ -142,5 +143,86 @@ func TestRetransmitRing_Wraparound(t *testing.T) {
 	// First element should be frame 72 (200 - 128)
 	if got[0][0] != 72 {
 		t.Fatalf("expected first frame 72, got %d", got[0][0])
+	}
+}
+
+func TestReorderBuffer_InOrder(t *testing.T) {
+	rb := newReorderBuffer()
+	// seq 0 == nextSeq → immediate delivery
+	flushed := rb.Insert(0, []byte("a"))
+	if len(flushed) != 1 || string(flushed[0]) != "a" {
+		t.Fatalf("expected immediate delivery of seq 0, got %v", flushed)
+	}
+	// seq 1 == nextSeq → immediate delivery
+	flushed = rb.Insert(1, []byte("b"))
+	if len(flushed) != 1 || string(flushed[0]) != "b" {
+		t.Fatalf("expected immediate delivery of seq 1, got %v", flushed)
+	}
+	if rb.Len() != 0 {
+		t.Fatal("buffer should be empty after in-order delivery")
+	}
+}
+
+func TestReorderBuffer_OutOfOrder(t *testing.T) {
+	rb := newReorderBuffer()
+	// seq 1 arrives before seq 0
+	rb.Insert(1, []byte("b"))
+	if rb.Len() != 1 {
+		t.Fatal("expected 1 buffered")
+	}
+	// seq 0 arrives — should flush both
+	flushed := rb.Insert(0, []byte("a"))
+	if len(flushed) != 2 {
+		t.Fatalf("expected 2 flushed, got %d", len(flushed))
+	}
+	if string(flushed[0]) != "a" || string(flushed[1]) != "b" {
+		t.Fatalf("unexpected order: %s, %s", flushed[0], flushed[1])
+	}
+}
+
+func TestReorderBuffer_Duplicate(t *testing.T) {
+	rb := newReorderBuffer()
+	rb.Insert(1, []byte("b")) // buffer seq 1 (gap at 0)
+	rb.Insert(1, []byte("b")) // duplicate
+	if rb.Len() != 1 {
+		t.Fatal("duplicate should not increase buffer size")
+	}
+}
+
+func TestReorderBuffer_WrapSafe(t *testing.T) {
+	rb := newReorderBuffer()
+	rb.nextSeq = 0xFFFFFFFF
+	flushed := rb.Insert(0xFFFFFFFF, []byte("wrap"))
+	if len(flushed) != 1 {
+		t.Fatal("expected delivery at wrap point")
+	}
+	// Next expected is 0x00000000
+	if rb.nextSeq != 0 {
+		t.Fatalf("expected nextSeq=0 after wrap, got %d", rb.nextSeq)
+	}
+}
+
+func TestReorderBuffer_Overflow(t *testing.T) {
+	rb := newReorderBuffer()
+	// Insert 256 out-of-order frames (skip seq 0)
+	for i := uint32(1); i <= reorderMaxFrames; i++ {
+		rb.Insert(i, []byte{byte(i)})
+	}
+	if rb.Overflowed() {
+		t.Fatal("should not overflow at exactly 256")
+	}
+	rb.Insert(reorderMaxFrames+1, []byte{0xFF})
+	if !rb.Overflowed() {
+		t.Fatal("should overflow at 257")
+	}
+}
+
+func TestReorderBuffer_Timeout(t *testing.T) {
+	rb := newReorderBuffer()
+	rb.Insert(1, []byte("b")) // gap at 0
+	// Manually set gap time to past
+	rb.gapSince = rb.gapSince.Add(-3 * time.Second)
+	if !rb.GapTimedOut(2 * time.Second) {
+		t.Fatal("expected timeout")
 	}
 }
