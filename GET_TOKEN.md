@@ -54,5 +54,5 @@ If using OK auth_tokens (starting with `$`), use single quotes to prevent shell 
 
 ## Token Lifetime
 
-- **VK access_token** (`vk1.a.*`): permanent with `offline` scope
-- **OK auth_token** (`$*`): unknown lifetime, may expire — use VK tokens when possible
+- **VK access_token** (`vk1.a.*`): 24 часа (`expires_in=86400`). Для новой сессии нужно получить заново.
+- **OK auth_token** (`$*`): неизвестное время жизни, привязан к аккаунту. Может прожить дольше, но без гарантий — используйте VK токены когда возможно.
