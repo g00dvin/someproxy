@@ -598,3 +598,39 @@ func RunRelayToRelay(ctx context.Context, cfg *Config) {
 	startRelayProxies(ctx, logger, cfg.Siren, dialMux, cfg.NumConns, cfg.SocksPort, cfg.HTTPPort, cfg.BindAddr, cfg.BypassMatcher)
 }
 
+// deduplicateTokens removes duplicate tokens, logging a warning for each.
+func deduplicateTokens(tokens []string, logger *slog.Logger) []string {
+	seen := make(map[string]bool, len(tokens))
+	result := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if seen[t] {
+			if len(t) > 20 {
+				logger.Warn("duplicate VK token ignored", "token", t[:20]+"...")
+			} else {
+				logger.Warn("duplicate VK token ignored")
+			}
+			continue
+		}
+		seen[t] = true
+		result = append(result, t)
+	}
+	return result
+}
+
+// allocateWithToken fetches TURN credentials using an authenticated token and creates a TURN allocation.
+func allocateWithToken(ctx context.Context, svc provider.Service, mgr *turn.Manager, token string) (*turn.Allocation, error) {
+	tap, ok := svc.(provider.TokenAuthProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider does not support token auth")
+	}
+	info, err := tap.FetchJoinInfoWithToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("fetch join info with token: %w", err)
+	}
+	alloc, err := mgr.AllocateWithCredentials(ctx, &info.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("allocate with credentials: %w", err)
+	}
+	return alloc, nil
+}
+
