@@ -127,10 +127,10 @@ func (m *Manager) dialAndAllocate(ctx context.Context, creds *provider.Credentia
 		}
 		// Moderate TCP write buffer for backpressure. Too large (OS default
 		// 128-256KB) absorbs bursts and causes TURN relay packet loss. Too
-		// small (16KB) bottlenecks throughput. 64KB balances backpressure
-		// with throughput — adaptive bridge pacing handles the rest.
+		// small (16KB) bottlenecks throughput. Adaptive bridge pacing
+		// handles relay overflow protection.
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetWriteBuffer(65536)
+			tcpConn.SetWriteBuffer(131072)
 			tcpConn.SetKeepAlive(true)
 			tcpConn.SetKeepAlivePeriod(10 * time.Second)
 		}
