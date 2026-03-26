@@ -117,3 +117,9 @@ type Service interface {
 	SessionProvider
 	SignalingConnector
 }
+
+// TokenAuthProvider is an optional interface for providers that support
+// authenticated token-based credential acquisition (fewer API calls, no rate-limit risk).
+type TokenAuthProvider interface {
+	FetchJoinInfoWithToken(ctx context.Context, token string) (*JoinInfo, error)
+}
