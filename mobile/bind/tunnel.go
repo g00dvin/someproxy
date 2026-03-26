@@ -144,6 +144,7 @@ type TunnelConfig struct {
 	UseTCP      bool   // TCP vs UDP for TURN
 	Token       string // auth token for server (empty = no auth)
 	Fingerprint string // server DTLS certificate SHA-256 fingerprint (hex, empty = no pinning)
+	VKTokens    string // comma-separated VK tokens (0-16), passed from Android UI
 }
 
 // ValidateNumConns returns a warning message if NumConns exceeds the
@@ -376,6 +377,38 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
 }
 
+// deduplicateTokens removes duplicate VK tokens, logging a warning for each duplicate.
+func deduplicateTokens(tokens []string, logger *slog.Logger) []string {
+	seen := make(map[string]bool, len(tokens))
+	result := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if seen[t] {
+			logger.Warn("duplicate VK token ignored")
+			continue
+		}
+		seen[t] = true
+		result = append(result, t)
+	}
+	return result
+}
+
+// allocateWithToken fetches fresh TURN credentials using a VK token and allocates a relay.
+func allocateWithToken(ctx context.Context, svc provider.Service, mgr *turn.Manager, token string) (*turn.Allocation, error) {
+	tap, ok := svc.(provider.TokenAuthProvider)
+	if !ok {
+		return nil, fmt.Errorf("provider does not support token auth")
+	}
+	info, err := tap.FetchJoinInfoWithToken(ctx, token)
+	if err != nil {
+		return nil, fmt.Errorf("fetch join info with token: %w", err)
+	}
+	alloc, err := mgr.AllocateWithCredentials(ctx, &info.Credentials)
+	if err != nil {
+		return nil, fmt.Errorf("allocate with credentials: %w", err)
+	}
+	return alloc, nil
+}
+
 // connectRelay creates TURN allocations, exchanges relay addresses via
 // signaling, and establishes DTLS connections to the server's relay addresses.
 // Returns a tunnelState without mutating t.
@@ -390,7 +423,20 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	cachedCreds := t.cachedCreds
 	t.mu.Unlock()
 
+	// Parse VK tokens from comma-separated string.
+	var vkTokens []string
+	if cfg.VKTokens != "" {
+		vkTokens = strings.Split(cfg.VKTokens, ",")
+	}
+
+	// Deduplicate and cap to numConns.
+	vkTokens = deduplicateTokens(vkTokens, t.logger)
+	if len(vkTokens) > cfg.NumConns {
+		vkTokens = vkTokens[:cfg.NumConns]
+	}
+
 	// Reuse cached JoinInfo from previous session if available.
+	// If VK tokens are present, prefer authenticated join for fresh JoinInfo.
 	var jr *provider.JoinInfo
 	if cachedJI != nil {
 		t.logger.Info("reusing cached JoinInfo", "conv_id", cachedJI.ConvID)
@@ -398,9 +444,20 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	} else {
 		t.setStage("Получение токена VK...")
 		var err error
-		jr, err = svc.FetchJoinInfo(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("join conference: %w", err)
+		if len(vkTokens) > 0 {
+			if tap, ok := svc.(provider.TokenAuthProvider); ok {
+				jr, err = tap.FetchJoinInfoWithToken(ctx, vkTokens[0])
+				if err != nil {
+					t.logger.Warn("first VK token failed for JoinInfo, falling back to anonymous", "err", err)
+					jr = nil
+				}
+			}
+		}
+		if jr == nil {
+			jr, err = svc.FetchJoinInfo(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("join conference: %w", err)
+			}
 		}
 		t.logger.Info("joined conference", "conv_id", jr.ConvID)
 	}
@@ -439,7 +496,7 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 	}
 	ackCancel()
 
-	// Start batched TURN allocations with cached credentials.
+	// Start batched TURN allocations with cached credentials for anonymous path.
 	t.setStage("Подключение к TURN...")
 	var credsProvider provider.CredentialsProvider = svc
 	if len(cachedCreds) > 0 {
@@ -447,7 +504,6 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		credsProvider = turn.NewCachedProvider(cachedCreds, svc)
 	}
 	mgr := turn.NewManager(credsProvider, cfg.UseTCP, t.logger)
-	batchCh := mgr.AllocateGradual(ctx, cfg.NumConns, turn.GradualOpts{})
 
 	sessionID := uuid.New()
 	var (
@@ -457,112 +513,64 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 		batchIdx int
 	)
 
-	t.setStage("Обмен relay адресами...")
-
 	type dtlsResult struct {
 		conn    io.ReadWriteCloser
 		cleanup context.CancelFunc
 		err     error
 	}
 
-	for br := range batchCh {
-		if len(br.Allocs) == 0 {
-			if br.Final {
+	// dtlsHandshake performs DTLS handshake over a relay connection, writes auth token
+	// and session ID, and sends the result to the provided channel.
+	dtlsHandshake := func(relayConn net.PacketConn, addr *net.UDPAddr, results chan<- dtlsResult, punchCtx context.Context) {
+		var dtlsConn io.ReadWriteCloser
+		var cleanup context.CancelFunc
+		var lastErr error
+		for attempt := 1; attempt <= 2; attempt++ {
+			punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
+			internaldtls.PunchRelay(relayConn, addr)
+			go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
+			time.Sleep(200 * time.Millisecond) // let TURN permissions establish
+
+			var c net.Conn
+			c, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
+			punchLoopCancel()
+
+			if lastErr == nil {
+				dtlsConn = c
 				break
 			}
-			continue
-		}
-
-		addrs := make([]string, len(br.Allocs))
-		for i, a := range br.Allocs {
-			addrs[i] = a.RelayAddr.String()
-		}
-		t.logger.Info("batch ready", "batch", batchIdx, "allocs", len(br.Allocs), "final", br.Final)
-
-		if err := sigClient.SendRelayBatch(ctx, addrs, "client", nonce, batchIdx, br.Final); err != nil {
-			t.logger.Error("send relay batch", "batch", batchIdx, "err", err)
-			break
-		}
-		serverAddrs, _, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
-		if err != nil {
-			t.logger.Error("recv relay batch", "batch", batchIdx, "err", err)
-			break
-		}
-
-		pairCount := len(br.Allocs)
-		if len(serverAddrs) < pairCount {
-			pairCount = len(serverAddrs)
-		}
-		if pairCount == 0 {
-			batchIdx++
-			if br.Final {
-				break
+			t.logger.Warn("DTLS handshake failed", "attempt", attempt, "err", lastErr)
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt) * time.Second)
 			}
-			continue
+		}
+		if lastErr != nil {
+			results <- dtlsResult{err: lastErr}
+			return
 		}
 
-		if batchIdx == 0 {
-			t.setStage("Установка DTLS...")
-		}
-
-		results := make(chan dtlsResult, pairCount)
-		punchCtx, punchCancel := context.WithCancel(ctx)
-
-		for i := 0; i < pairCount; i++ {
-			serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
-			if err != nil {
-				results <- dtlsResult{err: err}
-				continue
+		if cfg.Token != "" {
+			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
+				cleanup()
+				results <- dtlsResult{err: fmt.Errorf("write auth token: %w", err)}
+				return
 			}
-			go func(relayConn net.PacketConn, addr *net.UDPAddr) {
-				var dtlsConn io.ReadWriteCloser
-				var cleanup context.CancelFunc
-				var lastErr error
-				for attempt := 1; attempt <= 2; attempt++ {
-					punchLoopCtx, punchLoopCancel := context.WithCancel(punchCtx)
-					internaldtls.PunchRelay(relayConn, addr)
-					go internaldtls.StartPunchLoop(punchLoopCtx, relayConn, addr)
-					time.Sleep(200 * time.Millisecond) // let TURN permissions establish
-
-					var c net.Conn
-					c, cleanup, lastErr = internaldtls.DialOverTURN(ctx, relayConn, addr, t.fpBytes)
-					punchLoopCancel()
-
-					if lastErr == nil {
-						dtlsConn = c
-						break
-					}
-					t.logger.Warn("DTLS handshake failed", "attempt", attempt, "err", lastErr)
-					if attempt < 2 {
-						time.Sleep(time.Duration(attempt) * time.Second)
-					}
-				}
-				if lastErr != nil {
-					results <- dtlsResult{err: lastErr}
-					return
-				}
-
-				if cfg.Token != "" {
-					if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
-						cleanup()
-						results <- dtlsResult{err: fmt.Errorf("write auth token: %w", err)}
-						return
-					}
-				}
-
-				var sid [16]byte
-				copy(sid[:], sessionID[:])
-				if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-					cleanup()
-					results <- dtlsResult{err: fmt.Errorf("write session id: %w", err)}
-					return
-				}
-
-				results <- dtlsResult{conn: dtlsConn, cleanup: cleanup}
-			}(br.Allocs[i].RelayConn, serverUDP)
 		}
 
-		for j := 0; j < pairCount; j++ {
+		var sid [16]byte
+		copy(sid[:], sessionID[:])
+		if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+			cleanup()
+			results <- dtlsResult{err: fmt.Errorf("write session id: %w", err)}
+			return
+		}
+
+		results <- dtlsResult{conn: dtlsConn, cleanup: cleanup}
+	}
+
+	// collectDTLS collects results from the channel and adds successful connections to the MUX.
+	collectDTLS := func(results <-chan dtlsResult, count int) {
+		for j := 0; j < count; j++ {
 			r := <-results
 			if r.err != nil {
 				t.logger.Warn("relay DTLS failed in batch", "batch", batchIdx, "err", r.err)
@@ -575,11 +583,151 @@ func (t *Tunnel) connectRelay(ctx context.Context, cfg *TunnelConfig) (*tunnelSt
 			}
 			muxConns = append(muxConns, r.conn)
 		}
-		punchCancel()
+	}
 
+	// --- Token allocation phase (batch 0) ---
+	tokenConns := len(vkTokens)
+	anonConns := cfg.NumConns - tokenConns
+
+	if tokenConns > 0 {
+		t.setStage("Обмен relay адресами (токены)...")
+		tokenAllocs := make([]*turn.Allocation, tokenConns)
+		var tokenWg sync.WaitGroup
+		var tokenMu sync.Mutex
+		for i, tok := range vkTokens {
+			tokenWg.Add(1)
+			go func(idx int, token string) {
+				defer tokenWg.Done()
+				alloc, aErr := allocateWithToken(ctx, svc, mgr, token)
+				tokenMu.Lock()
+				defer tokenMu.Unlock()
+				if aErr != nil {
+					t.logger.Warn("token allocation failed", "index", idx, "err", aErr)
+					return
+				}
+				tokenAllocs[idx] = alloc
+			}(i, tok)
+		}
+		tokenWg.Wait()
+
+		// Collect successful allocations.
+		var tokenAddrs []string
+		var successAllocs []*turn.Allocation
+		for _, a := range tokenAllocs {
+			if a != nil {
+				tokenAddrs = append(tokenAddrs, a.RelayAddr.String())
+				successAllocs = append(successAllocs, a)
+			}
+		}
+
+		if len(tokenAddrs) > 0 {
+			final := anonConns == 0
+			if err := sigClient.SendRelayBatch(ctx, tokenAddrs, "client", nonce, batchIdx, final); err != nil {
+				mgr.CloseAll()
+				sigClient.Close()
+				return nil, fmt.Errorf("send token relay batch: %w", err)
+			}
+			serverAddrs, _, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
+			if err != nil {
+				mgr.CloseAll()
+				sigClient.Close()
+				return nil, fmt.Errorf("recv token relay batch: %w", err)
+			}
+
+			pairCount := len(successAllocs)
+			if len(serverAddrs) < pairCount {
+				pairCount = len(serverAddrs)
+			}
+
+			if pairCount > 0 {
+				if batchIdx == 0 {
+					t.setStage("Установка DTLS...")
+				}
+				results := make(chan dtlsResult, pairCount)
+				punchCtx, punchCancel := context.WithCancel(ctx)
+				for i := 0; i < pairCount; i++ {
+					serverUDP, rErr := net.ResolveUDPAddr("udp", serverAddrs[i])
+					if rErr != nil {
+						results <- dtlsResult{err: rErr}
+						continue
+					}
+					go dtlsHandshake(successAllocs[i].RelayConn, serverUDP, results, punchCtx)
+				}
+				collectDTLS(results, pairCount)
+				punchCancel()
+			}
+		}
+
+		// Failed tokens fall back to anonymous allocations.
+		failedTokens := tokenConns - len(successAllocs)
+		anonConns += failedTokens
 		batchIdx++
-		if br.Final {
-			break
+	}
+
+	// --- Anonymous allocation phase ---
+	t.setStage("Обмен relay адресами...")
+	if anonConns > 0 {
+		batchCh := mgr.AllocateGradual(ctx, anonConns, turn.GradualOpts{})
+
+		for br := range batchCh {
+			if len(br.Allocs) == 0 {
+				if br.Final {
+					break
+				}
+				continue
+			}
+
+			addrs := make([]string, len(br.Allocs))
+			for i, a := range br.Allocs {
+				addrs[i] = a.RelayAddr.String()
+			}
+			t.logger.Info("batch ready", "batch", batchIdx, "allocs", len(br.Allocs), "final", br.Final)
+
+			if err := sigClient.SendRelayBatch(ctx, addrs, "client", nonce, batchIdx, br.Final); err != nil {
+				t.logger.Error("send relay batch", "batch", batchIdx, "err", err)
+				break
+			}
+			serverAddrs, _, _, _, err := sigClient.RecvRelayBatch(ctx, "client", nonce)
+			if err != nil {
+				t.logger.Error("recv relay batch", "batch", batchIdx, "err", err)
+				break
+			}
+
+			pairCount := len(br.Allocs)
+			if len(serverAddrs) < pairCount {
+				pairCount = len(serverAddrs)
+			}
+			if pairCount == 0 {
+				batchIdx++
+				if br.Final {
+					break
+				}
+				continue
+			}
+
+			if batchIdx == 0 {
+				t.setStage("Установка DTLS...")
+			}
+
+			results := make(chan dtlsResult, pairCount)
+			punchCtx, punchCancel := context.WithCancel(ctx)
+
+			for i := 0; i < pairCount; i++ {
+				serverUDP, err := net.ResolveUDPAddr("udp", serverAddrs[i])
+				if err != nil {
+					results <- dtlsResult{err: err}
+					continue
+				}
+				go dtlsHandshake(br.Allocs[i].RelayConn, serverUDP, results, punchCtx)
+			}
+
+			collectDTLS(results, pairCount)
+			punchCancel()
+
+			batchIdx++
+			if br.Final {
+				break
+			}
 		}
 	}
 
