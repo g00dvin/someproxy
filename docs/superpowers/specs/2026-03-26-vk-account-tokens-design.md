@@ -42,6 +42,7 @@ VK access_token lifetime: ~24h (default) or permanent (with `offline` scope).
 OK auth_token lifetime: unknown, appears tied to account not session.
 
 On VK API error 5 (expired token): log warning, fall back to anonymous flow for that connection.
+Error 5 is distinct from rate-limit errors — needs separate check in `vkGetCallToken`.
 
 ## Allocation Strategy
 
@@ -62,8 +63,17 @@ Phase 2 (batched via AllocateGradual, concurrent with phase 1):
   conn 7   → anonymous batch 3 (final) → ...
 ```
 
-First JoinInfo (for signaling connection) obtained via token if available, else anonymous.
+Signaling initialization sequencing:
+1. Try first token → `FetchJoinInfoWithToken(token1)` → use its `JoinInfo` for signaling
+2. If first token fails (expired/error) → fall back to anonymous `FetchJoinInfo()` for signaling
+3. Once signaling is established, launch both phases concurrently
+
 All relay addresses exchanged through one signalingClient (same as current flow).
+
+Edge cases:
+- `len(tokens) >= numConns` → phase 2 has zero anonymous connections (no `AllocateGradual`)
+- `len(tokens) > numConns` → only first `numConns` tokens used
+- Duplicate tokens → deduplicate with warning log
 
 ## CLI Interface
 
@@ -113,7 +123,13 @@ Future: embedded OAuth callback server for automatic token capture.
 ### Modified files
 
 **`internal/provider/provider.go`**
-- Extend `Service` interface: `FetchJoinInfoWithToken(ctx context.Context, token string) (*JoinInfo, error)`
+- New optional interface (does NOT extend `Service` — avoids breaking Telemost provider):
+```go
+type TokenAuthProvider interface {
+    FetchJoinInfoWithToken(ctx context.Context, token string) (*JoinInfo, error)
+}
+```
+- Call sites use type assertion: `if tap, ok := svc.(provider.TokenAuthProvider); ok { ... }`
 
 **`internal/provider/vk/vk.go`**
 - `FetchJoinInfoWithToken(ctx, token)` — 3-step authorized flow
@@ -127,12 +143,17 @@ Future: embedded OAuth callback server for automatic token capture.
 - `AllocateWithCredentials(ctx context.Context, creds *provider.Credentials) (*Allocation, error)` — create TURN allocation from pre-fetched credentials
 
 **`internal/client/client.go`**
+- `Config` struct: add `VKTokens []string`
 - `connectRelaySession`: two concurrent goroutines:
   - Token goroutine: parallel `FetchJoinInfoWithToken` + `AllocateWithCredentials` + relay batch exchange
   - Anonymous goroutine: `AllocateGradual` + batched relay exchange (existing flow)
 
 **`internal/server/server.go`**
-- `acceptOneClient`: same dual-goroutine pattern
+- `Config` struct: add `VKTokens []string`
+- Server uses tokens for its own TURN allocations reactively: when receiving a client batch,
+  if tokens are available, use `FetchJoinInfoWithToken` + `AllocateWithCredentials` for the
+  matching allocations instead of anonymous `Allocate`. Tokens consumed in order, excess
+  batches fall back to anonymous.
 
 **`mobile/bind/tunnel.go`**
 - `TunnelConfig.VKTokens []string`
@@ -154,6 +175,19 @@ Future: embedded OAuth callback server for automatic token capture.
 | VK API error 14 (captcha) | Skip token, fall back to anonymous |
 | OK auth_token rejected | Warning log, skip token, fall back to anonymous |
 | All tokens failed | Full anonymous flow (existing behavior) |
+
+## Shell Escaping Note
+
+OK auth_tokens start with `$` which triggers variable expansion in bash.
+CLI examples use single quotes: `--vk-token='$YYY'`.
+`VK_TOKENS` env var requires escaping: `VK_TOKENS='$token1,vk1.a.token2'`.
+`GET_TOKEN.md` documents this explicitly.
+
+## Out of Scope
+
+- `cmd/server-ui/main.go` — token support can be added later if needed
+- Automatic token refresh / OAuth callback server
+- Token storage/encryption on CLI side
 
 ## Backward Compatibility
 
