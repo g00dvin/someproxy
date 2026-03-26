@@ -254,3 +254,59 @@ Future: mix providers in one pool (e.g., 2 VK calls + 1 Telemost call).
 5. E2E: `--link=A --link=B --n=2`, speed test, kill one call, verify tunnel continues
 6. E2E: graceful degradation (client 1 link, server 2 links)
 7. E2E: reconnect after slot death
+
+## test-e2e.sh Adaptation
+
+Current `test-e2e.sh` supports single `--link`. Must be extended for multi-call testing.
+
+### New parameters
+
+```bash
+# Single call (current behavior)
+./test-e2e.sh --n=4
+
+# Multi-call pool
+./test-e2e.sh --n=2 --links=2
+
+# Custom: 3 calls × 4 conns, with monitoring
+./test-e2e.sh --n=4 --links=3 --monitor=5
+```
+
+- `--links=N` — number of call links to use from .env (default: 1)
+- Requires N call links in .env: `VK_CALL_LINK_1`, `VK_CALL_LINK_2`, ... or comma-separated `VK_CALL_LINKS=link1,link2,link3`
+
+### .env format extension
+
+```bash
+# Single call (backward compatible)
+VK_CALL_LINK=fnKPjrFaF...
+
+# Multi-call (new)
+VK_CALL_LINK_1=fnKPjrFaF...
+VK_CALL_LINK_2=abcdef123...
+VK_CALL_LINK_3=xyz789abc...
+```
+
+### Script changes
+
+1. Parse `--links=N`, read N links from .env
+2. Build server/client command with multiple `--link=` flags
+3. Speed test: compare single-call vs multi-call throughput
+4. Fault tolerance test: kill one call (how? — TBD: maybe close browser tab for one call), verify tunnel continues
+5. Report per-slot status if available (server/client expose status endpoint or log)
+
+### Test scenarios
+
+```bash
+# Baseline: 1 call × 4 conns
+./test-e2e.sh --n=4 --links=1 --download-url=http://speedtest.selectel.ru/10MB
+
+# Multi-call: 2 calls × 2 conns (same total: 4)
+./test-e2e.sh --n=2 --links=2 --download-url=http://speedtest.selectel.ru/10MB
+
+# Multi-call: 2 calls × 4 conns (8 total)
+./test-e2e.sh --n=4 --links=2 --download-url=http://speedtest.selectel.ru/10MB
+
+# Stability: 2 calls × 2 conns, 10 min monitoring
+./test-e2e.sh --n=2 --links=2 --monitor=10
+```
