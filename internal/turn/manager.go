@@ -106,6 +106,12 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 	if err != nil {
 		return nil, fmt.Errorf("fetch credentials: %w", err)
 	}
+	// Round-robin across available TURN servers to distribute load
+	if len(creds.Servers) > 1 {
+		srv := creds.Servers[idx%len(creds.Servers)]
+		creds.Host = srv.Host
+		creds.Port = srv.Port
+	}
 	return m.dialAndAllocate(ctx, creds)
 }
 

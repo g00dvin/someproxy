@@ -431,13 +431,20 @@ func okJoinConference(ctx context.Context, client *http.Client, ua string, link,
 		return nil, fmt.Errorf("no TURN URLs in response: %s", string(body))
 	}
 
+	slog.Info("TURN server URLs from VK", "urls", resp.TurnServer.URLs, "count", len(resp.TurnServer.URLs))
 	host, port := turn.ParseTURNURL(resp.TurnServer.URLs[0])
+	var servers []provider.TURNServer
+	for _, u := range resp.TurnServer.URLs {
+		h, p := turn.ParseTURNURL(u)
+		servers = append(servers, provider.TURNServer{Host: h, Port: p})
+	}
 	return &joinConferenceResult{
 		creds: &provider.Credentials{
 			Username: resp.TurnServer.Username,
 			Password: resp.TurnServer.Credential,
 			Host:     host,
 			Port:     port,
+			Servers:  servers,
 		},
 		endpoint:  resp.Endpoint,
 		convID:    resp.ID,

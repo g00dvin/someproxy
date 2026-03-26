@@ -9,12 +9,19 @@ import (
 	"log/slog"
 )
 
+// TURNServer is a single TURN server address.
+type TURNServer struct {
+	Host string
+	Port string
+}
+
 // Credentials holds TURN server access information.
 type Credentials struct {
 	Username string
 	Password string
-	Host     string
-	Port     string
+	Host     string // primary TURN server host (first URL)
+	Port     string // primary TURN server port
+	Servers  []TURNServer // all available TURN servers (for load distribution)
 }
 
 // JoinInfo holds the result of joining a conference/call service,
