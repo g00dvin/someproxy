@@ -105,3 +105,42 @@ func TestFrameSequenceNumbers(t *testing.T) {
 		}
 	}
 }
+
+func TestRetransmitRing_PushAndDrain(t *testing.T) {
+	var r retransmitRing
+	r.mu.Lock()
+	r.Push([]byte("frame1"))
+	r.Push([]byte("frame2"))
+	r.Push([]byte("frame3"))
+	r.mu.Unlock()
+
+	got := r.Drain()
+	if len(got) != 3 {
+		t.Fatalf("expected 3 frames, got %d", len(got))
+	}
+	if string(got[0]) != "frame1" || string(got[1]) != "frame2" || string(got[2]) != "frame3" {
+		t.Fatalf("unexpected order: %v", got)
+	}
+	// Drain again should be empty
+	if len(r.Drain()) != 0 {
+		t.Fatal("expected empty after drain")
+	}
+}
+
+func TestRetransmitRing_Wraparound(t *testing.T) {
+	var r retransmitRing
+	// Fill beyond capacity (128) — oldest should be evicted
+	for i := 0; i < 200; i++ {
+		r.mu.Lock()
+		r.Push([]byte{byte(i)})
+		r.mu.Unlock()
+	}
+	got := r.Drain()
+	if len(got) != retransmitRingSize {
+		t.Fatalf("expected %d frames, got %d", retransmitRingSize, len(got))
+	}
+	// First element should be frame 72 (200 - 128)
+	if got[0][0] != 72 {
+		t.Fatalf("expected first frame 72, got %d", got[0][0])
+	}
+}

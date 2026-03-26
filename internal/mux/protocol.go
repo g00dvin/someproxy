@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"sync"
 )
 
 // Frame header format (13 bytes):
@@ -75,4 +76,46 @@ func ReadFrame(r io.Reader) (*Frame, error) {
 		}
 	}
 	return f, nil
+}
+
+const retransmitRingSize = 128
+
+// retransmitRing is a fixed-size circular buffer of marshaled frames
+// for optimistic retransmission on connection death.
+// Push requires external locking (mu); Drain acquires mu internally.
+type retransmitRing struct {
+	mu    sync.Mutex
+	buf   [retransmitRingSize][]byte
+	write int
+	count int
+}
+
+// Push adds a marshaled frame to the ring, evicting the oldest if full.
+// Caller MUST hold r.mu.
+func (r *retransmitRing) Push(data []byte) {
+	r.buf[r.write] = data
+	r.write = (r.write + 1) % retransmitRingSize
+	if r.count < retransmitRingSize {
+		r.count++
+	}
+}
+
+// Drain returns all buffered frames in FIFO order and resets the ring.
+// Thread-safe — acquires r.mu internally.
+func (r *retransmitRing) Drain() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.count == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, r.count)
+	start := (r.write - r.count + retransmitRingSize) % retransmitRingSize
+	for i := 0; i < r.count; i++ {
+		idx := (start + i) % retransmitRingSize
+		out = append(out, r.buf[idx])
+		r.buf[idx] = nil // release for GC
+	}
+	r.count = 0
+	r.write = 0
+	return out
 }
