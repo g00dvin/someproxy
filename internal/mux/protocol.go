@@ -124,7 +124,7 @@ func (r *retransmitRing) Drain() [][]byte {
 }
 
 const (
-	reorderMaxFrames  = 256
+	reorderMaxFrames  = 4096
 	reorderGapTimeout = 2 * time.Second
 )
 
