@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"log/slog"
+	"net"
 	"testing"
+	"time"
 )
 
 // dummyConn is a minimal ReadWriteCloser for testing.
@@ -103,6 +105,81 @@ func TestFrameClose_DeferredWithPendingReorder(t *testing.T) {
 	if string(d1) != "data1" {
 		t.Fatalf("expected 'data1', got '%s'", d1)
 	}
+}
+
+func TestStripedStream_E2E(t *testing.T) {
+	// Create two Mux instances connected by 2 in-memory pipe pairs
+	sender := New(slog.Default())
+	receiver := New(slog.Default())
+
+	for i := 0; i < 2; i++ {
+		c1, c2 := net.Pipe()
+		sender.AddConn(c1)
+		receiver.AddConn(c2)
+	}
+
+	receiver.EnableStreamAccept(64)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Start dispatch loop on receiver
+	go receiver.DispatchLoop(ctx)
+
+	// Give readLoops time to start
+	time.Sleep(50 * time.Millisecond)
+
+	// Open striped stream (sender has 2 conns)
+	s, err := sender.OpenStream(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.striping {
+		t.Fatal("expected striping to be enabled with 2 conns")
+	}
+
+	// Accept on receiver
+	var rs *Stream
+	select {
+	case rs = <-receiver.AcceptedStreams():
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for accepted stream")
+	}
+	if !rs.striping {
+		t.Fatal("receiver stream should be striped")
+	}
+
+	// Write 10KB of data
+	payload := make([]byte, 10240)
+	for i := range payload {
+		payload[i] = byte(i % 256)
+	}
+
+	go func() {
+		s.Write(payload)
+		s.Close()
+	}()
+
+	// Read all data
+	var received []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := rs.Read(buf)
+		if n > 0 {
+			received = append(received, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if !bytes.Equal(received, payload) {
+		t.Fatalf("data mismatch: sent %d bytes, received %d bytes", len(payload), len(received))
+	}
+
+	cancel()
+	sender.Close()
+	receiver.Close()
 }
 
 func TestNonStripedStream_BackwardCompat(t *testing.T) {
