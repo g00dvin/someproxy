@@ -237,10 +237,8 @@ func (m *Mux) selectConn() *muxConn {
 		return nil
 	}
 
-	var best *muxConn
-	bestCW := int64(math.MinInt64)
-	var totalWeight int64
-
+	// Phase 1: find minimum latency among live conns for threshold filter.
+	var minLat int64
 	for _, mc := range m.conns {
 		if mc == nil {
 			continue
@@ -249,20 +247,60 @@ func (m *Mux) selectConn() *muxConn {
 		if lat == 0 {
 			lat = 1_000_000 // 1ms default
 		}
-		errs := mc.stats.errors.Load()
+		if minLat == 0 || lat < minLat {
+			minLat = lat
+		}
+	}
+	threshold := minLat * 3
 
-		// Weight: inverse latency (higher = better), penalty for errors.
-		weight := 1_000_000_000/lat - errs*10
+	// Phase 2: Build eligible set (latency <= 3x minimum).
+	type candidate struct {
+		mc  *muxConn
+		lat int64
+	}
+	var eligible []candidate
+	for _, mc := range m.conns {
+		if mc == nil {
+			continue
+		}
+		lat := mc.stats.latency.Load()
+		if lat == 0 {
+			lat = 1_000_000
+		}
+		if lat <= threshold {
+			eligible = append(eligible, candidate{mc, lat})
+		}
+	}
+	// Fallback: if filter excluded all, use all live conns
+	if len(eligible) == 0 {
+		for _, mc := range m.conns {
+			if mc == nil {
+				continue
+			}
+			lat := mc.stats.latency.Load()
+			if lat == 0 {
+				lat = 1_000_000
+			}
+			eligible = append(eligible, candidate{mc, lat})
+		}
+	}
+
+	// Phase 3: SWRR over eligible conns.
+	var best *muxConn
+	bestCW := int64(math.MinInt64)
+	var totalWeight int64
+
+	for _, c := range eligible {
+		errs := c.mc.stats.errors.Load()
+		weight := 1_000_000_000/c.lat - errs*10
 		if weight < 1 {
 			weight = 1
 		}
-
-		mc.wrrCurrent += weight
+		c.mc.wrrCurrent += weight
 		totalWeight += weight
-
-		if mc.wrrCurrent > bestCW {
-			bestCW = mc.wrrCurrent
-			best = mc
+		if c.mc.wrrCurrent > bestCW {
+			bestCW = c.mc.wrrCurrent
+			best = c.mc
 		}
 	}
 
