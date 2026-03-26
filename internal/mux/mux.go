@@ -1165,7 +1165,12 @@ func (s *Stream) Write(p []byte) (int, error) {
 			Payload:  payload,
 		}
 
-		mc := s.mux.selectConn()
+		var mc *muxConn
+		if s.striping {
+			mc = s.mux.selectConn() // round-robin across all conns
+		} else {
+			mc = s.assignedConn // pinned to one conn for ordering
+		}
 		if mc == nil {
 			if total > 0 {
 				return total, errors.New("no connections available")
@@ -1241,7 +1246,13 @@ func (s *Stream) Close() error {
 	close(s.done)
 	s.mux.streams.Delete(s.ID)
 	s.mux.streamCount.Add(-1)
-	return s.mux.sendFrameOn(nil, &Frame{
+	// Striped: any conn is fine (data already flushed).
+	// Non-striped: use assigned conn to preserve ordering with data frames.
+	mc := s.assignedConn
+	if s.striping {
+		mc = nil // selectConn picks fastest
+	}
+	return s.mux.sendFrameOn(mc, &Frame{
 		StreamID: s.ID,
 		Type:     FrameClose,
 		Sequence: s.mux.NextSeq(),

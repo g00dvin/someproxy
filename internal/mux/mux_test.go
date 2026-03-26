@@ -158,6 +158,7 @@ func TestStripedStream_E2E(t *testing.T) {
 
 	go func() {
 		s.Write(payload)
+		time.Sleep(50 * time.Millisecond) // let writeLoops flush to pipes
 		s.Close()
 	}()
 
