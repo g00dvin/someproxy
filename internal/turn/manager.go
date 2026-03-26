@@ -106,14 +106,17 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 	if err != nil {
 		return nil, fmt.Errorf("fetch credentials: %w", err)
 	}
+	return m.dialAndAllocate(ctx, creds)
+}
 
+func (m *Manager) dialAndAllocate(ctx context.Context, creds *provider.Credentials) (*Allocation, error) {
 	addr := net.JoinHostPort(creds.Host, creds.Port)
 	m.logger.Info("connecting to TURN server",
-		"index", idx,
 		"addr", addr,
 		"username", creds.Username,
 	)
 
+	var err error
 	var conn net.Conn
 	var turnConn net.PacketConn
 	if m.useTCP {
@@ -169,7 +172,6 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 	}
 
 	m.logger.Info("TURN allocation succeeded",
-		"index", idx,
 		"relay_addr", relayConn.LocalAddr().String(),
 	)
 
@@ -181,6 +183,20 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 		CreatedAt: time.Now(),
 		conn:      conn,
 	}, nil
+}
+
+// AllocateWithCredentials creates a single TURN allocation using pre-fetched credentials.
+// Used for token-based connections where credentials come from FetchJoinInfoWithToken.
+func (m *Manager) AllocateWithCredentials(ctx context.Context, creds *provider.Credentials) (*Allocation, error) {
+	alloc, err := m.dialAndAllocate(ctx, creds)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	m.allocations = append(m.allocations, alloc)
+	m.mu.Unlock()
+	m.logger.Info("allocated with credentials", "relay", alloc.RelayAddr.String(), "server", net.JoinHostPort(creds.Host, creds.Port))
+	return alloc, nil
 }
 
 // Allocations returns a snapshot of current allocations.
