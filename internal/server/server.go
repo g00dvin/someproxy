@@ -506,7 +506,7 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 	const maxConsecErrors = 3
 	consecErrors := 0
 	for {
-		err := s.acceptOneClient(ctx, sigClient, svc)
+		err := s.acceptOneClient(ctx, sigClient, svc, s.cfg.VKTokens)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -532,9 +532,12 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 // signaling channel, serves its session, and returns when the client
 // disconnects. The caller (runPersistentRelaySession) keeps the VK
 // session alive across multiple client connections.
-func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service) error {
+func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.SignalingClient, svc provider.Service, vkTokens []string) error {
 	mgr := turn.NewManager(svc, s.cfg.UseTCP, s.cfg.Logger)
 	defer mgr.CloseAll()
+
+	vkTokens = deduplicateTokens(vkTokens, s.cfg.Logger)
+	tokenIdx := 0
 
 	type dtlsResult struct {
 		index   int
@@ -568,14 +571,63 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 
 		s.cfg.Logger.Info("received client batch", "count", len(clientAddrs), "final", isFinal)
 
-		allocs, err := mgr.Allocate(ctx, len(clientAddrs))
-		if err != nil {
-			s.cfg.Logger.Error("allocate for batch failed", "err", err)
-			_ = sigClient.SendRelayBatch(ctx, nil, "server", clientNonce, totalPairs, isFinal)
-			if isFinal {
-				break
+		// Allocate TURN connections for this batch. If VK tokens are
+		// available, use them first (one per connection) via
+		// FetchJoinInfoWithToken + AllocateWithCredentials. Once tokens
+		// are exhausted, fall back to the anonymous bulk Allocate path.
+		var allocs []*turn.Allocation
+		tokenConns := 0
+		tap, hasTokenAuth := svc.(provider.TokenAuthProvider)
+
+		if hasTokenAuth && tokenIdx < len(vkTokens) {
+			for i := 0; i < len(clientAddrs); i++ {
+				if tokenIdx >= len(vkTokens) {
+					break
+				}
+				info, err := tap.FetchJoinInfoWithToken(ctx, vkTokens[tokenIdx])
+				if err != nil {
+					s.cfg.Logger.Warn("server token fetch failed, stopping token allocation",
+						"tokenIdx", tokenIdx, "err", err)
+					tokenIdx++
+					break
+				}
+				alloc, err := mgr.AllocateWithCredentials(ctx, &info.Credentials)
+				if err != nil {
+					s.cfg.Logger.Warn("server token TURN alloc failed, skipping token",
+						"tokenIdx", tokenIdx, "err", err)
+					tokenIdx++
+					continue
+				}
+				tokenIdx++
+				tokenConns++
+				allocs = append(allocs, alloc)
 			}
-			continue
+		}
+
+		// Allocate remaining connections anonymously.
+		remaining := len(clientAddrs) - len(allocs)
+		if remaining > 0 {
+			anonAllocs, err := mgr.Allocate(ctx, remaining)
+			if err != nil {
+				s.cfg.Logger.Error("anonymous allocate failed", "err", err)
+				if len(allocs) == 0 {
+					_ = sigClient.SendRelayBatch(ctx, nil, "server", clientNonce, totalPairs, isFinal)
+					if isFinal {
+						break
+					}
+					continue
+				}
+				// Proceed with partial token-only allocations.
+			} else {
+				allocs = append(allocs, anonAllocs...)
+			}
+		}
+
+		if tokenConns > 0 {
+			s.cfg.Logger.Info("batch allocation complete",
+				"token_conns", tokenConns,
+				"anon_conns", len(allocs)-tokenConns,
+				"total", len(allocs))
 		}
 
 		serverAddrs := make([]string, len(allocs))
@@ -916,4 +968,18 @@ func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) 
 
 	wg.Wait()
 	logger.Info("stream relay ended", "stream_id", stream.ID, "target", target)
+}
+
+func deduplicateTokens(tokens []string, logger *slog.Logger) []string {
+	seen := make(map[string]bool, len(tokens))
+	result := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if seen[t] {
+			logger.Warn("duplicate VK token ignored")
+			continue
+		}
+		seen[t] = true
+		result = append(result, t)
+	}
+	return result
 }
