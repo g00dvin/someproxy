@@ -719,18 +719,75 @@ func (m *Mux) dispatch(f *Frame) {
 	s := val.(*Stream)
 	switch f.Type {
 	case FrameData:
-		select {
-		case s.recv <- f.Payload:
-		case <-s.done:
+		if s.striping && s.reorder != nil {
+			m.dispatchStriped(s, f)
+		} else {
+			select {
+			case s.recv <- f.Payload:
+			case <-s.done:
+			}
 		}
 	case FrameClose:
-		if !s.closed.Swap(true) {
-			close(s.done)
-			m.streams.Delete(f.StreamID)
-			m.streamCount.Add(-1)
+		if s.striping && s.reorder != nil && s.reorder.Len() > 0 {
+			// Defer close until reorder buffer drains
+			s.closePending.Store(true)
+			return
 		}
-		close(s.recv)
+		m.closeStream(s)
 	}
+}
+
+func (m *Mux) dispatchStriped(s *Stream, f *Frame) {
+	if len(f.Payload) < stripSeqSize {
+		return // malformed
+	}
+	stripSeq := binary.BigEndian.Uint32(f.Payload[0:stripSeqSize])
+	data := make([]byte, len(f.Payload)-stripSeqSize)
+	copy(data, f.Payload[stripSeqSize:])
+
+	flushed := s.reorder.Insert(stripSeq, data)
+	for _, d := range flushed {
+		select {
+		case s.recv <- d:
+		case <-s.done:
+			return
+		}
+	}
+
+	// Check limits
+	if s.reorder.Overflowed() || s.reorder.GapTimedOut(reorderGapTimeout) {
+		m.logger.Warn("reorder buffer limit reached, closing stream",
+			"stream", s.ID,
+			"buffered", s.reorder.Len(),
+			"timedOut", s.reorder.GapTimedOut(reorderGapTimeout))
+		m.closeStream(s)
+		return
+	}
+
+	// If close was pending and buffer is now empty, execute deferred close
+	if s.closePending.Load() && s.reorder.Len() == 0 {
+		m.closeStream(s)
+	}
+}
+
+func (m *Mux) closeStream(s *Stream) {
+	if s.closed.Swap(true) {
+		return // already closed — prevent double-close panic on s.recv
+	}
+	close(s.done)
+	m.streams.Delete(s.ID)
+	m.streamCount.Add(-1)
+	// Drain any remaining reorder buffer before closing recv
+	if s.reorder != nil {
+		for _, d := range s.reorder.FlushAll() {
+			select {
+			case s.recv <- d:
+			case <-time.After(100 * time.Millisecond):
+				// recv channel full or blocked, accept data loss
+			}
+		}
+	}
+	close(s.recv)
 }
 
 // DispatchLoop processes incoming frames and routes them to streams.
@@ -920,7 +977,7 @@ func (s *Stream) Close() error {
 	close(s.done)
 	s.mux.streams.Delete(s.ID)
 	s.mux.streamCount.Add(-1)
-	return s.mux.sendFrameOn(s.assignedConn, &Frame{
+	return s.mux.sendFrameOn(nil, &Frame{
 		StreamID: s.ID,
 		Type:     FrameClose,
 		Sequence: s.mux.NextSeq(),
