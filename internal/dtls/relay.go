@@ -47,11 +47,31 @@ func isPunch(buf []byte, n int) bool {
 // UDP relay to overflow and drop packets.
 const bridgePipeBufferSize = 512 * 1024
 
-// bridgeWritePace is the fixed delay between pipe→relay writes.
-// VK TURN relays drop packets when write rate exceeds ~200 pkts/s.
+// DefaultWritePace is the base delay between pipe→relay writes for a single connection.
+// VK TURN relays drop packets when total write rate exceeds ~200 pkts/s.
 // 5ms pace = 200 pkts/s × ~1200 bytes = ~240 KB/s (~1.9 Mbps) per connection.
 // Tested: 4ms causes 50%+ packet loss; 5ms gives 0% loss on 5MB transfers.
-const bridgeWritePace = 5 * time.Millisecond
+const DefaultWritePace = 5 * time.Millisecond
+
+// bridgeWritePace is the active pacing used by bridge goroutines.
+// Set via SetWritePace before establishing connections.
+var bridgeWritePace = DefaultWritePace
+
+// SetWritePace overrides the per-connection relay write pacing.
+// Call with WritePaceForConns(n) before creating TURN connections
+// to scale pacing with the number of parallel connections.
+func SetWritePace(d time.Duration) {
+	bridgeWritePace = d
+}
+
+// WritePaceForConns returns the per-connection pacing to keep total relay rate
+// at ~200 pkts/s. With N connections, each gets 5ms*N to avoid overloading the relay.
+func WritePaceForConns(n int) time.Duration {
+	if n <= 1 {
+		return DefaultWritePace
+	}
+	return DefaultWritePace * time.Duration(n)
+}
 
 // AcceptOverTURN establishes a server-side DTLS connection through a TURN
 // relay PacketConn. Mirrors DialOverTURN but uses dtls.Server() instead

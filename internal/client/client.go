@@ -312,6 +312,8 @@ func connectRelaySession(ctx context.Context, logger *slog.Logger, siren *monito
 	}
 
 	// 3. Start batched TURN allocations.
+	// Scale per-connection write pacing so total relay rate stays ~200 pkts/s.
+	internaldtls.SetWritePace(internaldtls.WritePaceForConns(numConns))
 	mgr := turn.NewManager(svc, useTCP, logger)
 	// Reuse credentials from initial join to avoid re-joining the conference
 	// (VK hangs up the signaling session when a new anonymous participant joins).
