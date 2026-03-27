@@ -404,7 +404,7 @@ func (m *Mux) writeLoop(mc *muxConn) {
 		// Cap total batch size to stay within pion/dtls inboundBufferSize (8192).
 		// Each batch becomes one DTLS record; DTLS adds ~90 bytes overhead
 		// (header + CID + AEAD). Oversized records cause "short buffer" on receiver.
-		const maxBatchBytes = 7 * 1024
+		const maxBatchBytes = 4 * 1024
 		totalLen := len(req.data)
 	drain:
 		for len(batch) < 64 && totalLen < maxBatchBytes {
@@ -1096,6 +1096,10 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 			m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
 		}
 	}()
+	// pendingFrames buffers frames that arrive before their stream's FrameOpen.
+	// With striping, FrameOpen and FrameData may travel on different connections
+	// and arrive out of order in DispatchLoop.
+	pendingFrames := make(map[uint32][]*Frame)
 	for {
 		select {
 		case f, ok := <-m.inFrames:
@@ -1170,7 +1174,22 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 						m.logger.Warn("accepted streams buffer full")
 					}
 				}
+				// Replay any frames that arrived before this FrameOpen.
+				if pending, ok := pendingFrames[f.StreamID]; ok {
+					for _, pf := range pending {
+						m.dispatch(pf)
+					}
+					delete(pendingFrames, f.StreamID)
+				}
 				continue
+			}
+			// Buffer frames for streams not yet opened (striping race:
+			// FrameOpen and FrameData travel on different connections).
+			if f.StreamID != 0 && f.Type == FrameData {
+				if _, exists := m.streams.Load(f.StreamID); !exists {
+					pendingFrames[f.StreamID] = append(pendingFrames[f.StreamID], f)
+					continue
+				}
 			}
 			m.dispatch(f)
 		case <-ctx.Done():
