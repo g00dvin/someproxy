@@ -398,17 +398,21 @@ func (s *CallSlot) dtlsHandshakeParallel(ctx context.Context, m *mux.Mux, allocs
 				return
 			}
 
+			// Punch relay to create TURN permission
+			s.logger.Info("dtls: punch+handshake", "idx", i, "local", alloc.RelayAddr.String(), "remote", rAddr.String())
 			internaldtls.PunchRelay(alloc.RelayConn, rAddr)
 			punchCtx, punchCancel := context.WithCancel(ctx)
 			internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, rAddr)
 
-			pIdx := punchStartIdx + i
-			waiter := sigClient.PreparePunchWait(ctx, nonce, pIdx)
-			sigClient.SendPunchReady(ctx, nonce, pIdx)
-			if err := waiter(); err != nil {
-				punchCancel()
-				results <- dtlsResult{idx: i, err: fmt.Errorf("punch wait: %w", err)}
-				return
+			// Client uses punch signaling to coordinate with 3s timeout (best effort).
+			// Server just punches and accepts — no punch signaling needed.
+			if s.role == RoleClient {
+				pIdx := punchStartIdx + i
+				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
+				waiter := sigClient.PreparePunchWait(punchReadyCtx, nonce, pIdx)
+				sigClient.SendPunchReady(ctx, nonce, pIdx)
+				_ = waiter() // best effort — proceed to DTLS even if punch ack times out
+				prc()
 			}
 
 			var conn net.Conn
@@ -420,6 +424,7 @@ func (s *CallSlot) dtlsHandshakeParallel(ctx context.Context, m *mux.Mux, allocs
 			}
 			punchCancel()
 
+			s.logger.Info("DTLS handshake result", "idx", i, "role", s.role, "err", err)
 			if err != nil {
 				results <- dtlsResult{idx: i, err: fmt.Errorf("dtls: %w", err)}
 				return
