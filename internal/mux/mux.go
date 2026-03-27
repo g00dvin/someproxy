@@ -400,25 +400,27 @@ func (m *Mux) writeLoop(mc *muxConn) {
 		}
 		batch = append(batch[:0], req)
 
-		// Drain all immediately available frames (non-blocking)
+		// Drain all immediately available frames (non-blocking).
+		// Cap total batch size to stay within pion/dtls inboundBufferSize (8192).
+		// Each batch becomes one DTLS record; DTLS adds ~90 bytes overhead
+		// (header + CID + AEAD). Oversized records cause "short buffer" on receiver.
+		const maxBatchBytes = 7 * 1024
+		totalLen := len(req.data)
 	drain:
-		for len(batch) < 64 {
+		for len(batch) < 64 && totalLen < maxBatchBytes {
 			select {
 			case r, ok := <-mc.writeCh:
 				if !ok {
 					break drain
 				}
 				batch = append(batch, r)
+				totalLen += len(r.data)
 			default:
 				break drain
 			}
 		}
 
-		// Coalesce into single buffer for one TCP write
-		totalLen := 0
-		for _, r := range batch {
-			totalLen += len(r.data)
-		}
+		// Coalesce into single buffer for one TCP write.
 		buf := make([]byte, 0, totalLen)
 		for _, r := range batch {
 			buf = append(buf, r.data...)
@@ -1193,6 +1195,22 @@ var MaxFramePayload = func() int {
 	return DefaultFramePayload
 }()
 
+// trySendWriteCh attempts a non-blocking send to mc.writeCh.
+// Returns false if the channel is full or closed (recovers from panic on closed channel).
+func (s *Stream) trySendWriteCh(mc *muxConn, data []byte) (sent bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			sent = false
+		}
+	}()
+	select {
+	case mc.writeCh <- writeReq{data: data, wg: &s.inflight}:
+		return true
+	default:
+		return false
+	}
+}
+
 // Write sends data on the stream, chunking into multiple frames if needed.
 func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
@@ -1253,10 +1271,8 @@ func (s *Stream) Write(p []byte) (int, error) {
 			mc.rtxRing.Push(data)
 			mc.rtxRing.mu.Unlock()
 			s.inflight.Add(1)
-			select {
-			case mc.writeCh <- writeReq{data: data, wg: &s.inflight}:
-			default:
-				// Channel full — backpressure. Write synchronously as fallback.
+			if !s.trySendWriteCh(mc, data) {
+				// Channel full or closed — write synchronously as fallback.
 				s.mux.sendFrameOn(mc, f)
 				s.inflight.Done()
 			}

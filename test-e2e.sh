@@ -33,6 +33,7 @@ HTTP_PORT=3080
 DOWNLOAD_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/patch-6.12.xz"
 USE_VK_TOKEN=""    # empty=anonymous, "env"=from .env, "vk1.a.X"=explicit
 VERBOSE=""
+STRIPING=""
 
 for arg in "$@"; do
   case $arg in
@@ -43,6 +44,7 @@ for arg in "$@"; do
     --vk-token=*) USE_VK_TOKEN="${arg#*=}" ;;
     --vk-token) USE_VK_TOKEN="env" ;;
     --verbose) VERBOSE="--verbose" ;;
+    --striping) STRIPING=1 ;;
   esac
 done
 
@@ -112,6 +114,7 @@ echo "  Connections:  $CONNS"
 echo "  Links:        $LINKS"
 echo "  Monitor:      ${MONITOR_MIN}m"
 echo "  Verbose:      $([ -n "$VERBOSE" ] && echo yes || echo no)"
+echo "  Striping:     $([ -n "$STRIPING" ] && echo forced || echo adaptive)"
 echo ""
 
 # --- Helpers ---
@@ -282,7 +285,7 @@ sleep 1
 echo ""
 TOTAL_CONNS=$((CONNS * LINKS))
 echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-./callvpn-server${EXE} \
+ENABLE_STRIPING=${STRIPING:-} ./callvpn-server${EXE} \
   $LINK_ARGS \
   --tcp=true \
   --n="$CONNS" \
@@ -302,7 +305,7 @@ echo "[$(ts)] Server running (PID $SERVER_PID)"
 # --- Start client ---
 echo ""
 echo "[$(ts)] Starting client (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
-./callvpn-client${EXE} \
+ENABLE_STRIPING=${STRIPING:-} ./callvpn-client${EXE} \
   $LINK_ARGS \
   --n="$CONNS" \
   --tcp=true \
