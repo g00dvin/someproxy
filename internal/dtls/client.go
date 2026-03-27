@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -50,14 +51,17 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		defer wg.Done()
 		defer bridgeCancel()
 		buf := make([]byte, 65535)
+		var pktCount, byteCount int64
 		for {
 			select {
 			case <-bridgeCtx.Done():
+				slog.Debug("bridge relay→pipe context done", "pkts", pktCount, "bytes", byteCount)
 				return
 			default:
 			}
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
+				slog.Debug("bridge relay→pipe read done", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
 			if isPunch(buf, n) {
@@ -65,8 +69,11 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 			}
 			_, err = conn2.WriteTo(buf[:n], serverAddr)
 			if err != nil {
+				slog.Debug("bridge relay→pipe write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
+			pktCount++
+			byteCount += int64(n)
 		}
 	}()
 
@@ -75,23 +82,29 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 		defer wg.Done()
 		defer bridgeCancel()
 		buf := make([]byte, 65535)
+		var pktCount, byteCount int64
 		for {
 			select {
 			case <-bridgeCtx.Done():
+				slog.Debug("bridge pipe→relay context done", "pkts", pktCount, "bytes", byteCount)
 				return
 			default:
 			}
 			n, _, err := conn2.ReadFrom(buf)
 			if err != nil {
+				slog.Debug("bridge pipe→relay read done", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			start := time.Now()
 			_, err = relayConn.WriteTo(buf[:n], serverAddr)
 			if err != nil {
+				slog.Debug("bridge pipe→relay write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			if elapsed := time.Since(start); elapsed < bridgeSlowWrite {
-				time.Sleep(bridgeMinPace)
+			time.Sleep(bridgeWritePace)
+			pktCount++
+			byteCount += int64(n)
+			if pktCount%1000 == 0 {
+				slog.Debug("bridge pipe→relay progress", "pkts", pktCount, "bytes", byteCount)
 			}
 		}
 	}()

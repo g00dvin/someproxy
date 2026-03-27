@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -46,15 +47,11 @@ func isPunch(buf []byte, n int) bool {
 // UDP relay to overflow and drop packets.
 const bridgePipeBufferSize = 512 * 1024
 
-// Adaptive pacing constants for the pipe→relay bridge.
-// When WriteTo completes quickly (buffer has space), we add a small minimum
-// sleep to avoid overwhelming the TURN relay's internal forwarding.
-// When WriteTo blocks (TCP backpressure from filled 16KB write buffer),
-// no extra sleep is needed — the network is already rate-limiting us.
-const (
-	bridgeMinPace      = 1 * time.Millisecond          // minimum pace when writes are instant
-	bridgeSlowWrite    = 500 * time.Microsecond         // if write took this long, skip extra sleep
-)
+// bridgeWritePace is the fixed delay between pipe→relay writes.
+// VK TURN relays drop packets when write rate exceeds ~200 pkts/s.
+// 5ms pace = 200 pkts/s × ~1200 bytes = ~240 KB/s (~1.9 Mbps) per connection.
+// Tested: 4ms causes 50%+ packet loss; 5ms gives 0% loss on 5MB transfers.
+const bridgeWritePace = 5 * time.Millisecond
 
 // AcceptOverTURN establishes a server-side DTLS connection through a TURN
 // relay PacketConn. Mirrors DialOverTURN but uses dtls.Server() instead
@@ -82,14 +79,17 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		defer wg.Done()
 		defer bridgeCancel()
 		buf := make([]byte, 65535)
+		var pktCount, byteCount int64
 		for {
 			select {
 			case <-bridgeCtx.Done():
+				slog.Debug("bridge relay→pipe context done", "pkts", pktCount, "bytes", byteCount)
 				return
 			default:
 			}
 			n, _, err := relayConn.ReadFrom(buf)
 			if err != nil {
+				slog.Debug("bridge relay→pipe read done", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
 			if isPunch(buf, n) {
@@ -97,8 +97,11 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 			}
 			_, err = conn2.WriteTo(buf[:n], clientRelayAddr)
 			if err != nil {
+				slog.Debug("bridge relay→pipe write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
+			pktCount++
+			byteCount += int64(n)
 		}
 	}()
 
@@ -107,26 +110,29 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 		defer wg.Done()
 		defer bridgeCancel()
 		buf := make([]byte, 65535)
+		var pktCount, byteCount int64
 		for {
 			select {
 			case <-bridgeCtx.Done():
+				slog.Debug("bridge pipe→relay context done", "pkts", pktCount, "bytes", byteCount)
 				return
 			default:
 			}
 			n, _, err := conn2.ReadFrom(buf)
 			if err != nil {
+				slog.Debug("bridge pipe→relay read done", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			start := time.Now()
 			_, err = relayConn.WriteTo(buf[:n], clientRelayAddr)
 			if err != nil {
+				slog.Debug("bridge pipe→relay write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			// Adaptive: if write was fast (buffer not full), pace to avoid
-			// overwhelming the relay. If write blocked (TCP backpressure),
-			// no extra sleep needed.
-			if elapsed := time.Since(start); elapsed < bridgeSlowWrite {
-				time.Sleep(bridgeMinPace)
+			time.Sleep(bridgeWritePace)
+			pktCount++
+			byteCount += int64(n)
+			if pktCount%1000 == 0 {
+				slog.Debug("bridge pipe→relay progress", "pkts", pktCount, "bytes", byteCount)
 			}
 		}
 	}()

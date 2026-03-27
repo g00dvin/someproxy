@@ -35,7 +35,12 @@ func main() {
 	numConns := flag.Int("n", 1, "number of parallel connections per call")
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
+	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
 	flag.Parse()
+
+	if *verbose {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 
 	if *numConns > 8 {
 		fmt.Fprintf(os.Stderr, "WARNING: --n=%d exceeds recommended maximum of 8. "+
@@ -59,7 +64,11 @@ func main() {
 		log.Fatal("maximum 16 VK tokens allowed")
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logLevel := slog.LevelInfo
+	if *verbose {
+		logLevel = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 
 	cfg := server.Config{
 		ListenAddr: *listenAddr,

@@ -44,8 +44,13 @@ func main() {
 	fingerprint := flag.String("fingerprint", "", "server DTLS certificate SHA-256 fingerprint (hex)")
 	var vkTokens stringSlice
 	flag.Var(&vkTokens, "vk-token", "VK account token (repeatable, 0-16)")
+	verbose := flag.Bool("verbose", false, "enable verbose frame-level logging")
 
 	flag.Parse()
+
+	if *verbose {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
 
 	if len(vkTokens) == 0 {
 		if env := os.Getenv("VK_TOKENS"); env != "" {
@@ -77,7 +82,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logLevel := slog.LevelInfo
+	if *verbose {
+		logLevel = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
 	siren := monitoring.New(logger)
 
 	// Create call service providers (auto-detect from link).

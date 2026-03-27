@@ -150,6 +150,7 @@ type writeReq struct {
 
 type muxConn struct {
 	conn       io.ReadWriteCloser
+	index      int        // connection index within Mux.conns
 	stats      connStats
 	mu         sync.Mutex // serializes writes
 	wrrCurrent int64      // smooth weighted round-robin current weight (protected by Mux.mu)
@@ -171,9 +172,10 @@ func New(logger *slog.Logger, conns ...io.ReadWriteCloser) *Mux {
 		connDied:        make(chan int, 32),
 		disableStriping: os.Getenv("ENABLE_STRIPING") != "1",
 	}
-	for _, c := range conns {
+	for i, c := range conns {
 		mc := &muxConn{
 			conn:      c,
+			index:     i,
 			writeCh:   make(chan writeReq, 256),
 			writeDone: make(chan struct{}),
 		}
@@ -318,6 +320,11 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 		mc.conn.Close()    // close DTLS connection immediately to free resources
 		close(mc.writeCh)  // stop writeLoop (drains remaining frames)
 		<-mc.writeDone     // wait for writeLoop to finish
+		m.logger.Info("connection stats at death",
+			"conn", idx,
+			"bytes_sent", mc.stats.bytesSent.Load(),
+			"errors", mc.stats.errors.Load(),
+		)
 		m.RemoveConn(idx)  // retransmit buffered frames + check reorder gaps
 
 		// Notify about dead connection (non-blocking).
@@ -347,6 +354,13 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 			m.logger.Warn("read error on connection", "index", idx, "err", err)
 			return
 		}
+		m.logger.Debug("readLoop frame",
+			"conn", idx,
+			"stream", f.StreamID,
+			"type", f.Type,
+			"payload", len(f.Payload),
+			"seq", f.Sequence,
+		)
 		f.connIdx = idx
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
 		if !m.trySendInFrame(f) {
@@ -410,6 +424,13 @@ func (m *Mux) writeLoop(mc *muxConn) {
 			buf = append(buf, r.data...)
 		}
 
+		m.logger.Debug("writeLoop batch",
+			"conn", mc.index,
+			"frames", len(batch),
+			"bytes", totalLen,
+			"ch_len", len(mc.writeCh),
+		)
+
 		mc.mu.Lock()
 		if d, ok := mc.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
 			d.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -427,6 +448,12 @@ func (m *Mux) writeLoop(mc *muxConn) {
 			}
 		}
 		if err != nil {
+			m.logger.Debug("writeLoop batch error",
+				"conn", mc.index,
+				"frames", len(batch),
+				"bytes", totalLen,
+				"err", err,
+			)
 			mc.stats.errors.Add(1)
 			continue
 		}
@@ -594,6 +621,13 @@ func (m *Mux) sendFrameOn(mc *muxConn, f *Frame) error {
 	mc.mu.Unlock()
 
 	if err != nil {
+		m.logger.Debug("sendFrameOn write failed",
+			"conn", mc.index,
+			"stream", f.StreamID,
+			"type", f.Type,
+			"payload", len(f.Payload),
+			"err", err,
+		)
 		mc.stats.errors.Add(1)
 		// Try fallback to another connection.
 		fallback := m.selectConn()
@@ -709,6 +743,7 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 		idx = len(m.conns)
 		m.conns = append(m.conns, mc)
 	}
+	mc.index = idx
 	m.mu.Unlock()
 
 	m.activeReaders.Add(1)
