@@ -398,37 +398,61 @@ func (s *CallSlot) dtlsHandshakeParallel(ctx context.Context, m *mux.Mux, allocs
 				return
 			}
 
-			// Punch relay to create TURN permission
 			s.logger.Info("dtls: punch+handshake", "idx", i, "local", alloc.RelayAddr.String(), "remote", rAddr.String())
-			internaldtls.PunchRelay(alloc.RelayConn, rAddr)
-			punchCtx, punchCancel := context.WithCancel(ctx)
-			internaldtls.StartPunchLoop(punchCtx, alloc.RelayConn, rAddr)
 
-			// Client uses punch signaling to coordinate with 3s timeout (best effort).
-			// Server just punches and accepts — no punch signaling needed.
-			if s.role == RoleClient {
-				pIdx := punchStartIdx + i
-				punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
-				waiter := sigClient.PreparePunchWait(punchReadyCtx, nonce, pIdx)
-				sigClient.SendPunchReady(ctx, nonce, pIdx)
-				_ = waiter() // best effort — proceed to DTLS even if punch ack times out
-				prc()
+			// Retry loop matching original code: server 2 attempts, client 3
+			maxAttempts := 3
+			if s.role == RoleServer {
+				maxAttempts = 2
 			}
 
 			var conn net.Conn
 			var cleanup context.CancelFunc
-			if s.role == RoleClient {
-				conn, cleanup, err = internaldtls.DialOverTURN(ctx, alloc.RelayConn, rAddr, s.fp)
-			} else {
-				conn, cleanup, err = internaldtls.AcceptOverTURN(ctx, alloc.RelayConn, rAddr)
-			}
-			punchCancel()
+			var lastErr error
 
-			s.logger.Info("DTLS handshake result", "idx", i, "role", s.role, "err", err)
-			if err != nil {
-				results <- dtlsResult{idx: i, err: fmt.Errorf("dtls: %w", err)}
+			for attempt := 1; attempt <= maxAttempts; attempt++ {
+				// Punch relay to create TURN permission
+				punchLoopCtx, punchLoopCancel := context.WithCancel(ctx)
+				internaldtls.PunchRelay(alloc.RelayConn, rAddr)
+				internaldtls.StartPunchLoop(punchLoopCtx, alloc.RelayConn, rAddr)
+
+				if s.role == RoleClient {
+					// Client: punch signaling with 3s timeout (best effort)
+					pIdx := punchStartIdx + i
+					punchReadyCtx, prc := context.WithTimeout(ctx, 3*time.Second)
+					waiter := sigClient.PreparePunchWait(punchReadyCtx, nonce, pIdx)
+					sigClient.SendPunchReady(ctx, nonce, pIdx)
+					_ = waiter()
+					prc()
+				} else {
+					// Server: 200ms delay for TURN permission to establish (matches original)
+					time.Sleep(200 * time.Millisecond)
+				}
+
+				// DTLS handshake with 30s timeout
+				dtlsCtx, dtlsCancel := context.WithTimeout(ctx, 30*time.Second)
+				if s.role == RoleClient {
+					conn, cleanup, lastErr = internaldtls.DialOverTURN(dtlsCtx, alloc.RelayConn, rAddr, s.fp)
+				} else {
+					conn, cleanup, lastErr = internaldtls.AcceptOverTURN(dtlsCtx, alloc.RelayConn, rAddr)
+				}
+				dtlsCancel()
+				punchLoopCancel()
+
+				if lastErr == nil {
+					break
+				}
+				s.logger.Warn("dtls handshake failed", "idx", i, "attempt", attempt, "err", lastErr)
+				if attempt < maxAttempts {
+					time.Sleep(time.Duration(attempt) * time.Second)
+				}
+			}
+
+			if lastErr != nil {
+				results <- dtlsResult{idx: i, err: fmt.Errorf("dtls: %w", lastErr)}
 				return
 			}
+			s.logger.Info("dtls handshake ok", "idx", i)
 			results <- dtlsResult{conn: conn, cleanup: cleanup, idx: i}
 		}(i)
 	}
