@@ -40,6 +40,7 @@ type room struct {
 type participant struct {
 	peerID string
 	conn   *websocket.Conn
+	writeMu sync.Mutex // protects conn.WriteMessage from concurrent goroutines
 	done   chan struct{}
 }
 
@@ -200,7 +201,9 @@ func (s *SignalingServer) handleCall(w http.ResponseWriter, r *http.Request) {
 	for _, existing := range rm.participants {
 		// VK format: {"notification":"participant-joined","participant":{"peerId":{"id":<number>}}}
 		joined := fmt.Sprintf(`{"notification":"participant-joined","participant":{"peerId":{"id":%s}}}`, peerID)
+		existing.writeMu.Lock()
 		existing.conn.WriteMessage(websocket.TextMessage, []byte(joined)) //nolint:errcheck
+		existing.writeMu.Unlock()
 	}
 	rm.participants[peerID] = p
 	rm.mu.Unlock()
@@ -208,7 +211,9 @@ func (s *SignalingServer) handleCall(w http.ResponseWriter, r *http.Request) {
 	// Send connection notification to the new participant.
 	// VK format: {"notification":"connection","peerId":{"id":<number>}}
 	connMsg := fmt.Sprintf(`{"notification":"connection","peerId":{"id":%s}}`, peerID)
+	p.writeMu.Lock()
 	conn.WriteMessage(websocket.TextMessage, []byte(connMsg)) //nolint:errcheck
+	p.writeMu.Unlock()
 
 	// Start keepalive pinger.
 	go s.pingLoop(p)
@@ -225,7 +230,10 @@ func (s *SignalingServer) pingLoop(p *participant) {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			if err := p.conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+			p.writeMu.Lock()
+			err := p.conn.WriteMessage(websocket.TextMessage, []byte("ping"))
+			p.writeMu.Unlock()
+			if err != nil {
 				return
 			}
 		}
@@ -293,7 +301,9 @@ func (s *SignalingServer) routeCustomData(roomID, senderID string, data json.Raw
 		if dropRate > 0 && rand.Float64() < dropRate { //nolint:gosec
 			continue
 		}
+		p.writeMu.Lock()
 		p.conn.WriteMessage(websocket.TextMessage, notification) //nolint:errcheck
+		p.writeMu.Unlock()
 	}
 }
 

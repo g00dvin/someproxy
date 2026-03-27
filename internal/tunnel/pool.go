@@ -54,10 +54,12 @@ func NewCallPool(cfg PoolConfig) *CallPool {
 func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
 	p.logger.Info("starting client pool", "calls", len(p.cfg.Services), "conns_per_call", p.cfg.ConnsPerCall)
 
+	p.mu.Lock()
 	for i, svc := range p.cfg.Services {
 		slot := NewCallSlot(i, svc, RoleClient, p.cfg.UseTCP, p.cfg.AuthToken, p.cfg.VKTokens, p.cfg.Fingerprint, p.logger)
 		p.slots = append(p.slots, slot)
 	}
+	p.mu.Unlock()
 
 	// Phase 1: Sequential connect (rate limit safe)
 	for i, slot := range p.slots {
@@ -122,10 +124,12 @@ func (p *CallPool) StartClient(ctx context.Context) (*mux.Mux, error) {
 func (p *CallPool) StartServer(ctx context.Context) (*mux.Mux, error) {
 	p.logger.Info("starting server pool", "calls", len(p.cfg.Services), "conns_per_call", p.cfg.ConnsPerCall)
 
+	p.mu.Lock()
 	for i, svc := range p.cfg.Services {
 		slot := NewCallSlot(i, svc, RoleServer, p.cfg.UseTCP, p.cfg.AuthToken, p.cfg.VKTokens, nil, p.logger)
 		p.slots = append(p.slots, slot)
 	}
+	p.mu.Unlock()
 
 	// Phase 1: Sequential connect + pre-allocate 1 TURN per slot
 	type preAlloc struct {
@@ -343,13 +347,17 @@ func (p *CallPool) Status() []SlotStatus {
 func (p *CallPool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.done)
-		for _, slot := range p.slots {
+		p.mu.Lock()
+		slots := make([]*CallSlot, len(p.slots))
+		copy(slots, p.slots)
+		m := p.m
+		p.m = nil
+		p.mu.Unlock()
+		for _, slot := range slots {
 			slot.Close()
 		}
-		p.mu.Lock()
-		if p.m != nil {
-			p.m.Close()
+		if m != nil {
+			m.Close()
 		}
-		p.mu.Unlock()
 	})
 }

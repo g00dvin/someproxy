@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
@@ -16,6 +17,7 @@ type mockService struct {
 	turnSrvs  []*TURNServer
 	sigURL    string // signaling server base URL like "ws://127.0.0.1:XXXXX"
 	roomID    string
+	mu        sync.Mutex
 	callIndex int // for round-robin TURN selection
 }
 
@@ -28,8 +30,10 @@ func (s *mockService) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, er
 		return nil, fmt.Errorf("testrig: no TURN servers configured")
 	}
 
+	s.mu.Lock()
 	idx := s.callIndex % len(s.turnSrvs)
 	s.callIndex++
+	s.mu.Unlock()
 
 	primary := s.turnSrvs[idx]
 	host, port, _ := net.SplitHostPort(primary.Addr)
