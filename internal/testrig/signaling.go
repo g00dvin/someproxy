@@ -198,21 +198,17 @@ func (s *SignalingServer) handleCall(w http.ResponseWriter, r *http.Request) {
 	// Notify existing participants about the new one.
 	rm.mu.Lock()
 	for _, existing := range rm.participants {
-		joined, _ := json.Marshal(map[string]string{
-			"notification":  "participant-joined",
-			"participantId": peerID,
-		})
-		existing.conn.WriteMessage(websocket.TextMessage, joined) //nolint:errcheck
+		// VK format: {"notification":"participant-joined","participant":{"peerId":{"id":<number>}}}
+		joined := fmt.Sprintf(`{"notification":"participant-joined","participant":{"peerId":{"id":%s}}}`, peerID)
+		existing.conn.WriteMessage(websocket.TextMessage, []byte(joined)) //nolint:errcheck
 	}
 	rm.participants[peerID] = p
 	rm.mu.Unlock()
 
 	// Send connection notification to the new participant.
-	connMsg, _ := json.Marshal(map[string]string{
-		"notification": "connection",
-		"peerId":       peerID,
-	})
-	conn.WriteMessage(websocket.TextMessage, connMsg) //nolint:errcheck
+	// VK format: {"notification":"connection","peerId":{"id":<number>}}
+	connMsg := fmt.Sprintf(`{"notification":"connection","peerId":{"id":%s}}`, peerID)
+	conn.WriteMessage(websocket.TextMessage, []byte(connMsg)) //nolint:errcheck
 
 	// Start keepalive pinger.
 	go s.pingLoop(p)

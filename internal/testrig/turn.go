@@ -17,6 +17,15 @@ type TURNServer struct {
 	conn     net.PacketConn
 }
 
+// turnUsers is the set of credentials accepted by all testrig TURN servers.
+// All servers accept all users so that round-robin allocation works across servers.
+var turnUsers = map[string]string{
+	"test0": "pass0",
+	"test1": "pass1",
+	"test2": "pass2",
+	"test3": "pass3",
+}
+
 func newTURNServer(t *testing.T, index int) *TURNServer {
 	t.Helper()
 
@@ -29,14 +38,17 @@ func newTURNServer(t *testing.T, index int) *TURNServer {
 		t.Fatalf("testrig: listen UDP: %v", err)
 	}
 
-	authKey := turn.GenerateAuthKey(username, realm, password)
+	// Pre-compute auth keys for all known users.
+	authKeys := make(map[string][]byte, len(turnUsers))
+	for u, p := range turnUsers {
+		authKeys[u] = turn.GenerateAuthKey(u, realm, p)
+	}
+
 	srv, err := turn.NewServer(turn.ServerConfig{
 		Realm: realm,
 		AuthHandler: func(u string, realm string, srcAddr net.Addr) ([]byte, bool) {
-			if u != username {
-				return nil, false
-			}
-			return authKey, true
+			key, ok := authKeys[u]
+			return key, ok
 		},
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
