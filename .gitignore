@@ -54,3 +54,4 @@ test/integration/.env
 .serena
 .claude
 CLAUDE.md
+testdata/
