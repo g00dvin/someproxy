@@ -124,7 +124,7 @@ func (m *Manager) createAllocation(ctx context.Context, idx int) (*Allocation, e
 			return nil, fmt.Errorf("fetch credentials: %w", err)
 		}
 	}
-	// Round-robin across available TURN servers to distribute load
+	// Round-robin across available TURN servers to distribute load.
 	if len(creds.Servers) > 1 {
 		srv := creds.Servers[idx%len(creds.Servers)]
 		creds.Host = srv.Host

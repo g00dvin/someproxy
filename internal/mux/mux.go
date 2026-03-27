@@ -1278,7 +1278,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 
 		if s.striping {
 			// Async write: push marshaled frame to conn's write channel.
-			// This returns immediately, allowing parallel writes across conns.
 			data, err := f.MarshalBinary()
 			if err != nil {
 				if total > 0 {
@@ -1291,9 +1290,26 @@ func (s *Stream) Write(p []byte) (int, error) {
 			mc.rtxRing.mu.Unlock()
 			s.inflight.Add(1)
 			if !s.trySendWriteCh(mc, data) {
-				// Channel full or closed — write synchronously as fallback.
-				s.mux.sendFrameOn(mc, f)
-				s.inflight.Done()
+				// Channel full — try other conns to avoid head-of-line blocking.
+				// With striping, blocking on one slow conn starves ALL conns.
+				sent := false
+				s.mux.mu.Lock()
+				for _, alt := range s.mux.conns {
+					if alt != nil && alt != mc {
+						if s.trySendWriteCh(alt, data) {
+							sent = true
+							break
+						}
+					}
+				}
+				s.mux.mu.Unlock()
+				if !sent {
+					// All channels full — sync write as last resort.
+					s.mux.sendFrameOn(mc, f)
+					s.inflight.Done()
+				}
+				// If sent via alt conn, trySendWriteCh already
+				// passed the wg to writeReq — don't double-Done.
 			}
 		} else {
 			err := s.mux.sendFrameOn(mc, f)
