@@ -512,6 +512,9 @@ func (s *Server) runMultiRelayMode(ctx context.Context) {
 func (s *Server) runRelayMode(ctx context.Context) {
 	s.cfg.Logger.Info("starting relay-to-relay mode", "service", s.cfg.Service.Name())
 
+	backoff := 3 * time.Second
+	const maxBackoff = 5 * time.Minute
+
 	for {
 		if ctx.Err() != nil {
 			return
@@ -524,13 +527,19 @@ func (s *Server) runRelayMode(ctx context.Context) {
 			return
 		}
 		if err != nil {
-			s.cfg.Logger.Warn("persistent relay session failed", "err", err)
+			s.cfg.Logger.Warn("persistent relay session failed", "err", err, "retry_in", backoff)
 		}
 
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(3 * time.Second):
+		case <-time.After(backoff):
+		}
+
+		if err != nil {
+			backoff = min(backoff*2, maxBackoff)
+		} else {
+			backoff = 3 * time.Second
 		}
 	}
 }
@@ -545,7 +554,19 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 
 	svc := s.cfg.Service
 
-	jr, err := svc.FetchJoinInfo(ctx)
+	// Use token-authenticated join when VK tokens are available to avoid
+	// anonymous VK API calls (getAnonymousAccessTokenPayload) and rate limits.
+	var jr *provider.JoinInfo
+	var err error
+	if tap, ok := svc.(provider.TokenAuthProvider); ok && len(s.cfg.VKTokens) > 0 {
+		jr, err = tap.FetchJoinInfoWithToken(ctx, s.cfg.VKTokens[0])
+		if err != nil {
+			s.cfg.Logger.Warn("token join failed, falling back to anonymous", "err", err)
+			jr, err = svc.FetchJoinInfo(ctx)
+		}
+	} else {
+		jr, err = svc.FetchJoinInfo(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("join conference: %w", err)
 	}

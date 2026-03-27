@@ -97,7 +97,19 @@ func (s *CallSlot) Connect(ctx context.Context) error {
 
 	s.logger.Info("connecting to call")
 
-	info, err := s.svc.FetchJoinInfo(ctx)
+	// Use token-authenticated join when VK tokens are available to avoid
+	// anonymous VK API calls and rate limits.
+	var info *provider.JoinInfo
+	var err error
+	if tap, ok := s.svc.(provider.TokenAuthProvider); ok && len(s.vkTokens) > 0 {
+		info, err = tap.FetchJoinInfoWithToken(ctx, s.vkTokens[0])
+		if err != nil {
+			s.logger.Warn("token join failed, falling back to anonymous", "err", err)
+			info, err = s.svc.FetchJoinInfo(ctx)
+		}
+	} else {
+		info, err = s.svc.FetchJoinInfo(ctx)
+	}
 	if err != nil {
 		s.setError(err)
 		return fmt.Errorf("slot %d: fetch join info: %w", s.index, err)

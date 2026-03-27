@@ -70,7 +70,7 @@ else
   LINK_ARGS="--link=$VK_CALL_LINK"
 fi
 
-for var in VPN_TOKEN VK_TOKEN_1; do
+for var in VPN_TOKEN VK_TOKEN_1 VK_TOKEN_2; do
   if [[ -z "${!var:-}" ]]; then
     echo "FATAL: $var not set in .env"
     exit 1
@@ -228,6 +228,7 @@ echo "[$(ts)] Starting server (links=$LINKS, n=$CONNS, total=$TOTAL_CONNS)..."
   --tcp=true \
   --n="$CONNS" \
   --token="$VPN_TOKEN" \
+  --vk-token="$VK_TOKEN_2" \
   2>&1 | sed "s/^/  [server] /" &
 SERVER_PID=$!
 sleep 12
