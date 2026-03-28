@@ -10,39 +10,76 @@ data class Profile(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "",
     val connectionMode: String = "relay", // "relay" or "direct"
-    val callLink: String = "",
+    val callLinks: List<String> = listOf(""),
     val serverAddr: String = "",
     val token: String = "",
     val numConns: Int = 4,
-    val vkTokens: String = ""
+    val vkTokens: List<String> = emptyList()
 ) {
+    // Compat: first non-empty link for provider detection
+    val callLink: String get() = callLinks.firstOrNull { it.isNotBlank() } ?: ""
+
     fun isTelemostLink(): Boolean {
-        return callLink.contains("telemost.yandex") ||
-                (callLink.all { it.isDigit() } && callLink.length > 10)
+        val link = callLink
+        return link.contains("telemost.yandex") ||
+                (link.all { it.isDigit() } && link.length > 10)
     }
+
+    // Comma-separated for Go tunnel
+    fun callLinksJoined(): String = callLinks.filter { it.isNotBlank() }.joinToString(",")
+    fun vkTokensJoined(): String = vkTokens.filter { it.isNotBlank() }.joinToString(",")
 
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
         put("name", name)
         put("connectionMode", connectionMode)
-        put("callLink", callLink)
+        put("callLinks", JSONArray(callLinks))
         put("serverAddr", serverAddr)
         put("token", token)
         put("numConns", numConns)
-        if (vkTokens.isNotEmpty()) put("vkTokens", vkTokens)
+        if (vkTokens.isNotEmpty()) put("vkTokens", JSONArray(vkTokens))
     }
 
     companion object {
-        fun fromJson(obj: JSONObject): Profile = Profile(
-            id = obj.optString("id", UUID.randomUUID().toString()),
-            name = obj.optString("name", ""),
-            connectionMode = obj.optString("connectionMode", "relay"),
-            callLink = obj.optString("callLink", ""),
-            serverAddr = obj.optString("serverAddr", ""),
-            token = obj.optString("token", ""),
-            numConns = obj.optInt("numConns", 4),
-            vkTokens = obj.optString("vkTokens", "")
-        )
+        fun fromJson(obj: JSONObject): Profile {
+            // Migration: old "callLink" string → new "callLinks" list
+            val callLinks = when {
+                obj.has("callLinks") -> {
+                    val arr = obj.getJSONArray("callLinks")
+                    (0 until arr.length()).map { arr.getString(it) }
+                }
+                obj.has("callLink") -> {
+                    val link = obj.optString("callLink", "")
+                    if (link.isNotEmpty()) listOf(link) else listOf("")
+                }
+                else -> listOf("")
+            }
+
+            val vkTokens = when {
+                obj.has("vkTokens") -> {
+                    val v = obj.get("vkTokens")
+                    if (v is JSONArray) {
+                        (0 until v.length()).map { v.getString(it) }
+                    } else {
+                        // Migration: old comma-separated string
+                        val s = v.toString()
+                        if (s.isNotEmpty()) s.split(",").map { it.trim() } else emptyList()
+                    }
+                }
+                else -> emptyList()
+            }
+
+            return Profile(
+                id = obj.optString("id", UUID.randomUUID().toString()),
+                name = obj.optString("name", ""),
+                connectionMode = obj.optString("connectionMode", "relay"),
+                callLinks = callLinks,
+                serverAddr = obj.optString("serverAddr", ""),
+                token = obj.optString("token", ""),
+                numConns = obj.optInt("numConns", 4),
+                vkTokens = vkTokens
+            )
+        }
     }
 }
 
@@ -126,7 +163,7 @@ class ProfileManager(context: Context) {
         val profile = Profile(
             name = "Default",
             connectionMode = if (mode == "Direct") "direct" else "relay",
-            callLink = callLink,
+            callLinks = if (callLink.isNotEmpty()) listOf(callLink) else listOf(""),
             serverAddr = serverAddr,
             token = token,
             numConns = numConns

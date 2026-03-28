@@ -24,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
@@ -151,7 +152,7 @@ class MainActivity : ComponentActivity() {
                         totalConns = totalConns.value,
                         connectionStage = connectionStage.value,
                         logLines = logLines.value,
-                        onConnect = { callLink, serverAddr, token, numConns -> requestConnect(callLink, serverAddr, token, numConns) },
+                        onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
                         onDisconnect = { stopVpn() }
                     )
                 }
@@ -219,11 +220,14 @@ class MainActivity : ComponentActivity() {
 
         val profileManager = ProfileManager(this)
         val profile = profileManager.getActiveProfile() ?: return
-        val callLink = parseCallLink(profile.callLink)
+        val callLink = profile.callLinks
+            .map { parseCallLink(it) }
+            .filter { it.isNotBlank() }
+            .joinToString(",")
         if (callLink.isBlank()) return
 
         val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
-        requestConnect(callLink, serverAddr, profile.token, profile.numConns, profile.vkTokens)
+        requestConnect(callLink, serverAddr, profile.token, profile.numConns, profile.vkTokensJoined())
     }
 
     companion object {
@@ -251,7 +255,7 @@ fun CallVpnScreen(
     totalConns: Int,
     connectionStage: String = "",
     logLines: List<String>,
-    onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int) -> Unit,
+    onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
     onDisconnect: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -312,10 +316,14 @@ fun CallVpnScreen(
     val clipboardManager: ClipboardManager = LocalClipboardManager.current
 
     fun connectProfile(profile: Profile) {
-        val callLink = parseCallLink(profile.callLink)
+        val callLink = profile.callLinks
+            .map { parseCallLink(it) }
+            .filter { it.isNotBlank() }
+            .joinToString(",")
         val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
         val conns = profile.numConns.coerceIn(1, 16)
-        onConnect(callLink, serverAddr, profile.token, conns)
+        val vkTokensStr = profile.vkTokensJoined()
+        onConnect(callLink, serverAddr, profile.token, conns, vkTokensStr)
     }
 
     Column(
@@ -693,10 +701,11 @@ fun ProfileEditorDialog(
 
     var name by remember { mutableStateOf(base.name) }
     var connectionMode by remember { mutableStateOf(base.connectionMode) }
-    var callLink by remember { mutableStateOf(base.callLink) }
+    var callLinks by remember { mutableStateOf(base.callLinks.ifEmpty { listOf("") }) }
     var serverAddr by remember { mutableStateOf(base.serverAddr) }
     var token by remember { mutableStateOf(base.token) }
     var numConns by remember { mutableStateOf(base.numConns.toString()) }
+    var vkTokens by remember { mutableStateOf(base.vkTokens) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
 
     Dialog(onDismissRequest = onDismiss) {
@@ -750,15 +759,59 @@ fun ProfileEditorDialog(
                     )
                 }
 
-                // Call link
-                OutlinedTextField(
-                    value = callLink,
-                    onValueChange = { callLink = it },
-                    label = { Text("Ссылка на звонок") },
-                    placeholder = { Text("https://vk.com/call/join/...") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                // Call links (1-8)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "Ссылки на звонок (${callLinks.size}/8)",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (callLinks.size < 8) {
+                        IconButton(
+                            onClick = { callLinks = callLinks + "" },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.Add, "Добавить ссылку", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+                callLinks.forEachIndexed { index, link ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = link,
+                            onValueChange = { value ->
+                                callLinks = callLinks.toMutableList().also { it[index] = value }
+                            },
+                            label = { Text("Ссылка ${index + 1}") },
+                            placeholder = { Text("https://vk.com/call/join/...") },
+                            singleLine = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (callLinks.size > 1) {
+                            IconButton(
+                                onClick = {
+                                    callLinks = callLinks.toMutableList().also { it.removeAt(index) }
+                                },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Close,
+                                    "Удалить",
+                                    modifier = Modifier.size(18.dp),
+                                    tint = Color(0xFFF44336)
+                                )
+                            }
+                        }
+                    }
+                }
 
                 // Server address (direct only)
                 if (connectionMode == "direct") {
@@ -798,6 +851,66 @@ fun ProfileEditorDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                // VK tokens (0-16)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "VK токены (${vkTokens.size}/16)",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (vkTokens.size < 16) {
+                        IconButton(
+                            onClick = { vkTokens = vkTokens + "" },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(Icons.Default.Add, "Добавить токен", modifier = Modifier.size(18.dp))
+                        }
+                    }
+                }
+                if (vkTokens.isEmpty()) {
+                    Text(
+                        "Ускоряют подключение, обходят rate-limit VK API",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                    )
+                }
+                vkTokens.forEachIndexed { index, vkToken ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = vkToken,
+                            onValueChange = { value ->
+                                vkTokens = vkTokens.toMutableList().also { it[index] = value }
+                            },
+                            label = { Text("Токен ${index + 1}") },
+                            placeholder = { Text("vk1.a.…") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(
+                            onClick = {
+                                vkTokens = vkTokens.toMutableList().also { it.removeAt(index) }
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Close,
+                                "Удалить",
+                                modifier = Modifier.size(18.dp),
+                                tint = Color(0xFFF44336)
+                            )
+                        }
+                    }
+                }
+
                 // Delete button (only for existing profiles)
                 if (!isNew && onDelete != null) {
                     TextButton(
@@ -825,10 +938,11 @@ fun ProfileEditorDialog(
                             val saved = base.copy(
                                 name = name.trim(),
                                 connectionMode = connectionMode,
-                                callLink = callLink.trim(),
+                                callLinks = callLinks.map { it.trim() },
                                 serverAddr = serverAddr.trim(),
                                 token = token,
-                                numConns = conns
+                                numConns = conns,
+                                vkTokens = vkTokens.map { it.trim() }.filter { it.isNotEmpty() }
                             )
                             onSave(saved)
                         },
