@@ -908,7 +908,8 @@ func (m *Mux) Close() error {
 		m.closeAcceptOnce.Do(func() { close(m.acceptedStreams) })
 	}
 	m.mu.Lock()
-	conns := m.conns
+	conns := make([]*muxConn, len(m.conns))
+	copy(conns, m.conns)
 	m.mu.Unlock()
 	for _, mc := range conns {
 		if mc != nil {
