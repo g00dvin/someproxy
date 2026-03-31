@@ -716,17 +716,26 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 		clientAddrs, _, isFinal, batchNonce, err := sigClient.RecvRelayBatch(batchCtx, "server", clientNonce)
 		batchCancel()
 		if err != nil {
-			punchCancel()
-			// A new client sent disconnect-req while we're still waiting
-			// for batches from the previous (dead) client. Ack and abort
-			// so the caller can accept the new client immediately.
 			var de *provider.DisconnectError
 			if errors.As(err, &de) {
+				_ = sigClient.SendDisconnectAck(ctx, de.Nonce)
+				if clientNonce == "" && totalPairs == 0 {
+					// No batches received yet — this is the client's session
+					// init (disconnect-req to clear old state). Ack and keep
+					// waiting for relay batches.
+					s.cfg.Logger.Info("client session init disconnect, acked and waiting for batches",
+						"nonce", de.Nonce)
+					continue
+				}
+				// A new client sent disconnect-req while we're still waiting
+				// for batches from the previous (dead) client. Ack and abort
+				// so the caller can accept the new client immediately.
+				punchCancel()
 				s.cfg.Logger.Info("new client sent disconnect during batch exchange, aborting session",
 					"nonce", de.Nonce, "received_pairs", totalPairs)
-				_ = sigClient.SendDisconnectAck(ctx, de.Nonce)
 				return fmt.Errorf("aborted by new client disconnect: %w", err)
 			}
+			punchCancel()
 			if clientNonce != "" && ctx.Err() == nil {
 				// We already received at least one batch — the client likely
 				// disconnected before sending the final one. Continue with
