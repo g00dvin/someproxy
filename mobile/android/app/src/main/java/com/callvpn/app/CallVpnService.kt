@@ -42,6 +42,39 @@ class CallVpnService : VpnService() {
         when (intent?.action) {
             ACTION_START -> startVpn(intent)
             ACTION_STOP -> stopVpn()
+            ACTION_SPEEDTEST_START -> {
+                Thread {
+                    tunnel?.runSpeedTest(object : bind.SpeedTestCallback {
+                        override fun onPhase(phase: String) {
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(Intent(ACTION_SPEEDTEST_PROGRESS).apply {
+                                    putExtra(EXTRA_SPEEDTEST_PHASE, phase)
+                                })
+                        }
+                        override fun onProgress(jsonData: String) {
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(Intent(ACTION_SPEEDTEST_PROGRESS).apply {
+                                    putExtra(EXTRA_SPEEDTEST_JSON, jsonData)
+                                })
+                        }
+                        override fun onComplete(jsonData: String) {
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(Intent(ACTION_SPEEDTEST_PROGRESS).apply {
+                                    putExtra(EXTRA_SPEEDTEST_JSON, jsonData)
+                                    putExtra(EXTRA_SPEEDTEST_PHASE, "complete")
+                                })
+                        }
+                        override fun onError(err: String) {
+                            LocalBroadcastManager.getInstance(this@CallVpnService)
+                                .sendBroadcast(Intent(ACTION_SPEEDTEST_PROGRESS).apply {
+                                    putExtra(EXTRA_SPEEDTEST_PHASE, "error")
+                                    putExtra(EXTRA_SPEEDTEST_JSON, """{"error":"$err"}""")
+                                })
+                        }
+                    })
+                }.start()
+                return START_NOT_STICKY
+            }
         }
         return START_STICKY
     }
@@ -421,6 +454,10 @@ class CallVpnService : VpnService() {
         const val EXTRA_TOTAL_CONNS = "total_conns"
         const val ACTION_STAGE = "com.callvpn.STAGE"
         const val EXTRA_STAGE_TEXT = "stage_text"
+        const val ACTION_SPEEDTEST_START = "com.callvpn.SPEEDTEST_START"
+        const val ACTION_SPEEDTEST_PROGRESS = "com.callvpn.SPEEDTEST_PROGRESS"
+        const val EXTRA_SPEEDTEST_JSON = "speedtest_json"
+        const val EXTRA_SPEEDTEST_PHASE = "speedtest_phase"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1
 

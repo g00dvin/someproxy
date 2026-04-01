@@ -58,6 +58,10 @@ class MainActivity : ComponentActivity() {
     private var totalConns = mutableStateOf(0)
     private var logLines = mutableStateOf<List<String>>(emptyList())
     private var connectionStage = mutableStateOf("")
+    private var speedTestRunning = mutableStateOf(false)
+    private var speedTestPhase = mutableStateOf("")
+    private var speedTestProgress = mutableStateOf("")
+    private var speedTestResult = mutableStateOf("")
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
@@ -115,6 +119,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val speedTestReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val phase = intent.getStringExtra(CallVpnService.EXTRA_SPEEDTEST_PHASE) ?: ""
+            val json = intent.getStringExtra(CallVpnService.EXTRA_SPEEDTEST_JSON) ?: ""
+
+            when (phase) {
+                "complete" -> {
+                    speedTestRunning.value = false
+                    speedTestResult.value = json
+                    speedTestProgress.value = ""
+                }
+                "error" -> {
+                    speedTestRunning.value = false
+                    speedTestResult.value = json
+                    speedTestProgress.value = ""
+                }
+                else -> {
+                    speedTestPhase.value = phase
+                    if (json.isNotEmpty()) {
+                        speedTestProgress.value = json
+                    }
+                }
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -137,6 +167,7 @@ class MainActivity : ComponentActivity() {
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
         lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
         lbm.registerReceiver(stageReceiver, IntentFilter(CallVpnService.ACTION_STAGE))
+        lbm.registerReceiver(speedTestReceiver, IntentFilter(CallVpnService.ACTION_SPEEDTEST_PROGRESS))
 
         handleQuickConnect(intent)
 
@@ -152,6 +183,20 @@ class MainActivity : ComponentActivity() {
                         totalConns = totalConns.value,
                         connectionStage = connectionStage.value,
                         logLines = logLines.value,
+                        speedTestRunning = speedTestRunning.value,
+                        speedTestPhase = speedTestPhase.value,
+                        speedTestProgress = speedTestProgress.value,
+                        speedTestResult = speedTestResult.value,
+                        onSpeedTestStart = {
+                            speedTestRunning.value = true
+                            speedTestResult.value = ""
+                            speedTestProgress.value = ""
+                            speedTestPhase.value = ""
+                            val intent = Intent(this, CallVpnService::class.java).apply {
+                                action = CallVpnService.ACTION_SPEEDTEST_START
+                            }
+                            startService(intent)
+                        },
                         onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
                         onDisconnect = { stopVpn() }
                     )
@@ -166,6 +211,7 @@ class MainActivity : ComponentActivity() {
         lbm.unregisterReceiver(logReceiver)
         lbm.unregisterReceiver(connCountReceiver)
         lbm.unregisterReceiver(stageReceiver)
+        lbm.unregisterReceiver(speedTestReceiver)
         super.onDestroy()
     }
 
@@ -255,6 +301,11 @@ fun CallVpnScreen(
     totalConns: Int,
     connectionStage: String = "",
     logLines: List<String>,
+    speedTestRunning: Boolean = false,
+    speedTestPhase: String = "",
+    speedTestProgress: String = "",
+    speedTestResult: String = "",
+    onSpeedTestStart: () -> Unit = {},
     onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
     onDisconnect: () -> Unit
 ) {
@@ -574,6 +625,95 @@ fun CallVpnScreen(
                             fontFamily = FontFamily.Monospace,
                             color = lineColor
                         )
+                    }
+                }
+            }
+        }
+
+        // Speed Test — visible only when connected
+        if (vpnState == VpnState.Connected) {
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Button(
+                onClick = { onSpeedTestStart() },
+                enabled = !speedTestRunning,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (speedTestRunning) "Тестирование..." else "Тест скорости")
+            }
+
+            // Progress display
+            if (speedTestRunning && speedTestProgress.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                val phaseLabel = speedTestPhase.replaceFirstChar { it.uppercase() }
+                try {
+                    val json = org.json.JSONObject(speedTestProgress)
+                    val mbps = json.optDouble("current_mbps", 0.0)
+                    val elapsed = json.optInt("elapsed_s", 0)
+                    Text(
+                        text = "$phaseLabel: ${"%.2f".format(mbps)} Mbps (${elapsed}s)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                } catch (_: Exception) {
+                    Text(text = "$phaseLabel...", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+
+            // Final results
+            if (speedTestResult.isNotEmpty() && !speedTestRunning) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        try {
+                            val json = org.json.JSONObject(speedTestResult)
+                            val ping = json.optJSONObject("ping")
+                            val download = json.optJSONObject("download")
+                            val upload = json.optJSONObject("upload")
+                            val conns = json.optJSONArray("connections")
+
+                            if (ping != null) {
+                                Text(
+                                    "Ping: ${"%.1f".format(ping.optDouble("avg_ms"))}ms " +
+                                        "(jitter ${"%.1f".format(ping.optDouble("jitter_ms"))}ms)",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                            if (download != null) {
+                                Text(
+                                    "Download: ${"%.2f".format(download.optDouble("mbps"))} Mbps",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                            if (upload != null) {
+                                Text(
+                                    "Upload: ${"%.2f".format(upload.optDouble("mbps"))} Mbps",
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                            if (conns != null && conns.length() > 0) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text("Connections:", style = MaterialTheme.typography.labelSmall)
+                                for (i in 0 until conns.length()) {
+                                    val c = conns.getJSONObject(i)
+                                    Text(
+                                        "  #${c.optInt("index")}: " +
+                                            "${"%.2f".format(c.optDouble("down_mbps"))}/" +
+                                            "${"%.2f".format(c.optDouble("up_mbps"))} Mbps, " +
+                                            "${"%.0f".format(c.optDouble("latency_ms"))}ms",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                        } catch (_: Exception) {
+                            Text(speedTestResult, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }

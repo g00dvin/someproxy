@@ -19,11 +19,12 @@ type DialFunc func(ctx context.Context, network, addr string) (io.ReadWriteClose
 
 // Server implements an HTTP/HTTPS proxy with CONNECT support.
 type Server struct {
-	Addr   string
-	Dial   DialFunc
-	Bypass *bypass.Matcher
-	Logger *slog.Logger
-	server *http.Server
+	Addr      string
+	Dial      DialFunc
+	Bypass    *bypass.Matcher
+	Logger    *slog.Logger
+	SpeedTest func(w http.ResponseWriter)
+	server    *http.Server
 }
 
 // ListenAndServe starts the HTTP proxy server.
@@ -60,6 +61,10 @@ func (s *Server) Close() error {
 
 // ServeHTTP handles both CONNECT (tunneling) and regular HTTP proxy requests.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/__speedtest__" && s.SpeedTest != nil {
+		s.SpeedTest(w)
+		return
+	}
 	if r.Method == http.MethodConnect {
 		s.handleConnect(w, r)
 	} else {

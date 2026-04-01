@@ -834,6 +834,34 @@ func (m *Mux) TotalConns() int {
 	return n
 }
 
+// ConnStat holds exported per-connection statistics.
+type ConnStat struct {
+	Index     int
+	BytesSent int64
+	LatencyNs int64
+	Alive     bool
+}
+
+// ConnStats returns a snapshot of per-connection statistics.
+func (m *Mux) ConnStats() []ConnStat {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	stats := make([]ConnStat, len(m.conns))
+	for i, mc := range m.conns {
+		if mc == nil {
+			continue
+		}
+		stats[i] = ConnStat{
+			Index:     i,
+			BytesSent: mc.stats.bytesSent.Load(),
+			LatencyNs: mc.stats.latency.Load(),
+			Alive:     mc.conn != nil,
+		}
+	}
+	return stats
+}
+
 // RemoveConn sets the connection at the given index to nil.
 // The slot is reused by subsequent AddConn calls.
 // When a connection dies, its retransmit ring is drained and

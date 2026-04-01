@@ -233,6 +233,137 @@ run_download_test() {
   echo "==========================="
 }
 
+run_max_throughput_test() {
+  local total=$TOTAL_CONNS
+  local max_time=60
+  local tmpdir
+  tmpdir=$(mktemp -d)
+
+  echo ""
+  echo "====== MAX THROUGHPUT TEST ======"
+  echo "[$(ts)] $total parallel downloads via SOCKS5, url=$DOWNLOAD_URL"
+
+  # Launch N parallel curl processes
+  local pids=()
+  for i in $(seq 1 "$total"); do
+    curl -x socks5://127.0.0.1:$SOCKS_PORT -s -o /dev/null \
+      -w "%{size_download} %{speed_download} %{time_total}" \
+      --connect-timeout 15 --max-time "$max_time" \
+      "$DOWNLOAD_URL" > "$tmpdir/result_$i" 2>/dev/null &
+    pids+=($!)
+  done
+
+  # Wait for all to finish
+  for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  # Aggregate results
+  local total_bytes=0
+  local total_speed=0
+  local max_time_taken=0
+  local ok=0
+  local failed=0
+
+  for i in $(seq 1 "$total"); do
+    local res
+    res=$(cat "$tmpdir/result_$i" 2>/dev/null) || true
+    local sz=$(echo "$res" | awk '{print $1}')
+    local sp=$(echo "$res" | awk '{print $2}')
+    local tt=$(echo "$res" | awk '{print $3}')
+
+    if [[ -n "$sp" && "$sp" != "0" && "$sp" != "0.000" ]]; then
+      total_bytes=$(awk "BEGIN{printf \"%.0f\", $total_bytes + ${sz:-0}}")
+      total_speed=$(awk "BEGIN{printf \"%.3f\", $total_speed + $sp}")
+      if awk "BEGIN{exit !(${tt:-0} > $max_time_taken)}" 2>/dev/null; then
+        max_time_taken=$tt
+      fi
+      ok=$((ok + 1))
+      local mbps_i=$(awk "BEGIN{printf \"%.2f\", $sp * 8 / 1000000}")
+      echo "  [stream $i] ${mbps_i} Mbps (${tt}s)"
+    else
+      failed=$((failed + 1))
+      echo "  [stream $i] FAILED"
+    fi
+  done
+
+  echo ""
+  if [[ $ok -gt 0 ]]; then
+    local human_total
+    if awk "BEGIN{exit !($total_bytes > 1048576)}" 2>/dev/null; then
+      human_total="$(awk "BEGIN{printf \"%.1f\", $total_bytes / 1048576}") MB"
+    elif awk "BEGIN{exit !($total_bytes > 1024)}" 2>/dev/null; then
+      human_total="$(awk "BEGIN{printf \"%.0f\", $total_bytes / 1024}") KB"
+    else
+      human_total="${total_bytes}b"
+    fi
+    local mbps_total=$(awk "BEGIN{printf \"%.2f\", $total_speed * 8 / 1000000}")
+    echo "  AGGREGATE: ${human_total} in ${max_time_taken}s — ${mbps_total} Mbps"
+    echo "  Streams: $ok ok, $failed failed"
+  else
+    echo "  ALL STREAMS FAILED"
+  fi
+
+  rm -rf "$tmpdir"
+  echo "================================="
+}
+
+run_builtin_speedtest() {
+  echo ""
+  echo "====== BUILT-IN SPEED TEST ======"
+  echo "[$(ts)] Running speed test through tunnel..."
+
+  local tmpfile
+  tmpfile=$(mktemp)
+
+  # Stream JSON lines from the running client's HTTP proxy
+  curl -s -N http://127.0.0.1:$HTTP_PORT/__speedtest__ > "$tmpfile" 2>/dev/null || true
+
+  # Display progress lines (all but the last line)
+  local line_count
+  line_count=$(wc -l < "$tmpfile")
+  if [[ "$line_count" -gt 1 ]]; then
+    head -n $((line_count - 1)) "$tmpfile" | while IFS= read -r line; do
+      local phase=$(echo "$line" | jq -r '.phase // empty' 2>/dev/null)
+      local current_mbps=$(echo "$line" | jq -r '.current_mbps // empty' 2>/dev/null)
+      local elapsed=$(echo "$line" | jq -r '.elapsed_s // empty' 2>/dev/null)
+      local error=$(echo "$line" | jq -r '.error // empty' 2>/dev/null)
+
+      if [[ -n "$error" ]]; then
+        echo "[$(ts)] ERROR: $error"
+      elif [[ -n "$current_mbps" && -n "$elapsed" ]]; then
+        echo "[$(ts)] $phase: ${current_mbps} Mbps (${elapsed}s)"
+      elif [[ -n "$phase" ]]; then
+        echo "[$(ts)] Phase: $phase"
+      fi
+    done
+  fi
+
+  # Parse final result (last line)
+  local result
+  result=$(tail -n 1 "$tmpfile")
+  rm -f "$tmpfile"
+
+  if echo "$result" | jq -e '.ping' >/dev/null 2>&1; then
+    echo ""
+    local ping_avg=$(echo "$result" | jq -r '.ping.avg_ms')
+    local ping_jitter=$(echo "$result" | jq -r '.ping.jitter_ms')
+    local down_mbps=$(echo "$result" | jq -r '.download.mbps')
+    local up_mbps=$(echo "$result" | jq -r '.upload.mbps')
+    local num_conns=$(echo "$result" | jq -r '.connections | length')
+
+    echo "  Ping:     ${ping_avg}ms (jitter ${ping_jitter}ms)"
+    echo "  Download: ${down_mbps} Mbps"
+    echo "  Upload:   ${up_mbps} Mbps"
+    echo "  Connections: ${num_conns}"
+
+    echo "$result" | jq -r '.connections[] | "    #\(.index): \(.down_mbps)/\(.up_mbps) Mbps, \(.latency_ms)ms"' 2>/dev/null
+  else
+    echo "[$(ts)] Speed test failed or returned no result"
+  fi
+  echo "================================="
+}
+
 cleanup() {
   echo ""
   echo "[$(ts)] Shutting down gracefully..."
@@ -346,6 +477,12 @@ run_speed_test "n=$CONNS"
 
 # --- Download test ---
 run_download_test
+
+# --- Max throughput test ---
+run_max_throughput_test
+
+# --- Built-in speed test ---
+run_builtin_speedtest
 
 # --- Monitoring (optional) ---
 if [[ $MONITOR_MIN -gt 0 ]]; then

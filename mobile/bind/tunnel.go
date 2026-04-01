@@ -23,6 +23,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/provider"
 	"github.com/call-vpn/call-vpn/internal/provider/telemost"
 	"github.com/call-vpn/call-vpn/internal/provider/vk"
+	"github.com/call-vpn/call-vpn/internal/speedtest"
 	"github.com/call-vpn/call-vpn/internal/tunnel"
 	"github.com/call-vpn/call-vpn/internal/turn"
 	"github.com/google/uuid"
@@ -1321,3 +1322,39 @@ func (t *Tunnel) IsRunning() bool {
 	defer t.mu.Unlock()
 	return t.running
 }
+
+// SpeedTestCallback receives streaming speed test updates.
+// Implemented by the Android/iOS app.
+type SpeedTestCallback interface {
+	OnPhase(phase string)
+	OnProgress(jsonData string)
+	OnComplete(jsonData string)
+	OnError(err string)
+}
+
+// RunSpeedTest runs a speed test on the live tunnel.
+// Results are streamed via the callback.
+func (t *Tunnel) RunSpeedTest(cb SpeedTestCallback) {
+	t.mu.Lock()
+	m := t.m
+	t.mu.Unlock()
+
+	if m == nil {
+		cb.OnError("tunnel not connected")
+		return
+	}
+
+	adapter := &mobileCallbackAdapter{cb: cb}
+	if err := speedtest.RunClient(m, adapter, t.logger); err != nil {
+		cb.OnError(err.Error())
+	}
+}
+
+type mobileCallbackAdapter struct {
+	cb SpeedTestCallback
+}
+
+func (a *mobileCallbackAdapter) OnPhase(phase string)       { a.cb.OnPhase(phase) }
+func (a *mobileCallbackAdapter) OnProgress(jsonData string) { a.cb.OnProgress(jsonData) }
+func (a *mobileCallbackAdapter) OnComplete(jsonData string) { a.cb.OnComplete(jsonData) }
+func (a *mobileCallbackAdapter) OnError(err string)         { a.cb.OnError(err) }

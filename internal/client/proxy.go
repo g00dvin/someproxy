@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync/atomic"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/call-vpn/call-vpn/internal/mux"
 	httpproxy "github.com/call-vpn/call-vpn/internal/proxy/http"
 	"github.com/call-vpn/call-vpn/internal/proxy/socks5"
+	"github.com/call-vpn/call-vpn/internal/speedtest"
 )
 
 // startProxies starts SOCKS5 and HTTP proxies over the given Mux.
@@ -43,12 +45,22 @@ func startProxies(ctx context.Context, logger *slog.Logger, siren *monitoring.Si
 		Logger: logger.With("proxy", "socks5"),
 	}
 
+	speedTestHandler := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		cb := &httpCallback{w: w, flusher: flusher}
+		if err := speedtest.RunClient(m, cb, logger); err != nil {
+			logger.Warn("speed test failed", "err", err)
+		}
+	}
+
 	httpAddr := fmt.Sprintf("%s:%d", bindAddr, httpPort)
 	httpSrv := &httpproxy.Server{
-		Addr:   httpAddr,
-		Dial:   dialTunnel,
-		Bypass: bypassMatcher,
-		Logger: logger.With("proxy", "http"),
+		Addr:      httpAddr,
+		Dial:      dialTunnel,
+		Bypass:    bypassMatcher,
+		Logger:    logger.With("proxy", "http"),
+		SpeedTest: speedTestHandler,
 	}
 
 	errCh := make(chan error, 2)
@@ -141,12 +153,27 @@ func startRelayProxies(ctx context.Context, logger *slog.Logger, siren *monitori
 		Logger: logger.With("proxy", "socks5"),
 	}
 
+	speedTestHandler := func(w http.ResponseWriter) {
+		mx := getMux()
+		if mx == nil {
+			http.Error(w, `{"error":"tunnel not available"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		flusher, _ := w.(http.Flusher)
+		cb := &httpCallback{w: w, flusher: flusher}
+		if err := speedtest.RunClient(mx, cb, logger); err != nil {
+			logger.Warn("speed test failed", "err", err)
+		}
+	}
+
 	httpAddr := fmt.Sprintf("%s:%d", bindAddr, httpPort)
 	httpSrv := &httpproxy.Server{
-		Addr:   httpAddr,
-		Dial:   dialTunnel,
-		Bypass: bypassMatcher,
-		Logger: logger.With("proxy", "http"),
+		Addr:      httpAddr,
+		Dial:      dialTunnel,
+		Bypass:    bypassMatcher,
+		Logger:    logger.With("proxy", "http"),
+		SpeedTest: speedTestHandler,
 	}
 
 	errCh := make(chan error, 2)
@@ -210,4 +237,21 @@ func startRelayProxies(ctx context.Context, logger *slog.Logger, siren *monitori
 	socks5Srv.Close()
 	httpSrv.Close()
 	logger.Info("client stopped")
+}
+
+type httpCallback struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (c *httpCallback) OnPhase(phase string)      { c.writeLine(`{"phase":"` + phase + `"}`) }
+func (c *httpCallback) OnProgress(jsonData string) { c.writeLine(jsonData) }
+func (c *httpCallback) OnComplete(jsonData string) { c.writeLine(jsonData) }
+func (c *httpCallback) OnError(err string)         { c.writeLine(`{"error":"` + err + `"}`) }
+
+func (c *httpCallback) writeLine(line string) {
+	io.WriteString(c.w, line+"\n")
+	if c.flusher != nil {
+		c.flusher.Flush()
+	}
 }
