@@ -646,18 +646,17 @@ fun CallVpnScreen(
             if (speedTestRunning && speedTestProgress.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(8.dp))
                 val phaseLabel = speedTestPhase.replaceFirstChar { it.uppercase() }
-                try {
+                val progressText = runCatching {
                     val json = org.json.JSONObject(speedTestProgress)
                     val mbps = json.optDouble("current_mbps", 0.0)
                     val elapsed = json.optInt("elapsed_s", 0)
-                    Text(
-                        text = "$phaseLabel: ${"%.2f".format(mbps)} Mbps (${elapsed}s)",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                } catch (_: Exception) {
-                    Text(text = "$phaseLabel...", style = MaterialTheme.typography.bodyMedium)
-                }
+                    "$phaseLabel: ${"%.2f".format(mbps)} Mbps (${elapsed}s)"
+                }.getOrDefault("$phaseLabel...")
+                Text(
+                    text = progressText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
 
             // Final results
@@ -670,48 +669,51 @@ fun CallVpnScreen(
                     )
                 ) {
                     Column(modifier = Modifier.padding(12.dp)) {
-                        try {
+                        val lines = runCatching {
                             val json = org.json.JSONObject(speedTestResult)
                             val ping = json.optJSONObject("ping")
                             val download = json.optJSONObject("download")
                             val upload = json.optJSONObject("upload")
                             val conns = json.optJSONArray("connections")
-
-                            if (ping != null) {
-                                Text(
-                                    "Ping: ${"%.1f".format(ping.optDouble("avg_ms"))}ms " +
-                                        "(jitter ${"%.1f".format(ping.optDouble("jitter_ms"))}ms)",
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            }
-                            if (download != null) {
-                                Text(
-                                    "Download: ${"%.2f".format(download.optDouble("mbps"))} Mbps",
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            }
-                            if (upload != null) {
-                                Text(
-                                    "Upload: ${"%.2f".format(upload.optDouble("mbps"))} Mbps",
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                            }
-                            if (conns != null && conns.length() > 0) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text("Connections:", style = MaterialTheme.typography.labelSmall)
-                                for (i in 0 until conns.length()) {
-                                    val c = conns.getJSONObject(i)
-                                    Text(
-                                        "  #${c.optInt("index")}: " +
+                            buildList {
+                                if (ping != null) {
+                                    add("Ping: ${"%.1f".format(ping.optDouble("avg_ms"))}ms " +
+                                        "(jitter ${"%.1f".format(ping.optDouble("jitter_ms"))}ms)")
+                                }
+                                if (download != null) {
+                                    add("Download: ${"%.2f".format(download.optDouble("mbps"))} Mbps")
+                                }
+                                if (upload != null) {
+                                    add("Upload: ${"%.2f".format(upload.optDouble("mbps"))} Mbps")
+                                }
+                                if (conns != null && conns.length() > 0) {
+                                    add("")  // spacer marker
+                                    add("Connections:")
+                                    for (i in 0 until conns.length()) {
+                                        val c = conns.getJSONObject(i)
+                                        add("  #${c.optInt("index")}: " +
                                             "${"%.2f".format(c.optDouble("down_mbps"))}/" +
                                             "${"%.2f".format(c.optDouble("up_mbps"))} Mbps, " +
-                                            "${"%.0f".format(c.optDouble("latency_ms"))}ms",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace
-                                    )
+                                            "${"%.0f".format(c.optDouble("latency_ms"))}ms")
+                                    }
                                 }
                             }
-                        } catch (_: Exception) {
+                        }.getOrNull()
+
+                        if (lines != null) {
+                            for (line in lines) {
+                                if (line.isEmpty()) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                } else if (line == "Connections:") {
+                                    Text(line, style = MaterialTheme.typography.labelSmall)
+                                } else if (line.startsWith("  #")) {
+                                    Text(line, style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace)
+                                } else {
+                                    Text(line, style = MaterialTheme.typography.bodyMedium)
+                                }
+                            }
+                        } else {
                             Text(speedTestResult, style = MaterialTheme.typography.bodySmall)
                         }
                     }
