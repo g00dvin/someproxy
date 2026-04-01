@@ -136,7 +136,12 @@ func handleUpload(stream *mux.Stream, logger *slog.Logger) {
 }
 
 // RunClient runs a full speed test (ping + download + upload) on the given Mux.
+// Enables striping so the test stream uses all connections for aggregate throughput.
 func RunClient(m *mux.Mux, cb Callback, logger *slog.Logger) error {
+	// Enable striping so the speed test stream distributes across all connections,
+	// measuring aggregate throughput rather than a single connection.
+	m.EnableStriping()
+
 	stream, err := m.OpenStream(StreamID)
 	if err != nil {
 		return fmt.Errorf("open speed test stream: %w", err)
@@ -385,7 +390,9 @@ func buildConnResults(pre, mid, postDown, postUp []mux.ConnStat,
 			continue
 		}
 
-		downBytes := postDown[i].BytesSent - mid[i].BytesSent
+		// Download: client receives data → use BytesRecv delta
+		downBytes := postDown[i].BytesRecv - mid[i].BytesRecv
+		// Upload: client sends data → use BytesSent delta
 		upBytes := postUp[i].BytesSent - postDown[i].BytesSent
 
 		var downMbps, upMbps float64

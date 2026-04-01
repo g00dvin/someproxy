@@ -100,6 +100,7 @@ func (m *Mux) StartPingLoop(ctx context.Context, interval time.Duration) {
 type connStats struct {
 	latency   atomic.Int64 // nanoseconds, rolling average
 	bytesSent atomic.Int64
+	bytesRecv atomic.Int64
 	errors    atomic.Int64
 	lastUsed  atomic.Int64 // unix nano
 	prevSent  atomic.Int64 // bytesSent snapshot at last throughput measurement
@@ -365,6 +366,7 @@ func (m *Mux) readLoop(idx int, mc *muxConn) {
 			"seq", f.Sequence,
 		)
 		f.connIdx = idx
+		mc.stats.bytesRecv.Add(int64(headerSize + len(f.Payload)))
 		mc.stats.lastUsed.Store(time.Now().UnixNano())
 		if !m.trySendInFrame(f) {
 			return
@@ -838,6 +840,7 @@ func (m *Mux) TotalConns() int {
 type ConnStat struct {
 	Index     int
 	BytesSent int64
+	BytesRecv int64
 	LatencyNs int64
 	Alive     bool
 }
@@ -855,6 +858,7 @@ func (m *Mux) ConnStats() []ConnStat {
 		stats[i] = ConnStat{
 			Index:     i,
 			BytesSent: mc.stats.bytesSent.Load(),
+			BytesRecv: mc.stats.bytesRecv.Load(),
 			LatencyNs: mc.stats.latency.Load(),
 			Alive:     mc.conn != nil,
 		}
