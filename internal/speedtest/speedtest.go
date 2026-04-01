@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/mux"
@@ -135,55 +136,178 @@ func handleUpload(stream *mux.Stream, logger *slog.Logger) {
 	logger.Info("upload phase complete", "bytes", totalBytes, "duration", duration)
 }
 
-// RunClient runs a full speed test (ping + download + upload) on the given Mux.
-// Measures single-connection throughput + ping/latency with per-connection breakdown.
+// connTest holds results for a single connection's speed test stream.
+type connTest struct {
+	index    int
+	stream   *mux.Stream
+	ping     *PingResult
+	download *TransferResult
+	upload   *TransferResult
+	err      error
+}
+
+// RunClient runs a full speed test on the given Mux using N parallel streams
+// (one per active connection) to measure aggregate throughput.
+// Reports per-connection results and aggregated totals.
 func RunClient(m *mux.Mux, cb Callback, logger *slog.Logger) error {
-	stream, err := m.OpenStream(StreamID)
-	if err != nil {
-		return fmt.Errorf("open speed test stream: %w", err)
+	n := m.ActiveConns()
+	if n == 0 {
+		return fmt.Errorf("no connections available")
 	}
-	defer stream.Close()
 
-	preStats := m.ConnStats()
+	// Open N parallel streams — MUX SWRR pins each to a different connection.
+	streams := make([]*mux.Stream, n)
+	for i := range n {
+		s, err := m.OpenStream(StreamIDBase + uint32(i))
+		if err != nil {
+			// Close already opened streams.
+			for j := 0; j < i; j++ {
+				streams[j].Close()
+			}
+			return fmt.Errorf("open speed test stream %d: %w", i, err)
+		}
+		streams[i] = s
+	}
+	defer func() {
+		for _, s := range streams {
+			s.Close()
+		}
+	}()
 
-	// Phase 1: Ping
+	results := make([]connTest, n)
+	for i := range results {
+		results[i].index = i
+		results[i].stream = streams[i]
+	}
+
+	// Phase 1: Ping (sequential on stream 0 — measures single RTT)
 	cb.OnPhase("ping")
-	pingResult, err := runPing(stream, 20, logger)
+	pingResult, err := runPing(streams[0], 20, logger)
 	if err != nil {
 		return fmt.Errorf("ping phase: %w", err)
+	}
+	for i := range results {
+		results[i].ping = pingResult
 	}
 	pJSON, _ := json.Marshal(Progress{Phase: "ping"})
 	cb.OnProgress(string(pJSON))
 
-	// Phase 2: Download
+	// Phase 2: Download — all N streams in parallel
 	cb.OnPhase("download")
-	midStats := m.ConnStats()
-	downloadResult, err := runDownload(stream, cb, logger)
-	if err != nil {
-		return fmt.Errorf("download phase: %w", err)
-	}
+	preDownStats := m.ConnStats()
+	runParallelPhase(results, func(ct *connTest) {
+		ct.download, ct.err = runDownload(ct.stream, nil, logger)
+	}, cb, "download", logger)
 	postDownStats := m.ConnStats()
 
-	// Phase 3: Upload
+	// Phase 3: Upload — all N streams in parallel
 	cb.OnPhase("upload")
-	uploadResult, err := runUpload(stream, cb, logger)
-	if err != nil {
-		return fmt.Errorf("upload phase: %w", err)
-	}
+	runParallelPhase(results, func(ct *connTest) {
+		ct.upload, ct.err = runUpload(ct.stream, nil, logger)
+	}, cb, "upload", logger)
 	postUpStats := m.ConnStats()
 
-	connResults := buildConnResults(preStats, midStats, postDownStats, postUpStats,
-		downloadResult.DurationS, uploadResult.DurationS)
+	// Build results
+	var totalDownBytes, totalUpBytes int64
+	var maxDownDur, maxUpDur float64
+	var connResults []ConnResult
+
+	for i, ct := range results {
+		downBytes := postDownStats[i].BytesRecv - preDownStats[i].BytesRecv
+		upBytes := postUpStats[i].BytesSent - postDownStats[i].BytesSent
+		latMs := float64(postUpStats[i].LatencyNs) / float64(time.Millisecond)
+
+		dr := ct.download
+		ur := ct.upload
+		if dr == nil {
+			dr = &TransferResult{}
+		}
+		if ur == nil {
+			ur = &TransferResult{}
+		}
+
+		connResults = append(connResults, ConnResult{
+			Index:     i,
+			DownBytes: downBytes,
+			UpBytes:   upBytes,
+			DownMbps:  dr.Mbps,
+			UpMbps:    ur.Mbps,
+			LatencyMs: math.Round(latMs*100) / 100,
+		})
+
+		totalDownBytes += dr.Bytes
+		totalUpBytes += ur.Bytes
+		if dr.DurationS > maxDownDur {
+			maxDownDur = dr.DurationS
+		}
+		if ur.DurationS > maxUpDur {
+			maxUpDur = ur.DurationS
+		}
+	}
+
+	var downMbps, upMbps float64
+	if maxDownDur > 0 {
+		downMbps = float64(totalDownBytes) * 8 / maxDownDur / 1_000_000
+	}
+	if maxUpDur > 0 {
+		upMbps = float64(totalUpBytes) * 8 / maxUpDur / 1_000_000
+	}
 
 	result := &Result{
-		Ping:        *pingResult,
-		Download:    *downloadResult,
-		Upload:      *uploadResult,
+		Ping: *pingResult,
+		Download: TransferResult{
+			Bytes:     totalDownBytes,
+			DurationS: maxDownDur,
+			Mbps:      math.Round(downMbps*100) / 100,
+		},
+		Upload: TransferResult{
+			Bytes:     totalUpBytes,
+			DurationS: maxUpDur,
+			Mbps:      math.Round(upMbps*100) / 100,
+		},
 		Connections: connResults,
 	}
 
 	cb.OnComplete(result.JSON())
 	return nil
+}
+
+// runParallelPhase runs fn on all connTests concurrently, reporting aggregate
+// progress to cb every second.
+func runParallelPhase(cts []connTest, fn func(*connTest), cb Callback, phase string, logger *slog.Logger) {
+	var wg sync.WaitGroup
+	for i := range cts {
+		wg.Add(1)
+		go func(ct *connTest) {
+			defer wg.Done()
+			fn(ct)
+		}(&cts[i])
+	}
+
+	// Progress reporter — aggregate throughput across all streams.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	start := time.Now()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			elapsed := time.Since(start)
+			elapsedS := int(elapsed.Seconds())
+			// Sum current stats from MUX isn't trivial here, just report elapsed time.
+			p := Progress{Phase: phase, ElapsedS: elapsedS}
+			pJSON, _ := json.Marshal(p)
+			cb.OnProgress(string(pJSON))
+		}
+	}
 }
 
 func runPing(stream *mux.Stream, count int, logger *slog.Logger) (*PingResult, error) {
@@ -295,7 +419,9 @@ func runDownload(stream *mux.Stream, cb Callback, logger *slog.Logger) (*Transfe
 
 			p := Progress{Phase: "download", ElapsedS: elapsedS, CurrentMbps: math.Round(currentMbps*100) / 100, Bytes: totalBytes}
 			pJSON, _ := json.Marshal(p)
-			cb.OnProgress(string(pJSON))
+			if cb != nil {
+				cb.OnProgress(string(pJSON))
+			}
 		}
 	}
 
@@ -344,7 +470,9 @@ func runUpload(stream *mux.Stream, cb Callback, logger *slog.Logger) (*TransferR
 
 			p := Progress{Phase: "upload", ElapsedS: elapsedS, CurrentMbps: math.Round(currentMbps*100) / 100, Bytes: totalBytes}
 			pJSON, _ := json.Marshal(p)
-			cb.OnProgress(string(pJSON))
+			if cb != nil {
+				cb.OnProgress(string(pJSON))
+			}
 		}
 	}
 
@@ -374,40 +502,3 @@ func runUpload(stream *mux.Stream, cb Callback, logger *slog.Logger) (*TransferR
 	}, nil
 }
 
-func buildConnResults(pre, mid, postDown, postUp []mux.ConnStat,
-	downDuration, upDuration float64) []ConnResult {
-
-	var results []ConnResult
-	for i := range postUp {
-		if i >= len(pre) || i >= len(mid) || i >= len(postDown) {
-			break
-		}
-		if !postUp[i].Alive {
-			continue
-		}
-
-		// Download: client receives data → use BytesRecv delta
-		downBytes := postDown[i].BytesRecv - mid[i].BytesRecv
-		// Upload: client sends data → use BytesSent delta
-		upBytes := postUp[i].BytesSent - postDown[i].BytesSent
-
-		var downMbps, upMbps float64
-		if downDuration > 0 {
-			downMbps = float64(downBytes) * 8 / downDuration / 1_000_000
-		}
-		if upDuration > 0 {
-			upMbps = float64(upBytes) * 8 / upDuration / 1_000_000
-		}
-		latMs := float64(postUp[i].LatencyNs) / float64(time.Millisecond)
-
-		results = append(results, ConnResult{
-			Index:     i,
-			DownBytes: downBytes,
-			UpBytes:   upBytes,
-			DownMbps:  math.Round(downMbps*100) / 100,
-			UpMbps:    math.Round(upMbps*100) / 100,
-			LatencyMs: math.Round(latMs*100) / 100,
-		})
-	}
-	return results
-}

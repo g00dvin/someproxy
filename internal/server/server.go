@@ -1130,7 +1130,7 @@ func (s *Server) handleOneReconnect(ctx context.Context, sigClient provider.Sign
 func handleStream(ctx context.Context, logger *slog.Logger, stream *mux.Stream) {
 	defer stream.Close()
 
-	if stream.ID == speedtest.StreamID {
+	if speedtest.IsSpeedTestStream(stream.ID) {
 		speedtest.HandleServer(stream, logger)
 		return
 	}

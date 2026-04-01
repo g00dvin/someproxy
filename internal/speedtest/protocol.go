@@ -6,8 +6,14 @@ import (
 	"io"
 )
 
-// StreamID is the reserved MUX stream ID for speed tests.
-const StreamID uint32 = 0xFFFFFFFE
+// StreamID is the base reserved MUX stream ID for speed tests.
+// IDs from StreamIDBase to StreamIDBase+255 are reserved for parallel streams.
+const StreamIDBase uint32 = 0xFFFF0000
+
+// IsSpeedTestStream returns true if the stream ID is in the reserved range.
+func IsSpeedTestStream(id uint32) bool {
+	return id >= StreamIDBase
+}
 
 // Commands
 const (
