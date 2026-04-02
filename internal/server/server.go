@@ -456,10 +456,16 @@ func (s *Server) runMultiRelayMode(ctx context.Context) {
 			return
 		}
 
+		start := time.Now()
 		s.runMultiRelaySession(ctx)
 
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Reset backoff if session lived long enough (not a transient failure).
+		if time.Since(start) > time.Minute {
+			backoff = 3 * time.Second
 		}
 
 		logger.Warn("multi-relay session ended, restarting", "retry_in", backoff)
@@ -555,10 +561,19 @@ func (s *Server) runRelayMode(ctx context.Context) {
 
 		// Outer loop: maintain a persistent VK session.
 		// Only re-join VK when signaling dies.
+		start := time.Now()
 		err := s.runPersistentRelaySession(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+
+		// If session lived long enough, it was not a transient failure —
+		// reset backoff so we reconnect quickly after credential refresh
+		// or expected VK hangups.
+		if time.Since(start) > time.Minute {
+			backoff = 3 * time.Second
+		}
+
 		if err != nil {
 			s.cfg.Logger.Warn("persistent relay session failed", "err", err, "retry_in", backoff)
 		}
