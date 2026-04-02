@@ -7,8 +7,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.VpnService
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -156,6 +159,8 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        requestBatteryOptimizationExemption()
+
         vpnState.value = when (CallVpnService.currentState) {
             "connecting" -> VpnState.Connecting
             "connected" -> VpnState.Connected
@@ -246,6 +251,16 @@ class MainActivity : ComponentActivity() {
             putExtra(CallVpnService.EXTRA_VK_TOKENS, pendingVkTokens)
         }
         ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+            try { startActivity(intent) } catch (_: Exception) { }
+        }
     }
 
     private fun stopVpn() {

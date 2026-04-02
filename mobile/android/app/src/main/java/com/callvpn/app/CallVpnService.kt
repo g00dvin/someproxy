@@ -12,6 +12,8 @@ import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
+import android.provider.Settings.Global
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import bind.Tunnel
@@ -28,6 +30,7 @@ class CallVpnService : VpnService() {
     private var tunInterfaceName: String? = null
     private var tunReaderThread: Thread? = null
     private var tunWriterThread: Thread? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     @Volatile
     private var running = false
     @Volatile
@@ -137,6 +140,8 @@ class CallVpnService : VpnService() {
         val vkTokens = intent.getStringExtra(EXTRA_VK_TOKENS) ?: ""
 
         running = true
+        ensureMobileDataEnabled()
+        acquireWakeLock()
         startForeground(NOTIFICATION_ID, buildNotification("Подключение..."))
         broadcastState("connecting")
 
@@ -359,6 +364,7 @@ class CallVpnService : VpnService() {
 
     private fun stopVpn() {
         running = false
+        releaseWakeLock()
         unregisterNetworkCallback()
 
         // Clean up hotspot routing BEFORE closing TUN interface.
@@ -384,9 +390,24 @@ class CallVpnService : VpnService() {
         tunWriterThread = null
 
         tunnel?.stop()
+        ensureMobileDataEnabled()
         broadcastState("disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun acquireWakeLock() {
+        val pm = getSystemService(PowerManager::class.java) ?: return
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallVPN::Tunnel").apply {
+            acquire()
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wakeLock = null
     }
 
     /** Detects the VPN TUN interface name via root (app lacks sysfs access). */
@@ -402,9 +423,29 @@ class CallVpnService : VpnService() {
         }
     }
 
+    override fun onRevoke() {
+        stopVpn()
+    }
+
     override fun onDestroy() {
         stopVpn()
         super.onDestroy()
+    }
+
+    /**
+     * Ensures mobile data is enabled. On some MediaTek devices, a VPN crash
+     * or abrupt disconnect can leave the global mobile_data setting at 0,
+     * effectively killing all cellular connectivity until manually toggled.
+     */
+    private fun ensureMobileDataEnabled() {
+        try {
+            val enabled = Global.getInt(contentResolver, "mobile_data", 1)
+            if (enabled == 0) {
+                // Use root to re-enable — the app doesn't have WRITE_SECURE_SETTINGS.
+                Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "settings put global mobile_data 1 && svc data enable"))
+            }
+        } catch (_: Exception) { /* best-effort */ }
     }
 
     private fun registerNetworkCallback() {
