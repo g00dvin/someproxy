@@ -153,7 +153,7 @@ func (s *Server) runDirectMode(ctx context.Context) {
 	}()
 
 	for {
-		conn, err := ln.Accept(ctx)
+		rawConn, err := ln.Accept(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -161,7 +161,16 @@ func (s *Server) runDirectMode(ctx context.Context) {
 			s.cfg.Logger.Warn("accept error", "err", err)
 			continue
 		}
-		go s.handleConnection(ctx, conn)
+		// Handshake runs in the goroutine so a slow/failing handshake
+		// does not block acceptance of other connections.
+		go func() {
+			conn, err := ln.Handshake(ctx, rawConn)
+			if err != nil {
+				s.cfg.Logger.Warn("handshake error", "err", err)
+				return
+			}
+			s.handleConnection(ctx, conn)
+		}()
 	}
 }
 

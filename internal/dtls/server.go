@@ -62,14 +62,20 @@ func Listen(addr string) (*Listener, error) {
 	}, nil
 }
 
-// Accept waits for and returns the next DTLS connection.
-// Performs the DTLS handshake with a 30-second timeout.
-func (l *Listener) Accept(ctx context.Context) (net.Conn, error) {
+// Accept waits for and returns the next raw DTLS connection.
+// The caller must call Handshake on the returned connection before use.
+func (l *Listener) Accept(_ context.Context) (net.Conn, error) {
 	conn, err := l.ln.Accept()
 	if err != nil {
 		return nil, err
 	}
 
+	return conn, nil
+}
+
+// Handshake performs the DTLS handshake on a connection returned by Accept
+// with a 30-second timeout. Must be called before the connection is used.
+func (l *Listener) Handshake(ctx context.Context, conn net.Conn) (net.Conn, error) {
 	dtlsConn, ok := conn.(*dtls.Conn)
 	if !ok {
 		conn.Close()
