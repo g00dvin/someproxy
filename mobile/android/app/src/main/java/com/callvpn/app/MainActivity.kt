@@ -17,6 +17,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -65,6 +66,7 @@ class MainActivity : ComponentActivity() {
     private var speedTestPhase = mutableStateOf("")
     private var speedTestProgress = mutableStateOf("")
     private var speedTestResult = mutableStateOf("")
+    private var captchaChallenge = mutableStateOf("")
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
@@ -148,6 +150,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val captchaReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            captchaChallenge.value = intent?.getStringExtra(CallVpnService.EXTRA_CAPTCHA_JSON) ?: ""
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -173,6 +181,7 @@ class MainActivity : ComponentActivity() {
         lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
         lbm.registerReceiver(stageReceiver, IntentFilter(CallVpnService.ACTION_STAGE))
         lbm.registerReceiver(speedTestReceiver, IntentFilter(CallVpnService.ACTION_SPEEDTEST_PROGRESS))
+        lbm.registerReceiver(captchaReceiver, IntentFilter(CallVpnService.ACTION_CAPTCHA))
 
         handleQuickConnect(intent)
 
@@ -205,6 +214,22 @@ class MainActivity : ComponentActivity() {
                         onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
                         onDisconnect = { stopVpn() }
                     )
+
+                    // Captcha dialog
+                    if (captchaChallenge.value.isNotEmpty()) {
+                        CaptchaDialog(
+                            challengeJson = captchaChallenge.value,
+                            onSubmit = { key ->
+                                captchaChallenge.value = ""
+                                val intent = Intent(this@MainActivity, CallVpnService::class.java).apply {
+                                    action = CallVpnService.ACTION_CAPTCHA_SUBMIT
+                                    putExtra(CallVpnService.EXTRA_CAPTCHA_KEY, key)
+                                }
+                                startService(intent)
+                            },
+                            onDismiss = { captchaChallenge.value = "" }
+                        )
+                    }
                 }
             }
         }
@@ -217,6 +242,7 @@ class MainActivity : ComponentActivity() {
         lbm.unregisterReceiver(connCountReceiver)
         lbm.unregisterReceiver(stageReceiver)
         lbm.unregisterReceiver(speedTestReceiver)
+        lbm.unregisterReceiver(captchaReceiver)
         super.onDestroy()
     }
 
@@ -1399,6 +1425,139 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
                         )
                     ) {
                         Text("Сохранить", color = Color.White)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CaptchaDialog(
+    challengeJson: String,
+    onSubmit: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val captchaImg = remember(challengeJson) {
+        try {
+            org.json.JSONObject(challengeJson).optString("captcha_img", "")
+        } catch (_: Exception) { "" }
+    }
+
+    var captchaKey by remember { mutableStateOf("") }
+    var bitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var loadError by remember { mutableStateOf(false) }
+
+    // Load captcha image in background
+    LaunchedEffect(captchaImg) {
+        if (captchaImg.isNotEmpty()) {
+            withContext(Dispatchers.IO) {
+                try {
+                    val connection = java.net.URL(captchaImg).openConnection()
+                    connection.connectTimeout = 10000
+                    connection.readTimeout = 10000
+                    val input = connection.getInputStream()
+                    bitmap = android.graphics.BitmapFactory.decodeStream(input)
+                    input.close()
+                    if (bitmap == null) loadError = true
+                } catch (_: Exception) {
+                    loadError = true
+                }
+            }
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 6.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text(
+                    text = "Введите капчу",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+
+                Text(
+                    text = "VK требует подтверждение",
+                    fontSize = 13.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                // Captcha image
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(100.dp),
+                    color = Color.White,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    when {
+                        bitmap != null -> {
+                            androidx.compose.foundation.Image(
+                                bitmap = bitmap!!.asImageBitmap(),
+                                contentDescription = "Captcha",
+                                modifier = Modifier.fillMaxSize().padding(4.dp),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                            )
+                        }
+                        loadError -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "Ошибка загрузки",
+                                    color = Color.Red,
+                                    fontSize = 13.sp
+                                )
+                            }
+                        }
+                        else -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(32.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Answer input
+                OutlinedTextField(
+                    value = captchaKey,
+                    onValueChange = { captchaKey = it },
+                    label = { Text("Текст с картинки") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text("Отмена")
+                    }
+                    Button(
+                        onClick = { onSubmit(captchaKey.trim()) },
+                        enabled = captchaKey.isNotBlank(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF4CAF50)
+                        )
+                    ) {
+                        Text("Отправить", color = Color.White)
                     }
                 }
             }

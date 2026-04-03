@@ -138,6 +138,9 @@ type Tunnel struct {
 
 	// fatal error — set when reconnect gives up permanently
 	fatalErr atomic.Value // string
+
+	// interactive captcha solver
+	captchaSolver *vk.CaptchaSolver
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -171,8 +174,9 @@ func ValidateNumConns(n int) string {
 func NewTunnel() *Tunnel {
 	lb := NewLogBuffer(500)
 	return &Tunnel{
-		logBuf: lb,
-		logger: slog.New(slog.NewTextHandler(io.MultiWriter(lb, os.Stderr), &slog.HandlerOptions{Level: slog.LevelInfo})),
+		logBuf:        lb,
+		logger:        slog.New(slog.NewTextHandler(io.MultiWriter(lb, os.Stderr), &slog.HandlerOptions{Level: slog.LevelInfo})),
+		captchaSolver: vk.NewCaptchaSolver(),
 	}
 }
 
@@ -215,6 +219,19 @@ func (t *Tunnel) FatalError() string {
 func (t *Tunnel) setFatalError(msg string) {
 	t.fatalErr.Store(msg)
 	t.logger.Error("fatal: " + msg)
+}
+
+// CaptchaChallenge returns a JSON string with captcha_sid and captcha_img
+// if a captcha is pending, or empty string if none.
+// Android should poll this alongside Stage() and FatalError().
+func (t *Tunnel) CaptchaChallenge() string {
+	return t.captchaSolver.Challenge()
+}
+
+// SubmitCaptcha provides the user's captcha answer.
+// Call this after CaptchaChallenge() returned a non-empty challenge.
+func (t *Tunnel) SubmitCaptcha(key string) {
+	t.captchaSolver.Submit(key)
 }
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
@@ -261,7 +278,9 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	if telemost.IsTelemostLink(cleanLinks[0]) {
 		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
-		t.svc = vk.NewService(cleanLinks[0])
+		svc := vk.NewService(cleanLinks[0])
+		svc.SetCaptchaSolver(t.captchaSolver)
+		t.svc = svc
 	}
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
@@ -465,7 +484,9 @@ func (t *Tunnel) connectMultiRelay(ctx context.Context, cfg *TunnelConfig, links
 		if telemost.IsTelemostLink(link) {
 			services[i] = telemost.NewService(link, cfg.Token)
 		} else {
-			services[i] = vk.NewService(link)
+			svc := vk.NewService(link)
+			svc.SetCaptchaSolver(t.captchaSolver)
+			services[i] = svc
 		}
 	}
 
@@ -953,7 +974,7 @@ func (t *Tunnel) teardownMux() {
 // and re-establishes the tunnel with exponential backoff (1s → 60s).
 func (t *Tunnel) reconnectLoop() {
 	const maxBackoff = 60 * time.Second
-	const attemptTimeout = 20 * time.Second
+	const attemptTimeout = 120 * time.Second // 2 min to allow interactive captcha solving
 	const maxConsecutiveFailures = 10 // give up after ~5 min of failures
 	backoff := time.Second
 
