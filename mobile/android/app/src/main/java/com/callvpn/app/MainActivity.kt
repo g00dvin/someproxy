@@ -1525,9 +1525,7 @@ fun CaptchaDialog(
                                 modifier = Modifier.fillMaxSize(),
                                 contentAlignment = Alignment.Center
                             ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(32.dp)
-                                )
+                                Text("Загрузка...", color = Color.Gray)
                             }
                         }
                     }
