@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cbeuw/connutil"
@@ -56,11 +57,20 @@ const DefaultWritePace = 5 * time.Millisecond
 
 // bridgeWritePace is the active pacing used by bridge goroutines.
 // Set via SetWritePace before establishing connections.
-var bridgeWritePace = DefaultWritePace
+// Uses atomic.Int64 for safe concurrent access from bridge goroutines.
+var bridgeWritePaceNs atomic.Int64
+
+func init() {
+	bridgeWritePaceNs.Store(int64(DefaultWritePace))
+}
+
+func loadWritePace() time.Duration {
+	return time.Duration(bridgeWritePaceNs.Load())
+}
 
 // SetWritePace overrides the per-connection relay write pacing.
 func SetWritePace(d time.Duration) {
-	bridgeWritePace = d
+	bridgeWritePaceNs.Store(int64(d))
 }
 
 // ScalePaceIfStriping increases per-connection pacing when striping is enabled
@@ -156,7 +166,7 @@ func AcceptOverTURN(ctx context.Context, relayConn net.PacketConn, clientRelayAd
 				slog.Debug("bridge pipe→relay write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			time.Sleep(bridgeWritePace)
+			time.Sleep(loadWritePace())
 			pktCount++
 			byteCount += int64(n)
 			if pktCount%1000 == 0 {

@@ -23,6 +23,7 @@ import java.io.FileOutputStream
 
 class CallVpnService : VpnService() {
 
+    @Volatile
     private var tunnel: Tunnel? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
@@ -389,7 +390,9 @@ class CallVpnService : VpnService() {
         tunReaderThread = null
         tunWriterThread = null
 
-        tunnel?.stop()
+        val t = tunnel
+        tunnel = null
+        t?.stop()
         ensureMobileDataEnabled()
         broadcastState("disconnected")
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -399,7 +402,7 @@ class CallVpnService : VpnService() {
     private fun acquireWakeLock() {
         val pm = getSystemService(PowerManager::class.java) ?: return
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "CallVPN::Tunnel").apply {
-            acquire()
+            acquire(24 * 60 * 60 * 1000L) // 24h safety timeout to prevent indefinite hold
         }
     }
 
@@ -414,10 +417,17 @@ class CallVpnService : VpnService() {
     private fun detectTunName(): String? {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "ls /sys/class/net/"))
-            val output = process.inputStream.bufferedReader().readText()
-            process.waitFor()
-            val tunRegex = Regex("^tun\\d+$")
-            output.lines().firstOrNull { tunRegex.matches(it.trim()) }?.trim()
+            try {
+                val output = process.inputStream.bufferedReader().readText()
+                process.waitFor()
+                val tunRegex = Regex("^tun\\d+$")
+                output.lines().firstOrNull { tunRegex.matches(it.trim()) }?.trim()
+            } finally {
+                process.inputStream.close()
+                process.errorStream.close()
+                process.outputStream.close()
+                process.destroy()
+            }
         } catch (_: Exception) {
             null
         }
@@ -442,8 +452,16 @@ class CallVpnService : VpnService() {
             val enabled = Global.getInt(contentResolver, "mobile_data", 1)
             if (enabled == 0) {
                 // Use root to re-enable — the app doesn't have WRITE_SECURE_SETTINGS.
-                Runtime.getRuntime().exec(arrayOf("su", "-c",
+                val process = Runtime.getRuntime().exec(arrayOf("su", "-c",
                     "settings put global mobile_data 1 && svc data enable"))
+                try {
+                    process.waitFor()
+                } finally {
+                    process.inputStream.close()
+                    process.errorStream.close()
+                    process.outputStream.close()
+                    process.destroy()
+                }
             }
         } catch (_: Exception) { /* best-effort */ }
     }

@@ -77,7 +77,9 @@ func (s *Server) dial(ctx context.Context, addr string) (io.ReadWriteCloser, err
 		s.Logger.Debug("bypass tunnel", "addr", addr)
 		return net.DialTimeout("tcp", addr, 10*time.Second)
 	}
-	return s.Dial(ctx, "tcp", addr)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer dialCancel()
+	return s.Dial(dialCtx, "tcp", addr)
 }
 
 // handleConnect implements the HTTP CONNECT method for HTTPS tunneling.

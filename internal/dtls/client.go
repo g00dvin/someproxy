@@ -100,7 +100,7 @@ func DialOverTURN(ctx context.Context, relayConn net.PacketConn, serverAddr *net
 				slog.Debug("bridge pipe→relay write error", "pkts", pktCount, "bytes", byteCount, "err", err)
 				return
 			}
-			time.Sleep(bridgeWritePace)
+			time.Sleep(loadWritePace())
 			pktCount++
 			byteCount += int64(n)
 			if pktCount%1000 == 0 {

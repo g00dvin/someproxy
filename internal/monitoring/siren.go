@@ -79,10 +79,14 @@ func (s *Siren) History() []Alert {
 }
 
 func (s *Siren) sendSlack(ctx context.Context, alert Alert) {
+	// Use a short timeout to prevent goroutine accumulation when Slack is unreachable.
+	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	text := fmt.Sprintf("[%s] *%s* — %s", alert.Level, alert.Component, alert.Message)
 	payload, _ := json.Marshal(map[string]string{"text": text})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.slackWebhook, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(sendCtx, http.MethodPost, s.slackWebhook, bytes.NewReader(payload))
 	if err != nil {
 		s.logger.Warn("slack request creation failed", "err", err)
 		return

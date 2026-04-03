@@ -388,12 +388,22 @@ func relayUDP(gvConn net.Conn, outConn net.Conn) {
 
 	const udpTimeout = 2 * time.Minute
 
+	// When one direction fails, close both conns to unblock the other.
+	var once sync.Once
+	closeAll := func() {
+		once.Do(func() {
+			gvConn.Close()
+			outConn.Close()
+		})
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	// gVisor → real network.
 	go func() {
 		defer wg.Done()
+		defer closeAll()
 		buf := make([]byte, 65535)
 		for {
 			gvConn.SetReadDeadline(time.Now().Add(udpTimeout))
@@ -402,13 +412,16 @@ func relayUDP(gvConn net.Conn, outConn net.Conn) {
 				return
 			}
 			outConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			outConn.Write(buf[:n])
+			if _, err := outConn.Write(buf[:n]); err != nil {
+				return
+			}
 		}
 	}()
 
 	// Real network → gVisor.
 	go func() {
 		defer wg.Done()
+		defer closeAll()
 		buf := make([]byte, 65535)
 		for {
 			outConn.SetReadDeadline(time.Now().Add(udpTimeout))
@@ -417,7 +430,9 @@ func relayUDP(gvConn net.Conn, outConn net.Conn) {
 				return
 			}
 			gvConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			gvConn.Write(buf[:n])
+			if _, err := gvConn.Write(buf[:n]); err != nil {
+				return
+			}
 		}
 	}()
 

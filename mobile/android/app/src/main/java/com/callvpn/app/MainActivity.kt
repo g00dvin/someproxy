@@ -493,6 +493,60 @@ fun CallVpnScreen(
                     )
                 }
             }
+
+            // Import profile from clipboard
+            Surface(
+                modifier = Modifier
+                    .height(40.dp)
+                    .clickable {
+                        val clipText = clipboardManager.getText()?.text
+                        if (clipText.isNullOrBlank()) {
+                            Toast
+                                .makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT)
+                                .show()
+                            return@clickable
+                        }
+                        try {
+                            val imported = Profile.fromExportJson(clipText)
+                            profileManager.saveProfile(imported)
+                            profiles = profileManager.getProfiles()
+                            if (activeProfileId == null) {
+                                activeProfileId = imported.id
+                                profileManager.setActiveProfileId(imported.id)
+                            }
+                            Toast
+                                .makeText(
+                                    context,
+                                    "Профиль \"${imported.name.ifBlank { "Без имени" }}\" импортирован",
+                                    Toast.LENGTH_SHORT
+                                )
+                                .show()
+                        } catch (_: Exception) {
+                            Toast
+                                .makeText(context, "Ошибка: неверный формат JSON", Toast.LENGTH_SHORT)
+                                .show()
+                        }
+                    },
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        "\uD83D\uDCCB",
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        "Импорт",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -1068,16 +1122,35 @@ fun ProfileEditorDialog(
                     }
                 }
 
-                // Delete button (only for existing profiles)
-                if (!isNew && onDelete != null) {
+                // Export / Delete buttons
+                val exportClipboard = LocalClipboardManager.current
+                val exportContext = androidx.compose.ui.platform.LocalContext.current
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
                     TextButton(
-                        onClick = { showDeleteConfirm = true },
-                        modifier = Modifier.fillMaxWidth()
+                        onClick = {
+                            val conns = numConns.toIntOrNull()?.coerceIn(1, 16) ?: 4
+                            val current = base.copy(
+                                name = name.trim(),
+                                connectionMode = connectionMode,
+                                callLinks = callLinks.map { it.trim() },
+                                serverAddr = serverAddr.trim(),
+                                token = token,
+                                numConns = conns,
+                                vkTokens = vkTokens.map { it.trim() }.filter { it.isNotEmpty() }
+                            )
+                            exportClipboard.setText(AnnotatedString(current.toExportJson()))
+                            Toast.makeText(exportContext, "Профиль скопирован в буфер обмена", Toast.LENGTH_SHORT).show()
+                        }
                     ) {
-                        Text(
-                            "Удалить профиль",
-                            color = Color(0xFFF44336)
-                        )
+                        Text("Экспорт в буфер")
+                    }
+                    if (!isNew && onDelete != null) {
+                        TextButton(onClick = { showDeleteConfirm = true }) {
+                            Text("Удалить профиль", color = Color(0xFFF44336))
+                        }
                     }
                 }
 

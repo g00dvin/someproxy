@@ -40,7 +40,24 @@ data class Profile(
         if (vkTokens.isNotEmpty()) put("vkTokens", JSONArray(vkTokens))
     }
 
+    /** Export-friendly JSON without internal id (a new id is assigned on import). */
+    fun toExportJson(): String = JSONObject().apply {
+        put("name", name)
+        put("connectionMode", connectionMode)
+        put("callLinks", JSONArray(callLinks.filter { it.isNotBlank() }))
+        if (serverAddr.isNotBlank()) put("serverAddr", serverAddr)
+        if (token.isNotBlank()) put("token", token)
+        put("numConns", numConns)
+        if (vkTokens.isNotEmpty()) put("vkTokens", JSONArray(vkTokens.filter { it.isNotBlank() }))
+    }.toString(2)
+
     companion object {
+        /** Import a profile from exported JSON text. Always assigns a new id. */
+        fun fromExportJson(text: String): Profile {
+            val obj = JSONObject(text)
+            return fromJson(obj).copy(id = UUID.randomUUID().toString())
+        }
+
         fun fromJson(obj: JSONObject): Profile {
             // Migration: old "callLink" string → new "callLinks" list
             val callLinks = when {

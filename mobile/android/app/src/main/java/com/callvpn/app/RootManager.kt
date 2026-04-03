@@ -58,10 +58,17 @@ class RootManager(context: Context) {
         // Step 2: Execute su -c id to verify actual access
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val output = reader.readLine() ?: ""
-            val exitCode = process.waitFor()
-            exitCode == 0 && output.contains("uid=0")
+            try {
+                val reader = BufferedReader(InputStreamReader(process.inputStream))
+                val output = reader.readLine() ?: ""
+                val exitCode = process.waitFor()
+                exitCode == 0 && output.contains("uid=0")
+            } finally {
+                process.inputStream.close()
+                process.errorStream.close()
+                process.outputStream.close()
+                process.destroy()
+            }
         } catch (_: Exception) {
             false
         }
@@ -202,20 +209,29 @@ class RootManager(context: Context) {
      * across Magisk, KernelSU, SuperSU implementations.
      */
     private fun executeRootCommands(commands: List<String>): Boolean {
+        var scriptFile: File? = null
         return try {
-            val scriptFile = File.createTempFile("cvpn_", ".sh")
+            scriptFile = File.createTempFile("cvpn_", ".sh")
             scriptFile.writeText(commands.joinToString("\n") + "\n")
             scriptFile.setReadable(true, false)
             val path = scriptFile.absolutePath
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "sh $path"))
-            val stderr = process.errorStream.bufferedReader().readText()
-            val exitCode = process.waitFor()
-            scriptFile.delete()
-            lastError = stderr.trim()
-            exitCode == 0
+            try {
+                val stderr = process.errorStream.bufferedReader().readText()
+                val exitCode = process.waitFor()
+                lastError = stderr.trim()
+                exitCode == 0
+            } finally {
+                process.inputStream.close()
+                process.errorStream.close()
+                process.outputStream.close()
+                process.destroy()
+            }
         } catch (e: Exception) {
             lastError = e.message ?: e.toString()
             false
+        } finally {
+            scriptFile?.delete()
         }
     }
 
@@ -226,9 +242,16 @@ class RootManager(context: Context) {
     private fun executeRootCommand(command: String): String {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
-            val stdout = process.inputStream.bufferedReader().readText()
-            process.waitFor()
-            stdout.trim()
+            try {
+                val stdout = process.inputStream.bufferedReader().readText()
+                process.waitFor()
+                stdout.trim()
+            } finally {
+                process.inputStream.close()
+                process.errorStream.close()
+                process.outputStream.close()
+                process.destroy()
+            }
         } catch (_: Exception) {
             ""
         }

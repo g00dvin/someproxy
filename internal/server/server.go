@@ -141,7 +141,9 @@ func (s *Server) runDirectMode(ctx context.Context) {
 		s.cfg.Logger.Error("failed to start DTLS listener", "err", err)
 		return
 	}
-	defer ln.Close()
+	var closeOnce sync.Once
+	closeLn := func() { closeOnce.Do(func() { ln.Close() }) }
+	defer closeLn()
 
 	fp := ln.CertFingerprint()
 	s.cfg.Logger.Info("server listening (DTLS/UDP, direct mode)", "addr", s.cfg.ListenAddr,
@@ -149,7 +151,7 @@ func (s *Server) runDirectMode(ctx context.Context) {
 
 	go func() {
 		<-ctx.Done()
-		ln.Close()
+		closeLn()
 	}()
 
 	for {
@@ -259,6 +261,9 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 
 	go func() {
 		defer func() {
+			// Cancel context first so background goroutines (DispatchLoop,
+			// PingLoop) stop before we close the mux and netstack.
+			sessCancel()
 			s.sessionsMu.Lock()
 			delete(s.sessions, id)
 			s.sessionsMu.Unlock()
@@ -266,7 +271,6 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 				ns.Close()
 			}
 			m.Close()
-			sessCancel()
 			sessLogger.Info("session closed")
 		}()
 

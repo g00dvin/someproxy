@@ -95,7 +95,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 		}
 		remote = c
 	} else {
-		c, err := s.Dial(ctx, "tcp", target)
+		dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
+		c, err := s.Dial(dialCtx, "tcp", target)
+		dialCancel()
 		if err != nil {
 			s.Logger.Warn("tunnel dial failed", "target", target, "err", err)
 			s.sendReply(conn, 0x05)

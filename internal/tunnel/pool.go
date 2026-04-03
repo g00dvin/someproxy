@@ -44,7 +44,7 @@ func NewCallPool(cfg PoolConfig) *CallPool {
 		router:      NewSignalingRouter(),
 		logger:      cfg.Logger.With("component", "pool"),
 		sid:         uuid.New(),
-		reconnectCh: make(chan int, len(cfg.Services)),
+		reconnectCh: make(chan int, max(len(cfg.Services)*2, 8)),
 		done:        make(chan struct{}),
 	}
 }
@@ -260,6 +260,7 @@ func (p *CallPool) monitorSlots(ctx context.Context) {
 			slots := make([]*CallSlot, len(p.slots))
 			copy(slots, p.slots)
 			m := p.m
+			allConnsDown := m != nil && m.ActiveConns() == 0
 			p.mu.Unlock()
 
 			for _, slot := range slots {
@@ -276,7 +277,7 @@ func (p *CallPool) monitorSlots(ctx context.Context) {
 				}
 
 				// Check 2: all DTLS connections dead
-				if m != nil && m.ActiveConns() == 0 {
+				if allConnsDown {
 					p.logger.Warn("slot all DTLS conns dead, queuing reconnect", "slot", slot.index)
 					p.queueReconnect(slot.index)
 				}
@@ -362,15 +363,15 @@ func (p *CallPool) reconnectSlot(ctx context.Context, slotIdx int, delays *sync.
 
 	p.router.Register(newSlot.SignalingClient(), newSlot.Nonce())
 
-	p.mu.Lock()
-	m := p.m
-	p.mu.Unlock()
-
 	allocCtx, allocCancel := context.WithTimeout(ctx, reconnectSlotTimeout)
 	defer allocCancel()
 
 	sessionID := p.sid
 	if newSlot.role == RoleClient {
+		// Read mux under lock at point of use to avoid stale reference.
+		p.mu.Lock()
+		m := p.m
+		p.mu.Unlock()
 		_, err := newSlot.AllocateAndConnect(allocCtx, m, p.router, p.cfg.ConnsPerCall, sessionID)
 		if err != nil {
 			p.logger.Error("reconnect: allocate failed", "slot", slotIdx, "err", err)
@@ -379,6 +380,9 @@ func (p *CallPool) reconnectSlot(ctx context.Context, slotIdx int, delays *sync.
 			return
 		}
 	} else {
+		p.mu.Lock()
+		m := p.m
+		p.mu.Unlock()
 		_, err := newSlot.AllocateAndConnectServer(allocCtx, m, p.router, p.cfg.ConnsPerCall, nil)
 		if err != nil {
 			p.logger.Error("reconnect: allocate failed", "slot", slotIdx, "err", err)

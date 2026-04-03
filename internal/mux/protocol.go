@@ -137,6 +137,8 @@ type reorderEntry struct {
 type reorderHeap []reorderEntry
 
 func (h reorderHeap) Len() int           { return len(h) }
+// Less uses signed subtraction for correct circular uint32 sequence comparison
+// (RFC 1982 serial number arithmetic). Works when sequences are within 2^31 of each other.
 func (h reorderHeap) Less(i, j int) bool { return int32(h[i].stripSeq-h[j].stripSeq) < 0 }
 func (h reorderHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 func (h *reorderHeap) Push(x any)        { *h = append(*h, x.(reorderEntry)) }

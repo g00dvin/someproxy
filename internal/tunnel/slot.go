@@ -547,8 +547,8 @@ func (s *CallSlot) dtlsHandshakeParallel(ctx context.Context, m *mux.Mux, allocs
 		if res.cleanup != nil {
 			s.cleanups = append(s.cleanups, res.cleanup)
 		}
-		s.mu.Unlock()
 		s.activeC.Add(1)
+		s.mu.Unlock()
 	}
 
 	if m == nil && firstErr != nil {
