@@ -30,14 +30,19 @@ class DebugReceiver : BroadcastReceiver() {
                     .joinToString(",")
                 if (callLink.isBlank()) return
 
-                val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
+                val serverAddr = if (profile.connectionMode == "direct") profile.serverAddrsJoined().ifBlank { profile.effectiveServerAddr() } else ""
+                val token = if (profile.connectionMode == "direct") {
+                    val svrs = profile.servers.filter { it.addr.isNotBlank() }
+                    if (svrs.isNotEmpty()) svrs.joinToString(",") { it.token } else profile.effectiveToken()
+                } else ""
                 val svcIntent = Intent(context, CallVpnService::class.java).apply {
                     action = CallVpnService.ACTION_START
                     putExtra(CallVpnService.EXTRA_CALL_LINK, callLink)
                     putExtra(CallVpnService.EXTRA_SERVER_ADDR, serverAddr)
                     putExtra(CallVpnService.EXTRA_NUM_CONNS, profile.numConns)
-                    putExtra(CallVpnService.EXTRA_TOKEN, profile.token)
+                    putExtra(CallVpnService.EXTRA_TOKEN, token)
                     putExtra(CallVpnService.EXTRA_VK_TOKENS, profile.vkTokensJoined())
+                    putExtra(CallVpnService.EXTRA_SERVER_MODE, profile.serverMode)
                 }
                 ContextCompat.startForegroundService(context, svcIntent)
             }

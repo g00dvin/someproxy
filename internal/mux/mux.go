@@ -104,6 +104,7 @@ type connStats struct {
 	errors    atomic.Int64
 	lastUsed  atomic.Int64 // unix nano
 	prevSent  atomic.Int64 // bytesSent snapshot at last throughput measurement
+	createdAt atomic.Int64 // unix nano, set once at AddConn time
 }
 
 // Mux multiplexes framed streams over multiple underlying connections,
@@ -395,15 +396,7 @@ func (m *Mux) trySendInFrame(f *Frame) (sent bool) {
 // Batches multiple frames into a single TCP write to reduce syscall
 // overhead and avoid Nagle-like delays on small writes.
 func (m *Mux) writeLoop(mc *muxConn) {
-	defer func() {
-		// Drain remaining writeReqs so that inflight.Wait() never hangs.
-		for req := range mc.writeCh {
-			if req.wg != nil {
-				req.wg.Done()
-			}
-		}
-		close(mc.writeDone)
-	}()
+	defer close(mc.writeDone)
 	var batch []writeReq
 	for {
 		// Block on first frame
@@ -491,11 +484,6 @@ func (m *Mux) selectConn() *muxConn {
 
 	if len(m.conns) == 0 {
 		return nil
-	}
-
-	// Fast path: single connection — skip SWRR computation.
-	if len(m.conns) == 1 {
-		return m.conns[0] // may be nil
 	}
 
 	// Phase 1: find minimum latency among live conns for threshold filter.
@@ -748,7 +736,9 @@ func (m *Mux) AddConn(conn io.ReadWriteCloser) {
 		writeCh:   make(chan writeReq, 256),
 		writeDone: make(chan struct{}),
 	}
-	mc.stats.lastUsed.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	mc.stats.lastUsed.Store(now)
+	mc.stats.createdAt.Store(now)
 
 	m.mu.Lock()
 	idx := -1
@@ -877,6 +867,42 @@ func (m *Mux) ConnStats() []ConnStat {
 		}
 	}
 	return stats
+}
+
+// CloseOldestConn closes the oldest connection if its age exceeds maxAge
+// and at least minAlive connections would remain alive. Returns true if
+// a connection was closed (it will trigger ConnDied asynchronously).
+func (m *Mux) CloseOldestConn(maxAge time.Duration, minAlive int) bool {
+	now := time.Now().UnixNano()
+
+	m.mu.Lock()
+	var oldest *muxConn
+	oldestAge := int64(0)
+	alive := 0
+	for _, mc := range m.conns {
+		if mc == nil {
+			continue
+		}
+		alive++
+		age := now - mc.stats.createdAt.Load()
+		if age > oldestAge {
+			oldestAge = age
+			oldest = mc
+		}
+	}
+	m.mu.Unlock()
+
+	if oldest == nil || alive <= minAlive || oldestAge < int64(maxAge) {
+		return false
+	}
+
+	m.logger.Info("closing oldest connection for rotation",
+		"index", oldest.index,
+		"age", time.Duration(oldestAge).Round(time.Second),
+		"alive", alive,
+	)
+	oldest.conn.Close()
+	return true
 }
 
 // RemoveConn sets the connection at the given index to nil.
@@ -1114,18 +1140,16 @@ func (m *Mux) closeStream(s *Stream) {
 	if s.closed.Swap(true) {
 		return // already closed — prevent double-close panic on s.recv
 	}
-	// Delete from streams map first so no new dispatches target this stream.
+	close(s.done)
 	m.streams.Delete(s.ID)
 	m.streamCount.Add(-1)
-	// Signal done so any in-flight dispatch sees <-s.done and stops sending.
-	close(s.done)
-	// Drain any remaining reorder buffer before closing recv.
+	// Drain any remaining reorder buffer before closing recv
 	if s.reorder != nil {
 		for _, d := range s.reorder.FlushAll() {
 			select {
 			case s.recv <- d:
-			default:
-				// recv channel full, accept data loss
+			case <-time.After(100 * time.Millisecond):
+				// recv channel full or blocked, accept data loss
 			}
 		}
 	}
@@ -1150,25 +1174,8 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 	// pendingFrames buffers frames that arrive before their stream's FrameOpen.
 	// With striping, FrameOpen and FrameData may travel on different connections
 	// and arrive out of order in DispatchLoop.
-	const (
-		maxPendingStreams    = 256   // max distinct stream IDs buffered
-		maxPendingPerStream = 64    // max frames buffered per stream
-		pendingGCInterval   = 30 * time.Second
-	)
 	pendingFrames := make(map[uint32][]*Frame)
-	pendingTime := make(map[uint32]time.Time) // when first frame buffered per stream
-	lastPendingGC := time.Now()
 	for {
-		// Periodic cleanup of stale pending entries.
-		if now := time.Now(); now.Sub(lastPendingGC) > pendingGCInterval {
-			for sid, t := range pendingTime {
-				if now.Sub(t) > pendingGCInterval {
-					delete(pendingFrames, sid)
-					delete(pendingTime, sid)
-				}
-			}
-			lastPendingGC = now
-		}
 		select {
 		case f, ok := <-m.inFrames:
 			if !ok {
@@ -1239,9 +1246,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 					select {
 					case m.acceptedStreams <- s:
 					default:
-						m.logger.Warn("accepted streams buffer full, closing orphan stream", "stream", f.StreamID)
-						m.closeStream(s)
-						continue
+						m.logger.Warn("accepted streams buffer full")
 					}
 				}
 				// Replay any frames that arrived before this FrameOpen.
@@ -1250,7 +1255,6 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 						m.dispatch(pf)
 					}
 					delete(pendingFrames, f.StreamID)
-					delete(pendingTime, f.StreamID)
 				}
 				continue
 			}
@@ -1258,14 +1262,7 @@ func (m *Mux) DispatchLoop(ctx context.Context) {
 			// FrameOpen and FrameData travel on different connections).
 			if f.StreamID != 0 && f.Type == FrameData {
 				if _, exists := m.streams.Load(f.StreamID); !exists {
-					pf := pendingFrames[f.StreamID]
-					if len(pf) < maxPendingPerStream && len(pendingFrames) < maxPendingStreams {
-						if len(pf) == 0 {
-							pendingTime[f.StreamID] = time.Now()
-						}
-						pendingFrames[f.StreamID] = append(pf, f)
-					}
-					// else: drop frame — cap exceeded (potential DoS or orphan)
+					pendingFrames[f.StreamID] = append(pendingFrames[f.StreamID], f)
 					continue
 				}
 			}

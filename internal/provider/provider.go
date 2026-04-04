@@ -65,12 +65,9 @@ const (
 
 // RateLimitError is returned by providers when the upstream API throttles requests.
 // Code contains the provider-specific error code (e.g. VK codes 6, 9, 14, 29, 1105).
-// When Code == 14 (captcha), CaptchaSID and CaptchaImg are populated.
 type RateLimitError struct {
-	Code       int
-	Message    string
-	CaptchaSID string // non-empty when Code == 14
-	CaptchaImg string // captcha image URL when Code == 14
+	Code    int
+	Message string
 }
 
 func (e *RateLimitError) Error() string {

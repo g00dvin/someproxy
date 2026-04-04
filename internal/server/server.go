@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -141,9 +142,7 @@ func (s *Server) runDirectMode(ctx context.Context) {
 		s.cfg.Logger.Error("failed to start DTLS listener", "err", err)
 		return
 	}
-	var closeOnce sync.Once
-	closeLn := func() { closeOnce.Do(func() { ln.Close() }) }
-	defer closeLn()
+	defer ln.Close()
 
 	fp := ln.CertFingerprint()
 	s.cfg.Logger.Info("server listening (DTLS/UDP, direct mode)", "addr", s.cfg.ListenAddr,
@@ -151,7 +150,7 @@ func (s *Server) runDirectMode(ctx context.Context) {
 
 	go func() {
 		<-ctx.Done()
-		closeLn()
+		ln.Close()
 	}()
 
 	for {
@@ -163,8 +162,6 @@ func (s *Server) runDirectMode(ctx context.Context) {
 			s.cfg.Logger.Warn("accept error", "err", err)
 			continue
 		}
-		// Handshake runs in the goroutine so a slow/failing handshake
-		// does not block acceptance of other connections.
 		go func() {
 			conn, err := ln.Handshake(ctx, rawConn)
 			if err != nil {
@@ -261,9 +258,6 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 
 	go func() {
 		defer func() {
-			// Cancel context first so background goroutines (DispatchLoop,
-			// PingLoop) stop before we close the mux and netstack.
-			sessCancel()
 			s.sessionsMu.Lock()
 			delete(s.sessions, id)
 			s.sessionsMu.Unlock()
@@ -271,6 +265,7 @@ func (s *Server) getOrCreateSession(ctx context.Context, id [16]byte) *session {
 				ns.Close()
 			}
 			m.Close()
+			sessCancel()
 			sessLogger.Info("session closed")
 		}()
 
@@ -688,8 +683,8 @@ func (s *Server) runPersistentRelaySession(ctx context.Context) error {
 			return nil
 		}
 		if credCtx.Err() != nil && ctx.Err() == nil {
-			s.cfg.Logger.Warn("TURN credentials approaching expiry, rejoining VK proactively")
-			return fmt.Errorf("proactive credential refresh")
+			s.cfg.Logger.Warn("session refresh triggered, rejoining VK proactively")
+			return fmt.Errorf("proactive session refresh")
 		}
 		if !sigClient.IsAlive() {
 			s.cfg.Logger.Warn("signaling died, will rejoin VK")
@@ -1042,6 +1037,32 @@ func (s *Server) acceptOneClient(ctx context.Context, sigClient provider.Signali
 	}()
 
 	go s.handleReconnections(sessCtx, sigClient, mgr, m)
+
+	// Rolling connection rotation: close the oldest connection every
+	// rotationInterval if it exceeds a random maxConnAge (up to 2h).
+	// The client's ReconnectManager replaces it with a fresh TURN allocation.
+	go func() {
+		rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+		maxConnAge := time.Duration(60+rng.Intn(60)) * time.Minute // 1h-2h random
+		const rotationInterval = 5 * time.Minute
+		minAlive := max(s.cfg.NumConns/2, 2)
+
+		s.cfg.Logger.Info("connection rotation configured",
+			"maxConnAge", maxConnAge.Round(time.Second),
+			"rotationInterval", rotationInterval,
+			"minAlive", minAlive)
+
+		ticker := time.NewTicker(rotationInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				m.CloseOldestConn(maxConnAge, minAlive)
+			case <-sessCtx.Done():
+				return
+			}
+		}
+	}()
 
 	go func() {
 		reason, disconnectNonce := sigClient.WaitForSessionEnd(sessCtx)

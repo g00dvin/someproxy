@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/call-vpn/call-vpn/internal/provider"
@@ -41,81 +40,18 @@ func classifyToken(token string) string {
 	return "unknown"
 }
 
-// CaptchaSolver allows interactive captcha resolution via the mobile UI.
-// When a VK API call returns error code 14, the solver blocks the calling
-// goroutine until the user provides an answer or the context is cancelled.
-type CaptchaSolver struct {
-	mu       sync.Mutex
-	sid      string
-	imgURL   string
-	answerCh chan string
-	pending  atomic.Bool
-}
+// Option configures a Service.
+type Option func(*Service)
 
-// NewCaptchaSolver creates a new captcha solver.
-func NewCaptchaSolver() *CaptchaSolver {
-	return &CaptchaSolver{
-		answerCh: make(chan string, 1),
-	}
-}
-
-// Challenge returns a JSON string with captcha_sid and captcha_img
-// if a captcha is pending, or empty string if none.
-func (s *CaptchaSolver) Challenge() string {
-	if !s.pending.Load() {
-		return ""
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	b, _ := json.Marshal(map[string]string{
-		"captcha_sid": s.sid,
-		"captcha_img": s.imgURL,
-	})
-	return string(b)
-}
-
-// Submit provides the captcha answer from the user.
-func (s *CaptchaSolver) Submit(key string) {
-	s.pending.Store(false)
-	// Drain stale answer before sending new one
-	select {
-	case <-s.answerCh:
-	default:
-	}
-	select {
-	case s.answerCh <- key:
-	default:
-	}
-}
-
-// WaitForAnswer stores the challenge and blocks until the user answers
-// or the context is cancelled.
-func (s *CaptchaSolver) WaitForAnswer(ctx context.Context, sid, imgURL string) (string, error) {
-	s.mu.Lock()
-	s.sid = sid
-	s.imgURL = imgURL
-	s.mu.Unlock()
-
-	// Drain any stale answer
-	select {
-	case <-s.answerCh:
-	default:
-	}
-	s.pending.Store(true)
-
-	select {
-	case key := <-s.answerCh:
-		return key, nil
-	case <-ctx.Done():
-		s.pending.Store(false)
-		return "", ctx.Err()
-	}
+// WithCaptchaSolver sets the captcha solver for the service.
+func WithCaptchaSolver(s provider.CaptchaSolver) Option {
+	return func(svc *Service) { svc.captcha = s }
 }
 
 // Service implements provider.Service for VK Calls.
 type Service struct {
 	callLink string
-	captcha  *CaptchaSolver
+	captcha  provider.CaptchaSolver
 }
 
 // Compile-time checks.
@@ -123,15 +59,12 @@ var _ provider.Service = (*Service)(nil)
 var _ provider.TokenAuthProvider = (*Service)(nil)
 
 // NewService creates a VK call service provider.
-func NewService(callLink string) *Service {
-	return &Service{callLink: callLink}
-}
-
-// SetCaptchaSolver sets the interactive captcha solver.
-// When set, VK API calls that return captcha errors will block
-// and wait for the user to solve the captcha instead of failing.
-func (s *Service) SetCaptchaSolver(solver *CaptchaSolver) {
-	s.captcha = solver
+func NewService(callLink string, opts ...Option) *Service {
+	s := &Service{callLink: callLink}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 func (s *Service) Name() string { return "vk" }
@@ -184,7 +117,7 @@ func (s *Service) FetchJoinInfo(ctx context.Context) (*provider.JoinInfo, error)
 	}
 
 	// Step 2: Get join token (call-specific)
-	joinToken, err := vkJoinToken(ctx, client, ua, s.callLink, messagesToken, s.captcha)
+	joinToken, err := s.vkJoinToken(ctx, client, ua, s.callLink, messagesToken)
 	if err != nil {
 		wg.Wait()
 		return nil, fmt.Errorf("step2 join token: %w", err)
@@ -299,17 +232,57 @@ func vkMessagesToken(ctx context.Context, client *http.Client, ua string) (strin
 	return resp.Data.AccessToken, nil
 }
 
-func vkJoinToken(ctx context.Context, client *http.Client, ua string, link, token3 string, solver *CaptchaSolver) (string, error) {
+func (s *Service) vkJoinToken(ctx context.Context, client *http.Client, ua string, link, token3 string) (string, error) {
 	data := url.Values{
 		"vk_join_link": {fmt.Sprintf("https://vk.com/call/join/%s", link)},
 		"name":         {provider.RandomDisplayName()},
 		"access_token": {token3},
 	}
 	endpoint := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s", vkAPIVersion)
-	body, err := vkAPIPostWithCaptcha(ctx, client, ua, endpoint, data, solver)
+
+	body, err := httpPost(ctx, client, ua, endpoint, data)
 	if err != nil {
 		return "", err
 	}
+
+	// Check for captcha (error 14) before generic rate limit check.
+	var errResp vkErrorResponse
+	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != nil && errResp.Error.Code == 14 {
+		if s.captcha == nil {
+			slog.Warn("VK API captcha required, no solver configured", "endpoint", endpoint)
+			return "", &provider.RateLimitError{Code: 14, Message: errResp.Error.Msg}
+		}
+
+		slog.Info("captcha required, solving...", "captcha_sid", errResp.Error.CaptchaSID)
+		start := time.Now()
+
+		result, solveErr := s.captcha.SolveCaptcha(ctx, &provider.CaptchaChallenge{
+			RedirectURI: errResp.Error.RedirectURI,
+			CaptchaSID:  errResp.Error.CaptchaSID,
+			CaptchaTS:   errResp.Error.CaptchaTS,
+			CaptchaImg:  errResp.Error.CaptchaImg,
+		})
+		if solveErr != nil {
+			slog.Warn("captcha solve failed", "err", solveErr, "duration", time.Since(start))
+			return "", fmt.Errorf("captcha solve: %w", solveErr)
+		}
+		slog.Info("captcha solved", "duration", time.Since(start))
+
+		// Retry with captcha solution.
+		data.Set("success_token", result.SuccessToken)
+		data.Set("captcha_sid", errResp.Error.CaptchaSID)
+		data.Set("captcha_ts", fmt.Sprintf("%.2f", errResp.Error.CaptchaTS))
+		data.Set("captcha_attempt", "1")
+
+		body, err = vkAPIPost(ctx, client, ua, endpoint, data)
+		if err != nil {
+			return "", fmt.Errorf("retry after captcha: %w", err)
+		}
+	} else if rle := checkVKRateLimit(body); rle != nil {
+		slog.Warn("VK API rate limit", "code", rle.Code, "msg", rle.Message, "endpoint", endpoint)
+		return "", rle
+	}
+
 	var resp struct {
 		Response struct {
 			Token string `json:"token"`
@@ -475,10 +448,12 @@ func okJoinConference(ctx context.Context, client *http.Client, ua string, link,
 // vkErrorResponse represents a VK API JSON error envelope.
 type vkErrorResponse struct {
 	Error *struct {
-		Code       int    `json:"error_code"`
-		Msg        string `json:"error_msg"`
-		CaptchaSID string `json:"captcha_sid"`
-		CaptchaImg string `json:"captcha_img"`
+		Code        int     `json:"error_code"`
+		Msg         string  `json:"error_msg"`
+		RedirectURI string  `json:"redirect_uri"`
+		CaptchaSID  string  `json:"captcha_sid"`
+		CaptchaTS   float64 `json:"captcha_ts"`
+		CaptchaImg  string  `json:"captcha_img"`
 	} `json:"error"`
 }
 
@@ -498,10 +473,8 @@ func checkVKRateLimit(body []byte) *provider.RateLimitError {
 	}
 	if vkRateLimitCodes[resp.Error.Code] {
 		return &provider.RateLimitError{
-			Code:       resp.Error.Code,
-			Message:    resp.Error.Msg,
-			CaptchaSID: resp.Error.CaptchaSID,
-			CaptchaImg: resp.Error.CaptchaImg,
+			Code:    resp.Error.Code,
+			Message: resp.Error.Msg,
 		}
 	}
 	return nil
@@ -529,40 +502,15 @@ func checkLoginRateLimit(body []byte) *provider.RateLimitError {
 // vkAPIPost performs an HTTP POST to a VK API endpoint and checks
 // the response for rate limit errors before returning.
 func vkAPIPost(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values) ([]byte, error) {
-	return vkAPIPostWithCaptcha(ctx, client, ua, endpoint, data, nil)
-}
-
-// vkAPIPostWithCaptcha is like vkAPIPost but supports interactive captcha solving.
-// When solver is non-nil and the API returns error code 14, it blocks waiting
-// for the user to solve the captcha, then retries with captcha_sid + captcha_key.
-func vkAPIPostWithCaptcha(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values, solver *CaptchaSolver) ([]byte, error) {
-	for {
-		body, err := httpPost(ctx, client, ua, endpoint, data)
-		if err != nil {
-			return nil, err
-		}
-		rle := checkVKRateLimit(body)
-		if rle == nil {
-			// Clean up captcha params from previous retry so they don't
-			// leak into subsequent unrelated calls with the same url.Values.
-			data.Del("captcha_sid")
-			data.Del("captcha_key")
-			return body, nil
-		}
-		if rle.Code != 14 || solver == nil || rle.CaptchaSID == "" {
-			slog.Warn("VK API rate limit", "code", rle.Code, "msg", rle.Message, "endpoint", endpoint)
-			return nil, rle
-		}
-		// Captcha required — wait for user to solve it
-		slog.Info("captcha required, waiting for user input", "sid", rle.CaptchaSID)
-		key, err := solver.WaitForAnswer(ctx, rle.CaptchaSID, rle.CaptchaImg)
-		if err != nil {
-			return nil, fmt.Errorf("captcha cancelled: %w", err)
-		}
-		// Retry with captcha params
-		data.Set("captcha_sid", rle.CaptchaSID)
-		data.Set("captcha_key", key)
+	body, err := httpPost(ctx, client, ua, endpoint, data)
+	if err != nil {
+		return nil, err
 	}
+	if rle := checkVKRateLimit(body); rle != nil {
+		slog.Warn("VK API rate limit", "code", rle.Code, "msg", rle.Message, "endpoint", endpoint)
+		return nil, rle
+	}
+	return body, nil
 }
 
 func httpPost(ctx context.Context, client *http.Client, ua string, endpoint string, data url.Values) ([]byte, error) {

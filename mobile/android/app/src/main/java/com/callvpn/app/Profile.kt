@@ -6,15 +6,34 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
+data class ServerEntry(
+    val addr: String = "",
+    val token: String = ""
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("addr", addr)
+        put("token", token)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject): ServerEntry = ServerEntry(
+            addr = obj.optString("addr", ""),
+            token = obj.optString("token", "")
+        )
+    }
+}
+
 data class Profile(
     val id: String = UUID.randomUUID().toString(),
     val name: String = "",
     val connectionMode: String = "relay", // "relay" or "direct"
     val callLinks: List<String> = listOf(""),
-    val serverAddr: String = "",
-    val token: String = "",
+    val serverAddr: String = "",  // legacy single server
+    val token: String = "",       // legacy single token
     val numConns: Int = 4,
-    val vkTokens: List<String> = emptyList()
+    val vkTokens: List<String> = emptyList(),
+    val servers: List<ServerEntry> = emptyList(), // multi-server
+    val serverMode: String = "active-backup" // "active-backup" or "load-balance"
 ) {
     // Compat: first non-empty link for provider detection
     val callLink: String get() = callLinks.firstOrNull { it.isNotBlank() } ?: ""
@@ -29,6 +48,21 @@ data class Profile(
     fun callLinksJoined(): String = callLinks.filter { it.isNotBlank() }.joinToString(",")
     fun vkTokensJoined(): String = vkTokens.filter { it.isNotBlank() }.joinToString(",")
 
+    /** Returns effective server address — first server from list or legacy field. */
+    fun effectiveServerAddr(): String {
+        val s = servers.filter { it.addr.isNotBlank() }
+        return if (s.isNotEmpty()) s.first().addr else serverAddr
+    }
+
+    /** Returns effective token for first server. */
+    fun effectiveToken(): String {
+        val s = servers.filter { it.addr.isNotBlank() }
+        return if (s.isNotEmpty()) s.first().token else token
+    }
+
+    /** Returns all server addresses joined for multi-server mode. */
+    fun serverAddrsJoined(): String = servers.filter { it.addr.isNotBlank() }.joinToString(",") { it.addr }
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
         put("name", name)
@@ -38,6 +72,12 @@ data class Profile(
         put("token", token)
         put("numConns", numConns)
         if (vkTokens.isNotEmpty()) put("vkTokens", JSONArray(vkTokens))
+        if (servers.isNotEmpty()) {
+            val arr = JSONArray()
+            servers.forEach { arr.put(it.toJson()) }
+            put("servers", arr)
+        }
+        put("serverMode", serverMode)
     }
 
     /** Export-friendly JSON without internal id (a new id is assigned on import). */
@@ -49,6 +89,12 @@ data class Profile(
         if (token.isNotBlank()) put("token", token)
         put("numConns", numConns)
         if (vkTokens.isNotEmpty()) put("vkTokens", JSONArray(vkTokens.filter { it.isNotBlank() }))
+        if (servers.isNotEmpty()) {
+            val arr = JSONArray()
+            servers.filter { it.addr.isNotBlank() }.forEach { arr.put(it.toJson()) }
+            put("servers", arr)
+        }
+        put("serverMode", serverMode)
     }.toString(2)
 
     companion object {
@@ -59,7 +105,7 @@ data class Profile(
         }
 
         fun fromJson(obj: JSONObject): Profile {
-            // Migration: old "callLink" string → new "callLinks" list
+            // Migration: old "callLink" string -> new "callLinks" list
             val callLinks = when {
                 obj.has("callLinks") -> {
                     val arr = obj.getJSONArray("callLinks")
@@ -86,6 +132,16 @@ data class Profile(
                 else -> emptyList()
             }
 
+            val servers = if (obj.has("servers")) {
+                val arr = obj.getJSONArray("servers")
+                (0 until arr.length()).map { ServerEntry.fromJson(arr.getJSONObject(it)) }
+            } else {
+                // Migrate from legacy single server
+                val addr = obj.optString("serverAddr", "")
+                val tok = obj.optString("token", "")
+                if (addr.isNotBlank()) listOf(ServerEntry(addr, tok)) else emptyList()
+            }
+
             return Profile(
                 id = obj.optString("id", UUID.randomUUID().toString()),
                 name = obj.optString("name", ""),
@@ -94,7 +150,9 @@ data class Profile(
                 serverAddr = obj.optString("serverAddr", ""),
                 token = obj.optString("token", ""),
                 numConns = obj.optInt("numConns", 4),
-                vkTokens = vkTokens
+                vkTokens = vkTokens,
+                servers = servers,
+                serverMode = obj.optString("serverMode", "active-backup")
             )
         }
     }
@@ -177,13 +235,16 @@ class ProfileManager(context: Context) {
         val numConns = prefs.getInt("num_conns", 4)
         val mode = prefs.getString("connection_mode", "Relay") ?: "Relay"
 
+        val servers = if (serverAddr.isNotBlank()) listOf(ServerEntry(serverAddr, token)) else emptyList()
+
         val profile = Profile(
             name = "Default",
             connectionMode = if (mode == "Direct") "direct" else "relay",
             callLinks = if (callLink.isNotEmpty()) listOf(callLink) else listOf(""),
             serverAddr = serverAddr,
             token = token,
-            numConns = numConns
+            numConns = numConns,
+            servers = servers
         )
 
         saveProfiles(listOf(profile))

@@ -46,11 +46,6 @@ class CallVpnService : VpnService() {
         when (intent?.action) {
             ACTION_START -> startVpn(intent)
             ACTION_STOP -> stopVpn()
-            ACTION_CAPTCHA_SUBMIT -> {
-                val key = intent.getStringExtra(EXTRA_CAPTCHA_KEY) ?: ""
-                tunnel?.submitCaptcha(key)
-                return START_NOT_STICKY
-            }
             ACTION_SPEEDTEST_START -> {
                 Thread {
                     tunnel?.runSpeedTest(object : bind.SpeedTestCallback {
@@ -144,6 +139,7 @@ class CallVpnService : VpnService() {
         val numConns = intent.getIntExtra(EXTRA_NUM_CONNS, 4)
         val token = intent.getStringExtra(EXTRA_TOKEN) ?: ""
         val vkTokens = intent.getStringExtra(EXTRA_VK_TOKENS) ?: ""
+        val serverMode = intent.getStringExtra(EXTRA_SERVER_MODE) ?: "active-backup"
 
         running = true
         ensureMobileDataEnabled()
@@ -164,15 +160,16 @@ class CallVpnService : VpnService() {
                 this.useTCP = true
                 this.token = token
                 this.vkTokens = vkTokens
+                this.serverMode = serverMode
             }
 
             val t = Tunnel()
+            t.setCaptchaCallback(CaptchaSolverCallback(this@CallVpnService))
             tunnel = t
 
             // Start stage+log poller BEFORE t.start() so UI sees connection stages.
             val mgr = getSystemService(NotificationManager::class.java)
             Thread {
-                var lastCaptchaSid = ""
                 while (running) {
                     try {
                         val logs = tunnel?.readLogs() ?: ""
@@ -226,22 +223,6 @@ class CallVpnService : VpnService() {
                         LocalBroadcastManager.getInstance(this@CallVpnService)
                             .sendBroadcast(connIntent)
 
-                        // Check for captcha challenge (dedup by SID)
-                        val captcha = tunnel?.captchaChallenge() ?: ""
-                        if (captcha.isNotEmpty()) {
-                            val sid = try {
-                                org.json.JSONObject(captcha).optString("captcha_sid", "")
-                            } catch (_: Exception) { "" }
-                            if (sid.isNotEmpty() && sid != lastCaptchaSid) {
-                                lastCaptchaSid = sid
-                                LocalBroadcastManager.getInstance(this@CallVpnService)
-                                    .sendBroadcast(Intent(ACTION_CAPTCHA).apply {
-                                        putExtra(EXTRA_CAPTCHA_JSON, captcha)
-                                    })
-                            }
-                        } else {
-                            lastCaptchaSid = ""
-                        }
 
                         Thread.sleep(300)
                     } catch (_: InterruptedException) {
@@ -529,6 +510,7 @@ class CallVpnService : VpnService() {
         const val EXTRA_NUM_CONNS = "num_conns"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_VK_TOKENS = "vk_tokens"
+        const val EXTRA_SERVER_MODE = "server_mode"
         const val EXTRA_STATE = "state"
         const val EXTRA_LOG_TEXT = "log_text"
         const val ACTION_CONN_COUNT = "com.callvpn.CONN_COUNT"
@@ -540,10 +522,6 @@ class CallVpnService : VpnService() {
         const val ACTION_SPEEDTEST_PROGRESS = "com.callvpn.SPEEDTEST_PROGRESS"
         const val EXTRA_SPEEDTEST_JSON = "speedtest_json"
         const val EXTRA_SPEEDTEST_PHASE = "speedtest_phase"
-        const val ACTION_CAPTCHA = "com.callvpn.CAPTCHA"
-        const val EXTRA_CAPTCHA_JSON = "captcha_json"
-        const val ACTION_CAPTCHA_SUBMIT = "com.callvpn.CAPTCHA_SUBMIT"
-        const val EXTRA_CAPTCHA_KEY = "captcha_key"
         const val CHANNEL_ID = "callvpn_channel"
         const val NOTIFICATION_ID = 1
 

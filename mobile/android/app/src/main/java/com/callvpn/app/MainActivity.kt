@@ -17,7 +17,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -27,10 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -38,6 +34,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -54,6 +51,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 enum class VpnState { Disconnected, Connecting, Connected }
+enum class Screen { Main, Settings, Logs, Apps, ProfileEditor }
 
 class MainActivity : ComponentActivity() {
 
@@ -66,7 +64,6 @@ class MainActivity : ComponentActivity() {
     private var speedTestPhase = mutableStateOf("")
     private var speedTestProgress = mutableStateOf("")
     private var speedTestResult = mutableStateOf("")
-    private var captchaChallenge = mutableStateOf("")
     private var pendingCallLink = ""
     private var pendingServerAddr = ""
     private var pendingToken = ""
@@ -86,7 +83,7 @@ class MainActivity : ComponentActivity() {
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* proceed regardless of result */ }
+    ) { /* proceed regardless */ }
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -96,102 +93,80 @@ class MainActivity : ComponentActivity() {
                 "connected" -> VpnState.Connected
                 else -> VpnState.Disconnected
             }
-            if (state == "disconnected") {
-                activeConns.value = 0
-                totalConns.value = 0
-            }
+            if (state == "disconnected") { activeConns.value = 0; totalConns.value = 0 }
         }
     }
-
     private val logReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val text = intent?.getStringExtra(CallVpnService.EXTRA_LOG_TEXT) ?: return
-            val newLines = text.split("\n").filter { it.isNotBlank() }
-            logLines.value = (logLines.value + newLines).takeLast(500)
+            logLines.value = (logLines.value + text.split("\n").filter { it.isNotBlank() }).takeLast(500)
         }
     }
-
     private val connCountReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             activeConns.value = intent?.getIntExtra(CallVpnService.EXTRA_ACTIVE_CONNS, 0) ?: 0
             totalConns.value = intent?.getIntExtra(CallVpnService.EXTRA_TOTAL_CONNS, 0) ?: 0
         }
     }
-
     private val stageReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             connectionStage.value = intent?.getStringExtra(CallVpnService.EXTRA_STAGE_TEXT) ?: ""
         }
     }
-
     private val speedTestReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val phase = intent.getStringExtra(CallVpnService.EXTRA_SPEEDTEST_PHASE) ?: ""
             val json = intent.getStringExtra(CallVpnService.EXTRA_SPEEDTEST_JSON) ?: ""
-
             when (phase) {
-                "complete" -> {
-                    speedTestRunning.value = false
-                    speedTestResult.value = json
-                    speedTestProgress.value = ""
-                }
-                "error" -> {
+                "complete", "error" -> {
                     speedTestRunning.value = false
                     speedTestResult.value = json
                     speedTestProgress.value = ""
                 }
                 else -> {
                     speedTestPhase.value = phase
-                    if (json.isNotEmpty()) {
-                        speedTestProgress.value = json
-                    }
+                    if (json.isNotEmpty()) speedTestProgress.value = json
                 }
             }
         }
     }
 
-    private val captchaReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            captchaChallenge.value = intent?.getStringExtra(CallVpnService.EXTRA_CAPTCHA_JSON) ?: ""
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-            ) {
+                != PackageManager.PERMISSION_GRANTED) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
-
         requestBatteryOptimizationExemption()
-
         vpnState.value = when (CallVpnService.currentState) {
             "connecting" -> VpnState.Connecting
             "connected" -> VpnState.Connected
             else -> VpnState.Disconnected
         }
-
         val lbm = LocalBroadcastManager.getInstance(this)
         lbm.registerReceiver(stateReceiver, IntentFilter(CallVpnService.ACTION_STATE_CHANGED))
         lbm.registerReceiver(logReceiver, IntentFilter(CallVpnService.ACTION_LOG))
         lbm.registerReceiver(connCountReceiver, IntentFilter(CallVpnService.ACTION_CONN_COUNT))
         lbm.registerReceiver(stageReceiver, IntentFilter(CallVpnService.ACTION_STAGE))
         lbm.registerReceiver(speedTestReceiver, IntentFilter(CallVpnService.ACTION_SPEEDTEST_PROGRESS))
-        lbm.registerReceiver(captchaReceiver, IntentFilter(CallVpnService.ACTION_CAPTCHA))
-
         handleQuickConnect(intent)
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
-                    CallVpnScreen(
+            val colors = darkColorScheme().copy(
+                background = Color(0xFF121212),
+                surface = Color(0xFF1E1E1E),
+                surfaceVariant = Color(0xFF2A2A2A),
+                primary = Color(0xFF90CAF9),
+                onBackground = Color(0xFFE0E0E0),
+                onSurface = Color(0xFFE0E0E0),
+                onSurfaceVariant = Color(0xFF9E9E9E),
+                outline = Color(0xFF424242)
+            )
+            MaterialTheme(colorScheme = colors) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                    AppNavigation(
                         vpnState = vpnState.value,
                         activeConns = activeConns.value,
                         totalConns = totalConns.value,
@@ -203,33 +178,16 @@ class MainActivity : ComponentActivity() {
                         speedTestResult = speedTestResult.value,
                         onSpeedTestStart = {
                             speedTestRunning.value = true
-                            speedTestResult.value = ""
-                            speedTestProgress.value = ""
-                            speedTestPhase.value = ""
-                            val intent = Intent(this, CallVpnService::class.java).apply {
+                            speedTestResult.value = ""; speedTestProgress.value = ""; speedTestPhase.value = ""
+                            startService(Intent(this, CallVpnService::class.java).apply {
                                 action = CallVpnService.ACTION_SPEEDTEST_START
-                            }
-                            startService(intent)
+                            })
                         },
-                        onConnect = { callLink, serverAddr, token, numConns, vkTokens -> requestConnect(callLink, serverAddr, token, numConns, vkTokens) },
+                        onConnect = { callLink, serverAddr, token, numConns, vkTokens, serverMode ->
+                            requestConnect(callLink, serverAddr, token, numConns, vkTokens, serverMode)
+                        },
                         onDisconnect = { stopVpn() }
                     )
-
-                    // Captcha dialog
-                    if (captchaChallenge.value.isNotEmpty()) {
-                        CaptchaDialog(
-                            challengeJson = captchaChallenge.value,
-                            onSubmit = { key ->
-                                captchaChallenge.value = ""
-                                val intent = Intent(this@MainActivity, CallVpnService::class.java).apply {
-                                    action = CallVpnService.ACTION_CAPTCHA_SUBMIT
-                                    putExtra(CallVpnService.EXTRA_CAPTCHA_KEY, key)
-                                }
-                                startService(intent)
-                            },
-                            onDismiss = { captchaChallenge.value = "" }
-                        )
-                    }
                 }
             }
         }
@@ -242,23 +200,18 @@ class MainActivity : ComponentActivity() {
         lbm.unregisterReceiver(connCountReceiver)
         lbm.unregisterReceiver(stageReceiver)
         lbm.unregisterReceiver(speedTestReceiver)
-        lbm.unregisterReceiver(captchaReceiver)
         super.onDestroy()
     }
 
     private var pendingNumConns = 4
+    private var pendingServerMode = "active-backup"
 
-    private fun requestConnect(callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String = "") {
-        pendingCallLink = callLink
-        pendingServerAddr = serverAddr
-        pendingToken = token
-        pendingNumConns = numConns
-        pendingVkTokens = vkTokens
-
+    private fun requestConnect(callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String = "", serverMode: String = "active-backup") {
+        pendingCallLink = callLink; pendingServerAddr = serverAddr
+        pendingToken = token; pendingNumConns = numConns; pendingVkTokens = vkTokens; pendingServerMode = serverMode
         val intent = VpnService.prepare(this)
-        if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
-        } else {
+        if (intent != null) vpnPermissionLauncher.launch(intent)
+        else {
             getSharedPreferences("callvpn", Context.MODE_PRIVATE)
                 .edit().putBoolean("vpn_permission_granted", true).apply()
             startVpnService()
@@ -267,7 +220,6 @@ class MainActivity : ComponentActivity() {
 
     private fun startVpnService() {
         vpnState.value = VpnState.Connecting
-
         val intent = Intent(this, CallVpnService::class.java).apply {
             action = CallVpnService.ACTION_START
             putExtra(CallVpnService.EXTRA_CALL_LINK, pendingCallLink)
@@ -275,6 +227,7 @@ class MainActivity : ComponentActivity() {
             putExtra(CallVpnService.EXTRA_NUM_CONNS, pendingNumConns)
             putExtra(CallVpnService.EXTRA_TOKEN, pendingToken)
             putExtra(CallVpnService.EXTRA_VK_TOKENS, pendingVkTokens)
+            putExtra(CallVpnService.EXTRA_SERVER_MODE, pendingServerMode)
         }
         ContextCompat.startForegroundService(this, intent)
     }
@@ -282,254 +235,262 @@ class MainActivity : ComponentActivity() {
     private fun requestBatteryOptimizationExemption() {
         val pm = getSystemService(PowerManager::class.java) ?: return
         if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            try { startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
                 data = Uri.parse("package:$packageName")
-            }
-            try { startActivity(intent) } catch (_: Exception) { }
+            }) } catch (_: Exception) { }
         }
     }
 
     private fun stopVpn() {
-        val intent = Intent(this, CallVpnService::class.java).apply {
-            action = CallVpnService.ACTION_STOP
-        }
-        startService(intent)
+        startService(Intent(this, CallVpnService::class.java).apply { action = CallVpnService.ACTION_STOP })
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleQuickConnect(intent)
-    }
+    override fun onNewIntent(intent: Intent) { super.onNewIntent(intent); handleQuickConnect(intent) }
 
     private fun handleQuickConnect(intent: Intent?) {
         if (intent?.action != ACTION_QUICK_CONNECT) return
         if (vpnState.value != VpnState.Disconnected) return
-
         val profileManager = ProfileManager(this)
         val profile = profileManager.getActiveProfile() ?: return
-        val callLink = profile.callLinks
-            .map { parseCallLink(it) }
-            .filter { it.isNotBlank() }
-            .joinToString(",")
+        val callLink = profile.callLinks.map { parseCallLink(it) }.filter { it.isNotBlank() }.joinToString(",")
         if (callLink.isBlank()) return
-
-        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
-        requestConnect(callLink, serverAddr, profile.token, profile.numConns, profile.vkTokensJoined())
+        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddrsJoined().ifBlank { profile.effectiveServerAddr() } else ""
+        val token = if (profile.connectionMode == "direct") {
+            val svrs = profile.servers.filter { it.addr.isNotBlank() }
+            if (svrs.isNotEmpty()) svrs.joinToString(",") { it.token } else profile.effectiveToken()
+        } else ""
+        requestConnect(callLink, serverAddr, token, profile.numConns, profile.vkTokensJoined(), profile.serverMode)
     }
 
-    companion object {
-        const val ACTION_QUICK_CONNECT = "com.callvpn.QUICK_CONNECT"
-    }
+    companion object { const val ACTION_QUICK_CONNECT = "com.callvpn.QUICK_CONNECT" }
 }
 
 private fun parseCallLink(input: String): String {
-    val vkRegex = Regex("""vk\.com/call/join/([A-Za-z0-9_-]+)""")
-    val vkMatch = vkRegex.find(input)
+    val vkMatch = Regex("""vk\.com/call/join/([A-Za-z0-9_-]+)""").find(input)
     if (vkMatch != null) return vkMatch.groupValues[1]
-
-    val telemostRegex = Regex("""telemost\.yandex\.\w+/j/(\d+)""")
-    val telemostMatch = telemostRegex.find(input)
+    val telemostMatch = Regex("""telemost\.yandex\.\w+/j/(\d+)""").find(input)
     if (telemostMatch != null) return telemostMatch.groupValues[1]
-
     return input.trim()
 }
 
+// ─── Navigation ──────────────────────────────────────────────────────────────
+
+@Composable
+fun AppNavigation(
+    vpnState: VpnState, activeConns: Int, totalConns: Int, connectionStage: String,
+    logLines: List<String>, speedTestRunning: Boolean, speedTestPhase: String,
+    speedTestProgress: String, speedTestResult: String, onSpeedTestStart: () -> Unit,
+    onConnect: (String, String, String, Int, String, String) -> Unit, onDisconnect: () -> Unit
+) {
+    var currentScreen by remember { mutableStateOf(Screen.Main) }
+    var editingProfile by remember { mutableStateOf<Profile?>(null) }
+    var isNewProfile by remember { mutableStateOf(false) }
+
+    when (currentScreen) {
+        Screen.Main -> MainScreen(
+            vpnState = vpnState, activeConns = activeConns, totalConns = totalConns,
+            connectionStage = connectionStage, speedTestRunning = speedTestRunning,
+            speedTestPhase = speedTestPhase, speedTestProgress = speedTestProgress,
+            speedTestResult = speedTestResult, onSpeedTestStart = onSpeedTestStart,
+            onConnect = onConnect, onDisconnect = onDisconnect,
+            onSettings = { currentScreen = Screen.Settings },
+            onEditProfile = { p -> editingProfile = p; isNewProfile = false; currentScreen = Screen.ProfileEditor },
+            onNewProfile = { editingProfile = null; isNewProfile = true; currentScreen = Screen.ProfileEditor }
+        )
+        Screen.Settings -> SettingsScreen(
+            onBack = { currentScreen = Screen.Main },
+            onLogs = { currentScreen = Screen.Logs },
+            onApps = { currentScreen = Screen.Apps },
+            vpnState = vpnState
+        )
+        Screen.Logs -> LogsScreen(logLines = logLines, onBack = { currentScreen = Screen.Settings })
+        Screen.Apps -> AppsScreen(onBack = { currentScreen = Screen.Settings })
+        Screen.ProfileEditor -> ProfileEditorScreen(
+            profile = editingProfile, isNew = isNewProfile,
+            onSave = { currentScreen = Screen.Main },
+            onDelete = { currentScreen = Screen.Main },
+            onBack = { currentScreen = Screen.Main },
+            onConnect = onConnect, onDisconnect = onDisconnect, vpnState = vpnState
+        )
+    }
+}
+
+// ─── Main Screen ─────────────────────────────────────────────────────────────
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun CallVpnScreen(
-    vpnState: VpnState,
-    activeConns: Int,
-    totalConns: Int,
-    connectionStage: String = "",
-    logLines: List<String>,
-    speedTestRunning: Boolean = false,
-    speedTestPhase: String = "",
-    speedTestProgress: String = "",
-    speedTestResult: String = "",
-    onSpeedTestStart: () -> Unit = {},
-    onConnect: (callLink: String, serverAddr: String, token: String, numConns: Int, vkTokens: String) -> Unit,
-    onDisconnect: () -> Unit
+fun MainScreen(
+    vpnState: VpnState, activeConns: Int, totalConns: Int, connectionStage: String,
+    speedTestRunning: Boolean, speedTestPhase: String, speedTestProgress: String,
+    speedTestResult: String, onSpeedTestStart: () -> Unit,
+    onConnect: (String, String, String, Int, String, String) -> Unit, onDisconnect: () -> Unit,
+    onSettings: () -> Unit, onEditProfile: (Profile) -> Unit, onNewProfile: () -> Unit
 ) {
-    val context = androidx.compose.ui.platform.LocalContext.current
+    val context = LocalContext.current
     val profileManager = remember { ProfileManager(context) }
-
     var profiles by remember { mutableStateOf(profileManager.getProfiles()) }
     var activeProfileId by remember { mutableStateOf(profileManager.getActiveProfileId()) }
-    var showEditor by remember { mutableStateOf(false) }
-    var editingProfile by remember { mutableStateOf<Profile?>(null) }
-
-    // Excluded apps
-    var showExcludedApps by remember { mutableStateOf(false) }
-
-    // Root detection for WiFi hotspot routing
-    val rootManager = remember { RootManager(context) }
-    var rootAvailable by remember { mutableStateOf(false) }
-    var hotspotRouting by remember { mutableStateOf(rootManager.hotspotRoutingEnabled) }
-
-    LaunchedEffect(Unit) {
-        rootAvailable = rootManager.isRootAvailable()
-        // If root was lost since last session, disable the toggle
-        if (!rootAvailable && hotspotRouting) {
-            hotspotRouting = false
-            rootManager.hotspotRoutingEnabled = false
-        }
-    }
-
     val activeProfile = profiles.find { it.id == activeProfileId }
     val isConnected = vpnState != VpnState.Disconnected
+    val clipboardManager: ClipboardManager = LocalClipboardManager.current
 
-    // Status colors
-    val statusColor = when (vpnState) {
-        VpnState.Disconnected -> Color.Gray
-        VpnState.Connecting -> Color(0xFFFFC107)
-        VpnState.Connected -> Color(0xFF4CAF50)
+    // Refresh profiles when returning to this screen
+    LaunchedEffect(Unit) {
+        profiles = profileManager.getProfiles()
+        activeProfileId = profileManager.getActiveProfileId()
     }
+
+    fun connectProfile(profile: Profile) {
+        val callLink = profile.callLinks.map { parseCallLink(it) }.filter { it.isNotBlank() }.joinToString(",")
+        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddrsJoined().ifBlank { profile.effectiveServerAddr() } else ""
+        val token = if (profile.connectionMode == "direct") {
+            val svrs = profile.servers.filter { it.addr.isNotBlank() }
+            if (svrs.isNotEmpty()) svrs.joinToString(",") { it.token } else profile.effectiveToken()
+        } else ""
+        onConnect(callLink, serverAddr, token, profile.numConns.coerceIn(1, 16), profile.vkTokensJoined(), profile.serverMode)
+    }
+
     val statusText = when (vpnState) {
         VpnState.Disconnected -> "Отключён"
         VpnState.Connecting -> if (connectionStage.isNotEmpty()) connectionStage else "Подключение..."
         VpnState.Connected -> "Подключён"
     }
+    val statusColor = when (vpnState) {
+        VpnState.Disconnected -> Color(0xFF757575)
+        VpnState.Connecting -> Color(0xFFFFB74D)
+        VpnState.Connected -> Color(0xFF81C784)
+    }
     val buttonColor = when (vpnState) {
-        VpnState.Disconnected -> if (activeProfile != null) Color(0xFF4CAF50) else Color.Gray
-        VpnState.Connecting -> Color(0xFFFFC107)
-        VpnState.Connected -> Color(0xFFF44336)
+        VpnState.Disconnected -> if (activeProfile != null) Color(0xFF424242) else Color(0xFF303030)
+        VpnState.Connecting -> Color(0xFF5D4037)
+        VpnState.Connected -> Color(0xFF424242)
+    }
+    val buttonBorderColor = when (vpnState) {
+        VpnState.Disconnected -> if (activeProfile != null) Color(0xFF616161) else Color(0xFF424242)
+        VpnState.Connecting -> Color(0xFFFFB74D)
+        VpnState.Connected -> Color(0xFF81C784)
     }
     val buttonText = when (vpnState) {
-        VpnState.Disconnected -> "Подключиться"
+        VpnState.Disconnected -> "Подключить"
         VpnState.Connecting -> "Отмена"
-        VpnState.Connected -> "Отключиться"
+        VpnState.Connected -> "Отключить"
     }
 
-    val logScrollState = rememberScrollState()
-    LaunchedEffect(logLines.size) {
-        logScrollState.animateScrollTo(logScrollState.maxValue)
-    }
-
-    val clipboardManager: ClipboardManager = LocalClipboardManager.current
-
-    fun connectProfile(profile: Profile) {
-        val callLink = profile.callLinks
-            .map { parseCallLink(it) }
-            .filter { it.isNotBlank() }
-            .joinToString(",")
-        val serverAddr = if (profile.connectionMode == "direct") profile.serverAddr else ""
-        val conns = profile.numConns.coerceIn(1, 16)
-        val vkTokensStr = profile.vkTokensJoined()
-        onConnect(callLink, serverAddr, profile.token, conns, vkTokensStr)
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Spacer(modifier = Modifier.height(32.dp))
-
-        // Title
-        Text(
-            text = "CallVPN",
-            fontSize = 32.sp,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onBackground
-        )
-
-        // Status
-        Text(
-            text = statusText,
-            fontSize = 16.sp,
-            color = statusColor,
-            fontWeight = FontWeight.Medium
-        )
-
-        // Connection count
-        if (vpnState != VpnState.Disconnected && totalConns > 0) {
-            Text(
-                text = "Подключения: $activeConns / $totalConns",
-                fontSize = 13.sp,
-                color = if (activeConns == totalConns)
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                else
-                    Color(0xFFFFC107),
-                fontFamily = FontFamily.Monospace
-            )
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Top bar with settings
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.End
+        ) {
+            IconButton(onClick = onSettings) {
+                Icon(Icons.Default.Settings, "Настройки", tint = Color(0xFF9E9E9E))
+            }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Profile badges
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            for (profile in profiles) {
-                val isActive = profile.id == activeProfileId
-                ProfileBadge(
-                    profile = profile,
-                    isActive = isActive,
-                    onSelect = {
-                        if (!isActive) {
-                            // Disconnect previous if connected
-                            if (isConnected) {
-                                onDisconnect()
-                            }
-                            activeProfileId = profile.id
-                            profileManager.setActiveProfileId(profile.id)
-                            // Auto-connect
-                            connectProfile(profile)
-                        }
-                    },
-                    onEdit = {
-                        editingProfile = profile
-                        showEditor = true
-                    }
+            Spacer(modifier = Modifier.height(40.dp))
+
+            // Status
+            Text(statusText, fontSize = 16.sp, color = statusColor, fontWeight = FontWeight.Medium)
+
+            // Connection count
+            if (vpnState != VpnState.Disconnected && totalConns > 0) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    "$activeConns / $totalConns", fontSize = 13.sp,
+                    color = if (activeConns == totalConns) Color(0xFF757575) else Color(0xFFFFB74D),
+                    fontFamily = FontFamily.Monospace
                 )
             }
 
-            // Add profile button
-            Surface(
-                modifier = Modifier
-                    .height(40.dp)
-                    .clickable {
-                        editingProfile = null
-                        showEditor = true
-                    },
-                shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                color = MaterialTheme.colorScheme.surface
+            Spacer(modifier = Modifier.height(40.dp))
+
+            // Connect button
+            OutlinedButton(
+                onClick = {
+                    when (vpnState) {
+                        VpnState.Disconnected -> activeProfile?.let { connectProfile(it) }
+                        else -> onDisconnect()
+                    }
+                },
+                modifier = Modifier.size(160.dp),
+                shape = CircleShape,
+                enabled = vpnState != VpnState.Disconnected || activeProfile != null,
+                colors = ButtonDefaults.outlinedButtonColors(containerColor = buttonColor),
+                border = BorderStroke(2.dp, buttonBorderColor)
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        Icons.Default.Add,
-                        contentDescription = "Добавить",
-                        modifier = Modifier.size(18.dp),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Text(
-                        "Добавить",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(buttonText, fontSize = 15.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0))
             }
 
-            // Import profile from clipboard
-            Surface(
-                modifier = Modifier
-                    .height(40.dp)
-                    .clickable {
+            Spacer(modifier = Modifier.height(40.dp))
+
+            // Profile badges
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                for (profile in profiles) {
+                    val isActive = profile.id == activeProfileId
+                    Surface(
+                        modifier = Modifier.height(36.dp).clickable {
+                            if (!isActive) {
+                                if (isConnected) onDisconnect()
+                                activeProfileId = profile.id
+                                profileManager.setActiveProfileId(profile.id)
+                                connectProfile(profile)
+                            } else {
+                                onEditProfile(profile)
+                            }
+                        },
+                        shape = RoundedCornerShape(18.dp),
+                        color = if (isActive) Color(0xFF2A2A2A) else Color(0xFF1E1E1E),
+                        border = BorderStroke(1.dp, if (isActive) Color(0xFF616161) else Color(0xFF383838))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                if (profile.isTelemostLink()) "Y" else "VK", fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = if (isActive) Color(0xFFE0E0E0) else Color(0xFF757575)
+                            )
+                            Text(
+                                profile.name.ifBlank { "Без имени" }, fontSize = 13.sp,
+                                color = if (isActive) Color(0xFFE0E0E0) else Color(0xFF9E9E9E)
+                            )
+                        }
+                    }
+                }
+
+                // Add
+                Surface(
+                    modifier = Modifier.height(36.dp).clickable { onNewProfile() },
+                    shape = RoundedCornerShape(18.dp),
+                    color = Color(0xFF1E1E1E),
+                    border = BorderStroke(1.dp, Color(0xFF383838))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
+                        Text("Добавить", fontSize = 12.sp, color = Color(0xFF757575))
+                    }
+                }
+
+                // Import
+                Surface(
+                    modifier = Modifier.height(36.dp).clickable {
                         val clipText = clipboardManager.getText()?.text
                         if (clipText.isNullOrBlank()) {
-                            Toast
-                                .makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT)
-                                .show()
+                            Toast.makeText(context, "Буфер обмена пуст", Toast.LENGTH_SHORT).show()
                             return@clickable
                         }
                         try {
@@ -540,891 +501,338 @@ fun CallVpnScreen(
                                 activeProfileId = imported.id
                                 profileManager.setActiveProfileId(imported.id)
                             }
-                            Toast
-                                .makeText(
-                                    context,
-                                    "Профиль \"${imported.name.ifBlank { "Без имени" }}\" импортирован",
-                                    Toast.LENGTH_SHORT
-                                )
-                                .show()
+                            Toast.makeText(context, "Импортировано", Toast.LENGTH_SHORT).show()
                         } catch (_: Exception) {
-                            Toast
-                                .makeText(context, "Ошибка: неверный формат JSON", Toast.LENGTH_SHORT)
-                                .show()
+                            Toast.makeText(context, "Неверный формат", Toast.LENGTH_SHORT).show()
                         }
                     },
-                shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-                color = MaterialTheme.colorScheme.surface
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    shape = RoundedCornerShape(18.dp),
+                    color = Color(0xFF1E1E1E),
+                    border = BorderStroke(1.dp, Color(0xFF383838))
                 ) {
-                    Text(
-                        "\uD83D\uDCCB",
-                        fontSize = 14.sp
-                    )
-                    Text(
-                        "Импорт",
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Импорт", fontSize = 12.sp, color = Color(0xFF757575))
+                    }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Big round button
-        Button(
-            onClick = {
-                when (vpnState) {
-                    VpnState.Disconnected -> {
-                        val profile = activeProfile ?: return@Button
-                        connectProfile(profile)
-                    }
-                    VpnState.Connecting -> onDisconnect()
-                    VpnState.Connected -> onDisconnect()
+            // Speed test
+            if (vpnState == VpnState.Connected) {
+                Spacer(modifier = Modifier.height(24.dp))
+                OutlinedButton(
+                    onClick = { onSpeedTestStart() }, enabled = !speedTestRunning,
+                    modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFF424242))
+                ) {
+                    Text(if (speedTestRunning) "Тестирование..." else "Тест скорости",
+                        color = Color(0xFF9E9E9E), fontSize = 13.sp)
                 }
-            },
-            modifier = Modifier.size(170.dp),
-            shape = CircleShape,
-            enabled = vpnState != VpnState.Disconnected || activeProfile != null,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = buttonColor,
-                disabledContainerColor = Color.Gray
-            )
-        ) {
-            Text(
-                text = buttonText,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color.White
-            )
-        }
+                if (speedTestRunning && speedTestProgress.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val txt = runCatching {
+                        val j = org.json.JSONObject(speedTestProgress)
+                        "${speedTestPhase}: ${"%.2f".format(j.optDouble("current_mbps", 0.0))} Mbps"
+                    }.getOrDefault("${speedTestPhase}...")
+                    Text(txt, fontSize = 12.sp, color = Color(0xFF90CAF9))
+                }
+                if (speedTestResult.isNotEmpty() && !speedTestRunning) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    SpeedTestResults(speedTestResult)
+                }
+            }
 
-        // Excluded apps button
-        OutlinedButton(
-            onClick = { showExcludedApps = true },
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
-        ) {
-            Text(
-                text = "Исключённые приложения",
-                fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-        }
-
-        // WiFi Hotspot routing toggle (only visible if root is available)
-        if (rootAvailable) {
+            // Version
+            Spacer(modifier = Modifier.height(32.dp))
+            Text("v${BuildConfig.VERSION_NAME}", fontSize = 11.sp, color = Color(0xFF616161))
             Spacer(modifier = Modifier.height(16.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "WiFi Hotspot через VPN",
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = "Маршрутизация раздачи + TTL 64",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Switch(
-                    checked = hotspotRouting,
-                    onCheckedChange = { enabled ->
-                        hotspotRouting = enabled
-                        rootManager.hotspotRoutingEnabled = enabled
-                    },
-                    enabled = vpnState == VpnState.Disconnected,
-                    colors = SwitchDefaults.colors(
-                        checkedThumbColor = Color.White,
-                        checkedTrackColor = Color(0xFF4CAF50),
-                        uncheckedThumbColor = Color.White,
-                        uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                )
-            }
         }
-
-        // App version
-        Text(
-            text = "v${BuildConfig.VERSION_NAME}",
-            fontSize = 12.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Log window
-        Text(
-            text = "Лог",
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Medium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.fillMaxWidth()
-        )
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(300.dp)
-                .clickable {
-                    if (logLines.isNotEmpty()) {
-                        clipboardManager.setText(AnnotatedString(logLines.joinToString("\n")))
-                        Toast
-                            .makeText(context, "Логи скопированы", Toast.LENGTH_SHORT)
-                            .show()
-                    }
-                },
-            color = MaterialTheme.colorScheme.surfaceVariant,
-            shape = MaterialTheme.shapes.small
-        ) {
-            if (logLines.isEmpty()) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(
-                        text = "Нет записей",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                    )
-                }
-            } else {
-                Column(
-                    modifier = Modifier
-                        .verticalScroll(logScrollState)
-                        .padding(8.dp)
-                ) {
-                    for (line in logLines) {
-                        val lineColor = when {
-                            line.contains("level=ERROR") || line.startsWith("ERROR:") -> Color(0xFFEF5350)
-                            line.contains("level=WARN") -> Color(0xFFFFC107)
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        }
-                        Text(
-                            text = line,
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = lineColor
-                        )
-                    }
-                }
-            }
-        }
-
-        // Speed Test — visible only when connected
-        if (vpnState == VpnState.Connected) {
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = { onSpeedTestStart() },
-                enabled = !speedTestRunning,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(if (speedTestRunning) "Тестирование..." else "Тест скорости")
-            }
-
-            // Progress display
-            if (speedTestRunning && speedTestProgress.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(8.dp))
-                val phaseLabel = speedTestPhase.replaceFirstChar { it.uppercase() }
-                val progressText = runCatching {
-                    val json = org.json.JSONObject(speedTestProgress)
-                    val mbps = json.optDouble("current_mbps", 0.0)
-                    val elapsed = json.optInt("elapsed_s", 0)
-                    "$phaseLabel: ${"%.2f".format(mbps)} Mbps (${elapsed}s)"
-                }.getOrDefault("$phaseLabel...")
-                Text(
-                    text = progressText,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-
-            // Final results
-            if (speedTestResult.isNotEmpty() && !speedTestRunning) {
-                Spacer(modifier = Modifier.height(8.dp))
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        val lines = runCatching {
-                            val json = org.json.JSONObject(speedTestResult)
-                            val ping = json.optJSONObject("ping")
-                            val download = json.optJSONObject("download")
-                            val upload = json.optJSONObject("upload")
-                            val conns = json.optJSONArray("connections")
-                            buildList {
-                                if (ping != null) {
-                                    add("Ping: ${"%.1f".format(ping.optDouble("avg_ms"))}ms " +
-                                        "(jitter ${"%.1f".format(ping.optDouble("jitter_ms"))}ms)")
-                                }
-                                if (download != null) {
-                                    add("Download: ${"%.2f".format(download.optDouble("mbps"))} Mbps")
-                                }
-                                if (upload != null) {
-                                    add("Upload: ${"%.2f".format(upload.optDouble("mbps"))} Mbps")
-                                }
-                                if (conns != null && conns.length() > 0) {
-                                    add("")  // spacer marker
-                                    add("Connections:")
-                                    for (i in 0 until conns.length()) {
-                                        val c = conns.getJSONObject(i)
-                                        add("  #${c.optInt("index")}: " +
-                                            "${"%.2f".format(c.optDouble("down_mbps"))}/" +
-                                            "${"%.2f".format(c.optDouble("up_mbps"))} Mbps, " +
-                                            "${"%.0f".format(c.optDouble("latency_ms"))}ms")
-                                    }
-                                }
-                            }
-                        }.getOrNull()
-
-                        if (lines != null) {
-                            for (line in lines) {
-                                if (line.isEmpty()) {
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                } else if (line == "Connections:") {
-                                    Text(line, style = MaterialTheme.typography.labelSmall)
-                                } else if (line.startsWith("  #")) {
-                                    Text(line, style = MaterialTheme.typography.bodySmall,
-                                        fontFamily = FontFamily.Monospace)
-                                } else {
-                                    Text(line, style = MaterialTheme.typography.bodyMedium)
-                                }
-                            }
-                        } else {
-                            Text(speedTestResult, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Excluded apps dialog
-    if (showExcludedApps) {
-        ExcludedAppsDialog(onDismiss = { showExcludedApps = false })
-    }
-
-    // Profile editor dialog
-    if (showEditor) {
-        ProfileEditorDialog(
-            profile = editingProfile,
-            onSave = { saved ->
-                profileManager.saveProfile(saved)
-                profiles = profileManager.getProfiles()
-
-                // If no active profile yet, make this one active
-                if (activeProfileId == null) {
-                    activeProfileId = saved.id
-                    profileManager.setActiveProfileId(saved.id)
-                }
-
-                // If edited profile is active and connected, reconnect
-                if (saved.id == activeProfileId && isConnected) {
-                    onDisconnect()
-                    connectProfile(saved)
-                }
-
-                showEditor = false
-                editingProfile = null
-            },
-            onDelete = if (editingProfile != null) {
-                { id ->
-                    val wasActive = id == activeProfileId
-                    if (wasActive && isConnected) {
-                        onDisconnect()
-                    }
-                    profileManager.deleteProfile(id)
-                    profiles = profileManager.getProfiles()
-                    activeProfileId = profileManager.getActiveProfileId()
-
-                    showEditor = false
-                    editingProfile = null
-                }
-            } else null,
-            onDismiss = {
-                showEditor = false
-                editingProfile = null
-            }
-        )
     }
 }
 
 @Composable
-fun ProfileBadge(
-    profile: Profile,
-    isActive: Boolean,
-    onSelect: () -> Unit,
-    onEdit: () -> Unit
-) {
-    val bgColor = if (isActive) Color(0xFF4CAF50) else MaterialTheme.colorScheme.surface
-    val textColor = if (isActive) Color.White else MaterialTheme.colorScheme.onSurface
-    val borderColor = if (isActive) Color(0xFF4CAF50) else MaterialTheme.colorScheme.outline
-
-    Surface(
-        modifier = Modifier
-            .height(40.dp)
-            .clickable { onSelect() },
-        shape = RoundedCornerShape(20.dp),
-        color = bgColor,
-        border = BorderStroke(1.dp, borderColor)
+fun SpeedTestResults(json: String) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+        shape = RoundedCornerShape(12.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(start = 12.dp, end = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            // Provider icon
-            Text(
-                text = if (profile.isTelemostLink()) "Я" else "VK",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (isActive) Color.White else {
-                    if (profile.isTelemostLink()) Color(0xFFFF0000) else Color(0xFF0077FF)
+        Column(modifier = Modifier.padding(12.dp)) {
+            val lines = runCatching {
+                val j = org.json.JSONObject(json)
+                buildList {
+                    j.optJSONObject("ping")?.let { add("Ping: ${"%.1f".format(it.optDouble("avg_ms"))}ms (jitter ${"%.1f".format(it.optDouble("jitter_ms"))}ms)") }
+                    j.optJSONObject("download")?.let { add("Download: ${"%.2f".format(it.optDouble("mbps"))} Mbps") }
+                    j.optJSONObject("upload")?.let { add("Upload: ${"%.2f".format(it.optDouble("mbps"))} Mbps") }
                 }
-            )
-
-            // Profile name
-            Text(
-                text = profile.name.ifBlank { "Без имени" },
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = textColor
-            )
-
-            // Edit button
-            IconButton(
-                onClick = onEdit,
-                modifier = Modifier.size(32.dp)
-            ) {
-                Icon(
-                    Icons.Default.Edit,
-                    contentDescription = "Редактировать",
-                    modifier = Modifier.size(16.dp),
-                    tint = textColor.copy(alpha = 0.7f)
-                )
-            }
+            }.getOrNull()
+            lines?.forEach { Text(it, fontSize = 12.sp, color = Color(0xFFE0E0E0)) }
+                ?: Text(json, fontSize = 11.sp, color = Color(0xFF9E9E9E))
         }
     }
 }
+
+// ─── Settings Screen ─────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ProfileEditorDialog(
-    profile: Profile?,
-    onSave: (Profile) -> Unit,
-    onDelete: ((String) -> Unit)?,
-    onDismiss: () -> Unit
-) {
-    val isNew = profile == null
-    val base = profile ?: Profile()
+fun SettingsScreen(onBack: () -> Unit, onLogs: () -> Unit, onApps: () -> Unit, vpnState: VpnState) {
+    val context = LocalContext.current
+    val rootManager = remember { RootManager(context) }
+    var rootAvailable by remember { mutableStateOf(false) }
+    var hotspotRouting by remember { mutableStateOf(rootManager.hotspotRoutingEnabled) }
 
-    var name by remember { mutableStateOf(base.name) }
-    var connectionMode by remember { mutableStateOf(base.connectionMode) }
-    var callLinks by remember { mutableStateOf(base.callLinks.ifEmpty { listOf("") }) }
-    var serverAddr by remember { mutableStateOf(base.serverAddr) }
-    var token by remember { mutableStateOf(base.token) }
-    var numConns by remember { mutableStateOf(base.numConns.toString()) }
-    var vkTokens by remember { mutableStateOf(base.vkTokens) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        rootAvailable = rootManager.isRootAvailable()
+        if (!rootAvailable && hotspotRouting) {
+            hotspotRouting = false; rootManager.hotspotRoutingEnabled = false
+        }
+    }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Top bar
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(
-                modifier = Modifier
-                    .padding(24.dp)
-                    .verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                Text(
-                    text = if (isNew) "Новый профиль" else "Редактирование",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
+            Text("Настройки", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0))
+        }
 
-                // Profile name
-                OutlinedTextField(
-                    value = name,
-                    onValueChange = { if (it.length <= 20) name = it },
-                    label = { Text("Имя профиля") },
-                    placeholder = { Text("Мой VPN") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            // App routing
+            SettingsItem(title = "Маршрутизация приложений", subtitle = "Белый / чёрный список", onClick = onApps)
 
-                // Connection mode
-                Text(
-                    "Тип подключения",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            // Logs
+            SettingsItem(title = "Логи", subtitle = "Просмотр и экспорт логов подключения", onClick = onLogs)
+
+            // Hotspot
+            if (rootAvailable) {
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = connectionMode == "relay",
-                        onClick = { connectionMode = "relay" },
-                        label = { Text("Relay-to-Relay") }
-                    )
-                    FilterChip(
-                        selected = connectionMode == "direct",
-                        onClick = { connectionMode = "direct" },
-                        label = { Text("Direct") }
-                    )
-                }
-
-                // Call links (1-8)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Ссылки на звонок (${callLinks.size}/8)",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (callLinks.size < 8) {
-                        IconButton(
-                            onClick = { callLinks = callLinks + "" },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(Icons.Default.Add, "Добавить ссылку", modifier = Modifier.size(18.dp))
-                        }
-                    }
-                }
-                callLinks.forEachIndexed { index, link ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = link,
-                            onValueChange = { value ->
-                                callLinks = callLinks.toMutableList().also { it[index] = value }
-                            },
-                            label = { Text("Ссылка ${index + 1}") },
-                            placeholder = { Text("https://vk.com/call/join/...") },
-                            singleLine = true,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (callLinks.size > 1) {
-                            IconButton(
-                                onClick = {
-                                    callLinks = callLinks.toMutableList().also { it.removeAt(index) }
-                                },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(
-                                    Icons.Default.Close,
-                                    "Удалить",
-                                    modifier = Modifier.size(18.dp),
-                                    tint = Color(0xFFF44336)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Server address (direct only)
-                if (connectionMode == "direct") {
-                    OutlinedTextField(
-                        value = serverAddr,
-                        onValueChange = { serverAddr = it },
-                        label = { Text("Адрес сервера") },
-                        placeholder = { Text("host:port") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-
-                // Token
-                OutlinedTextField(
-                    value = token,
-                    onValueChange = { token = it },
-                    label = { Text("Токен") },
-                    placeholder = { Text("Токен авторизации") },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                // Connections count
-                OutlinedTextField(
-                    value = numConns,
-                    onValueChange = { value ->
-                        if (value.isEmpty() || value.all { it.isDigit() }) {
-                            numConns = value
-                        }
-                    },
-                    label = { Text("Подключения (1-16)") },
-                    placeholder = { Text("4") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                // VK tokens (0-16)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "VK токены (${vkTokens.size}/16)",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    if (vkTokens.size < 16) {
-                        IconButton(
-                            onClick = { vkTokens = vkTokens + "" },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(Icons.Default.Add, "Добавить токен", modifier = Modifier.size(18.dp))
-                        }
-                    }
-                }
-                if (vkTokens.isEmpty()) {
-                    Text(
-                        "Ускоряют подключение, обходят rate-limit VK API",
-                        fontSize = 11.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                    )
-                }
-                vkTokens.forEachIndexed { index, vkToken ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        OutlinedTextField(
-                            value = vkToken,
-                            onValueChange = { value ->
-                                vkTokens = vkTokens.toMutableList().also { it[index] = value }
-                            },
-                            label = { Text("Токен ${index + 1}") },
-                            placeholder = { Text("vk1.a.…") },
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            modifier = Modifier.weight(1f)
-                        )
-                        IconButton(
-                            onClick = {
-                                vkTokens = vkTokens.toMutableList().also { it.removeAt(index) }
-                            },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Close,
-                                "Удалить",
-                                modifier = Modifier.size(18.dp),
-                                tint = Color(0xFFF44336)
-                            )
-                        }
-                    }
-                }
-
-                // Export / Delete buttons
-                val exportClipboard = LocalClipboardManager.current
-                val exportContext = androidx.compose.ui.platform.LocalContext.current
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    TextButton(
-                        onClick = {
-                            val conns = numConns.toIntOrNull()?.coerceIn(1, 16) ?: 4
-                            val current = base.copy(
-                                name = name.trim(),
-                                connectionMode = connectionMode,
-                                callLinks = callLinks.map { it.trim() },
-                                serverAddr = serverAddr.trim(),
-                                token = token,
-                                numConns = conns,
-                                vkTokens = vkTokens.map { it.trim() }.filter { it.isNotEmpty() }
-                            )
-                            exportClipboard.setText(AnnotatedString(current.toExportJson()))
-                            Toast.makeText(exportContext, "Профиль скопирован в буфер обмена", Toast.LENGTH_SHORT).show()
-                        }
-                    ) {
-                        Text("Экспорт в буфер")
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("WiFi Hotspot через VPN", fontSize = 14.sp, color = Color(0xFFE0E0E0))
+                        Text("Маршрутизация раздачи + TTL 64", fontSize = 11.sp, color = Color(0xFF757575))
                     }
-                    if (!isNew && onDelete != null) {
-                        TextButton(onClick = { showDeleteConfirm = true }) {
-                            Text("Удалить профиль", color = Color(0xFFF44336))
-                        }
-                    }
-                }
-
-                // Action buttons
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
-                ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Отмена")
-                    }
-                    Button(
-                        onClick = {
-                            val conns = numConns.toIntOrNull()?.coerceIn(1, 16) ?: 4
-                            val saved = base.copy(
-                                name = name.trim(),
-                                connectionMode = connectionMode,
-                                callLinks = callLinks.map { it.trim() },
-                                serverAddr = serverAddr.trim(),
-                                token = token,
-                                numConns = conns,
-                                vkTokens = vkTokens.map { it.trim() }.filter { it.isNotEmpty() }
-                            )
-                            onSave(saved)
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF4CAF50)
+                    Switch(
+                        checked = hotspotRouting,
+                        onCheckedChange = { hotspotRouting = it; rootManager.hotspotRoutingEnabled = it },
+                        enabled = vpnState == VpnState.Disconnected,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF616161),
+                            uncheckedThumbColor = Color(0xFF9E9E9E), uncheckedTrackColor = Color(0xFF2A2A2A)
                         )
-                    ) {
-                        Text("Сохранить", color = Color.White)
-                    }
+                    )
                 }
             }
         }
     }
-
-    // Delete confirmation dialog
-    if (showDeleteConfirm && onDelete != null && profile != null) {
-        AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
-            title = { Text("Удалить профиль?") },
-            text = { Text("Профиль \"${profile.name.ifBlank { "Без имени" }}\" будет удалён.") },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showDeleteConfirm = false
-                        onDelete(profile.id)
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
-                ) {
-                    Text("Удалить", color = Color.White)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) {
-                    Text("Отмена")
-                }
-            }
-        )
-    }
 }
 
-data class AppInfo(
-    val packageName: String,
-    val label: String,
-)
+@Composable
+fun SettingsItem(title: String, subtitle: String, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable { onClick() },
+        color = Color.Transparent
+    ) {
+        Row(
+            modifier = Modifier.padding(vertical = 14.dp, horizontal = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, fontSize = 14.sp, color = Color(0xFFE0E0E0))
+                Text(subtitle, fontSize = 11.sp, color = Color(0xFF757575))
+            }
+            Icon(Icons.Default.KeyboardArrowRight, null, tint = Color(0xFF616161))
+        }
+    }
+    HorizontalDivider(color = Color(0xFF2A2A2A))
+}
+
+// ─── Logs Screen ─────────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ExcludedAppsDialog(onDismiss: () -> Unit) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val excludedAppsManager = remember { ExcludedAppsManager(context) }
+fun LogsScreen(logLines: List<String>, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    val scrollState = rememberScrollState()
+    LaunchedEffect(logLines.size) { scrollState.animateScrollTo(scrollState.maxValue) }
 
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
+            Text("Логи", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0),
+                modifier = Modifier.weight(1f))
+            // Share / export
+            IconButton(onClick = {
+                if (logLines.isEmpty()) return@IconButton
+                val text = logLines.joinToString("\n")
+                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, text)
+                    putExtra(Intent.EXTRA_SUBJECT, "CallVPN Logs")
+                }
+                context.startActivity(Intent.createChooser(sendIntent, "Экспорт логов"))
+            }) { Icon(Icons.Default.Share, "Экспорт", tint = Color(0xFF9E9E9E)) }
+            // Copy
+            IconButton(onClick = {
+                if (logLines.isNotEmpty()) {
+                    clipboard.setText(AnnotatedString(logLines.joinToString("\n")))
+                    Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                }
+            }) { Icon(Icons.Default.ContentCopy, "Копировать", tint = Color(0xFF9E9E9E)) }
+        }
+
+        if (logLines.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Нет записей", fontSize = 13.sp, color = Color(0xFF616161))
+            }
+        } else {
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                for (line in logLines) {
+                    val c = when {
+                        line.contains("level=ERROR") || line.startsWith("ERROR:") -> Color(0xFFEF9A9A)
+                        line.contains("level=WARN") -> Color(0xFFFFCC80)
+                        else -> Color(0xFF9E9E9E)
+                    }
+                    Text(line, fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = c)
+                }
+            }
+        }
+    }
+}
+
+// ─── Apps Screen ─────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AppsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val manager = remember { ExcludedAppsManager(context) }
+    var routingMode by remember { mutableStateOf(manager.getRoutingMode()) }
+    var selectedPackages by remember { mutableStateOf(manager.getSelectedPackages()) }
     var allApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
-    var excludedPackages by remember { mutableStateOf(excludedAppsManager.getExcludedPackages()) }
     var searchQuery by remember { mutableStateOf("") }
 
-    // Load installed apps in background
     LaunchedEffect(Unit) {
         val apps = withContext(Dispatchers.IO) {
             val pm = context.packageManager
             try {
-                pm.getInstalledApplications(0)
-                    .mapNotNull { appInfo ->
-                        try {
-                            val intent = pm.getLaunchIntentForPackage(appInfo.packageName)
-                            if (intent == null) return@mapNotNull null
-                            AppInfo(
-                                packageName = appInfo.packageName,
-                                label = try { appInfo.loadLabel(pm).toString() } catch (_: Exception) { appInfo.packageName },
-                            )
-                        } catch (_: Exception) { null }
-                    }
-                    .sortedBy { it.label.lowercase() }
-            } catch (_: Exception) {
-                emptyList()
-            }
+                pm.getInstalledApplications(0).mapNotNull { appInfo ->
+                    try {
+                        if (pm.getLaunchIntentForPackage(appInfo.packageName) == null) return@mapNotNull null
+                        AppInfo(appInfo.packageName, try { appInfo.loadLabel(pm).toString() } catch (_: Exception) { appInfo.packageName })
+                    } catch (_: Exception) { null }
+                }.sortedBy { it.label.lowercase() }
+            } catch (_: Exception) { emptyList() }
         }
-        allApps = apps
-        loading = false
+        allApps = apps; loading = false
     }
 
-    val filteredApps = remember(allApps, searchQuery) {
+    val filtered = remember(allApps, searchQuery) {
         if (searchQuery.isBlank()) allApps
-        else {
-            val q = searchQuery.lowercase()
-            allApps.filter {
-                it.label.lowercase().contains(q) || it.packageName.lowercase().contains(q)
-            }
-        }
+        else allApps.filter { it.label.lowercase().contains(searchQuery.lowercase()) || it.packageName.contains(searchQuery.lowercase()) }
     }
 
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
-    ) {
-        Surface(
-            modifier = Modifier
-                .fillMaxWidth(0.95f)
-                .fillMaxHeight(0.85f),
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Column(modifier = Modifier.fillMaxSize()) {
-                // Header
-                Text(
-                    text = "Исключённые приложения",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.padding(start = 24.dp, top = 24.dp, end = 24.dp, bottom = 8.dp)
+            IconButton(onClick = {
+                manager.setRoutingMode(routingMode)
+                manager.setSelectedPackages(selectedPackages)
+                onBack()
+            }) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
+            Text("Приложения", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0))
+        }
+
+        // Mode selector
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = routingMode == "blacklist",
+                onClick = { routingMode = "blacklist"; manager.setRoutingMode("blacklist") },
+                label = { Text("Чёрный список", fontSize = 12.sp) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)
                 )
-                Text(
-                    text = "Отмеченные приложения не используют VPN",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 24.dp)
+            )
+            FilterChip(
+                selected = routingMode == "whitelist",
+                onClick = { routingMode = "whitelist"; manager.setRoutingMode("whitelist") },
+                label = { Text("Белый список", fontSize = 12.sp) },
+                colors = FilterChipDefaults.filterChipColors(
+                    selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)
                 )
+            )
+        }
 
-                Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            if (routingMode == "blacklist") "VPN для всех, кроме отмеченных" else "VPN только для отмеченных",
+            fontSize = 11.sp, color = Color(0xFF757575),
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+        )
 
-                // Search field
-                OutlinedTextField(
-                    value = searchQuery,
-                    onValueChange = { searchQuery = it },
-                    placeholder = { Text("Поиск приложений") },
-                    leadingIcon = {
-                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(20.dp))
-                    },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp),
-                    shape = RoundedCornerShape(12.dp)
-                )
+        // Search
+        OutlinedTextField(
+            value = searchQuery, onValueChange = { searchQuery = it },
+            placeholder = { Text("Поиск", fontSize = 13.sp) },
+            leadingIcon = { Icon(Icons.Default.Search, null, modifier = Modifier.size(18.dp)) },
+            singleLine = true, shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+        )
 
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // App list
-                if (loading) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            "Загрузка приложений...",
-                            fontSize = 14.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        items(filteredApps, key = { it.packageName }) { app ->
-                            val isForced = app.packageName in ExcludedAppsManager.FORCED_PACKAGES
-                            val isExcluded = app.packageName in excludedPackages
-
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable(enabled = !isForced) {
-                                        excludedPackages = if (isExcluded) {
-                                            excludedPackages - app.packageName
-                                        } else {
-                                            excludedPackages + app.packageName
-                                        }
-                                    }
-                                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = app.label,
-                                        fontSize = 14.sp,
-                                        fontWeight = FontWeight.Medium,
-                                        color = MaterialTheme.colorScheme.onSurface
-                                    )
-                                    Text(
-                                        text = app.packageName,
-                                        fontSize = 11.sp,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Checkbox(
-                                    checked = isExcluded,
-                                    onCheckedChange = if (isForced) null else { checked ->
-                                        excludedPackages = if (checked) {
-                                            excludedPackages + app.packageName
-                                        } else {
-                                            excludedPackages - app.packageName
-                                        }
-                                    },
-                                    enabled = !isForced,
-                                    colors = CheckboxDefaults.colors(
-                                        checkedColor = Color(0xFF4CAF50),
-                                        checkmarkColor = Color.White
-                                    )
-                                )
+        if (loading) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("Загрузка...", fontSize = 13.sp, color = Color(0xFF757575))
+            }
+        } else {
+            LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(filtered, key = { it.packageName }) { app ->
+                    val isForced = routingMode == "blacklist" && app.packageName in ExcludedAppsManager.FORCED_PACKAGES
+                    val isSelected = app.packageName in selectedPackages
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .clickable(enabled = !isForced) {
+                                selectedPackages = if (isSelected) selectedPackages - app.packageName
+                                    else selectedPackages + app.packageName
+                                manager.setSelectedPackages(selectedPackages)
                             }
-                        }
-                    }
-                }
-
-                // Bottom buttons
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
-                ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Отмена")
-                    }
-                    Button(
-                        onClick = {
-                            excludedAppsManager.setExcludedPackages(excludedPackages)
-                            onDismiss()
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF4CAF50)
-                        )
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Сохранить", color = Color.White)
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(app.label, fontSize = 13.sp, color = Color(0xFFE0E0E0))
+                            Text(app.packageName, fontSize = 10.sp, color = Color(0xFF616161))
+                        }
+                        Checkbox(
+                            checked = isSelected, enabled = !isForced,
+                            onCheckedChange = if (isForced) null else { checked ->
+                                selectedPackages = if (checked) selectedPackages + app.packageName
+                                    else selectedPackages - app.packageName
+                                manager.setSelectedPackages(selectedPackages)
+                            },
+                            colors = CheckboxDefaults.colors(checkedColor = Color(0xFF757575), checkmarkColor = Color.White)
+                        )
                     }
                 }
             }
@@ -1432,133 +840,250 @@ fun ExcludedAppsDialog(onDismiss: () -> Unit) {
     }
 }
 
+data class AppInfo(val packageName: String, val label: String)
+
+// ─── Profile Editor Screen ───────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CaptchaDialog(
-    challengeJson: String,
-    onSubmit: (String) -> Unit,
-    onDismiss: () -> Unit
+fun ProfileEditorScreen(
+    profile: Profile?, isNew: Boolean,
+    onSave: () -> Unit, onDelete: () -> Unit, onBack: () -> Unit,
+    onConnect: (String, String, String, Int, String, String) -> Unit, onDisconnect: () -> Unit,
+    vpnState: VpnState
 ) {
-    val captchaImg = remember(challengeJson) {
-        try {
-            org.json.JSONObject(challengeJson).optString("captcha_img", "")
-        } catch (_: Exception) { "" }
+    val context = LocalContext.current
+    val profileManager = remember { ProfileManager(context) }
+    val base = profile ?: Profile()
+    val clipboard = LocalClipboardManager.current
+
+    var name by remember { mutableStateOf(base.name) }
+    var connectionMode by remember { mutableStateOf(base.connectionMode) }
+    var callLinks by remember { mutableStateOf(base.callLinks.ifEmpty { listOf("") }) }
+    var numConns by remember { mutableStateOf(base.numConns.toString()) }
+    var vkTokens by remember { mutableStateOf(base.vkTokens) }
+    var servers by remember { mutableStateOf(base.servers.ifEmpty { listOf(ServerEntry()) }) }
+    var serverMode by remember { mutableStateOf(base.serverMode) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+
+    fun buildProfile(): Profile {
+        val conns = numConns.toIntOrNull()?.coerceIn(1, 16) ?: 4
+        val svrs = servers.filter { it.addr.isNotBlank() }
+        return base.copy(
+            name = name.trim(), connectionMode = connectionMode,
+            callLinks = callLinks.map { it.trim() },
+            serverAddr = svrs.firstOrNull()?.addr ?: "",
+            token = svrs.firstOrNull()?.token ?: "",
+            numConns = conns,
+            vkTokens = vkTokens.map { it.trim() }.filter { it.isNotEmpty() },
+            servers = svrs, serverMode = serverMode
+        )
     }
 
-    var captchaKey by remember { mutableStateOf("") }
-    var bitmap by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
-    var loadError by remember { mutableStateOf(false) }
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
+            Text(
+                if (isNew) "Новый профиль" else "Редактирование",
+                fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0),
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = {
+                val saved = buildProfile()
+                profileManager.saveProfile(saved)
+                val activeId = profileManager.getActiveProfileId()
+                if (activeId == null) profileManager.setActiveProfileId(saved.id)
+                if (saved.id == activeId && vpnState != VpnState.Disconnected) {
+                    onDisconnect()
+                }
+                onSave()
+            }) { Text("Сохранить", color = Color(0xFF90CAF9)) }
+        }
 
-    // Load captcha image in background
-    LaunchedEffect(captchaImg) {
-        if (captchaImg.isNotEmpty()) {
-            withContext(Dispatchers.IO) {
-                try {
-                    val connection = java.net.URL(captchaImg).openConnection()
-                    connection.connectTimeout = 10000
-                    connection.readTimeout = 10000
-                    val input = connection.getInputStream()
-                    bitmap = android.graphics.BitmapFactory.decodeStream(input)
-                    input.close()
-                    if (bitmap == null) loadError = true
-                } catch (_: Exception) {
-                    loadError = true
+        Column(
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Name
+            OutlinedTextField(
+                value = name, onValueChange = { if (it.length <= 20) name = it },
+                label = { Text("Имя профиля") }, placeholder = { Text("Мой VPN") },
+                singleLine = true, modifier = Modifier.fillMaxWidth()
+            )
+
+            // Connection mode
+            Text("Тип подключения", fontSize = 12.sp, color = Color(0xFF757575))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = connectionMode == "relay", onClick = { connectionMode = "relay" },
+                    label = { Text("Relay", fontSize = 12.sp) },
+                    colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF2A2A2A)))
+                FilterChip(selected = connectionMode == "direct", onClick = { connectionMode = "direct" },
+                    label = { Text("Direct", fontSize = 12.sp) },
+                    colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF2A2A2A)))
+            }
+
+            // Call links
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("Ссылки (${callLinks.size}/8)", fontSize = 12.sp, color = Color(0xFF757575))
+                if (callLinks.size < 8) {
+                    IconButton(onClick = { callLinks = callLinks + "" }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
+                    }
                 }
             }
-        }
-    }
+            callLinks.forEachIndexed { i, link ->
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = link, onValueChange = { v -> callLinks = callLinks.toMutableList().also { it[i] = v } },
+                        label = { Text("Ссылка ${i + 1}") }, placeholder = { Text("https://vk.com/call/join/...") },
+                        singleLine = true, modifier = Modifier.weight(1f)
+                    )
+                    if (callLinks.size > 1) {
+                        IconButton(onClick = { callLinks = callLinks.toMutableList().also { it.removeAt(i) } },
+                            modifier = Modifier.size(28.dp)) {
+                            Icon(Icons.Default.Close, null, modifier = Modifier.size(16.dp), tint = Color(0xFFEF9A9A))
+                        }
+                    }
+                }
+            }
 
-    Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 6.dp
-        ) {
-            Column(
-                modifier = Modifier.padding(24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                Text(
-                    text = "Введите капчу",
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
+            // Servers (direct mode)
+            if (connectionMode == "direct") {
+                HorizontalDivider(color = Color(0xFF2A2A2A))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text("Серверы (${servers.size})", fontSize = 12.sp, color = Color(0xFF757575))
+                    IconButton(onClick = { servers = servers + ServerEntry() }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
+                    }
+                }
 
-                Text(
-                    text = "VK требует подтверждение",
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                // Server mode
+                if (servers.size > 1) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = serverMode == "active-backup",
+                            onClick = { serverMode = "active-backup" },
+                            label = { Text("Active-Backup", fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF2A2A2A)))
+                        FilterChip(selected = serverMode == "load-balance",
+                            onClick = { serverMode = "load-balance" },
+                            label = { Text("Балансировка", fontSize = 11.sp) },
+                            colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF2A2A2A)))
+                    }
+                    Text(
+                        if (serverMode == "active-backup") "Резервный сервер при недоступности основного"
+                        else "Соединения распределяются между серверами",
+                        fontSize = 10.sp, color = Color(0xFF616161)
+                    )
+                }
 
-                // Captcha image
-                Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(100.dp),
-                    color = Color.White,
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    when {
-                        bitmap != null -> {
-                            androidx.compose.foundation.Image(
-                                bitmap = bitmap!!.asImageBitmap(),
-                                contentDescription = "Captcha",
-                                modifier = Modifier.fillMaxSize().padding(4.dp),
-                                contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                servers.forEachIndexed { i, server ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically) {
+                                Text("Сервер ${i + 1}", fontSize = 12.sp, color = Color(0xFF9E9E9E))
+                                if (servers.size > 1) {
+                                    IconButton(onClick = { servers = servers.toMutableList().also { it.removeAt(i) } },
+                                        modifier = Modifier.size(24.dp)) {
+                                        Icon(Icons.Default.Close, null, Modifier.size(14.dp), tint = Color(0xFFEF9A9A))
+                                    }
+                                }
+                            }
+                            OutlinedTextField(
+                                value = server.addr,
+                                onValueChange = { v -> servers = servers.toMutableList().also { it[i] = it[i].copy(addr = v) } },
+                                label = { Text("Адрес (host:port)") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = server.token,
+                                onValueChange = { v -> servers = servers.toMutableList().also { it[i] = it[i].copy(token = v) } },
+                                label = { Text("Токен") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                                visualTransformation = PasswordVisualTransformation()
                             )
                         }
-                        loadError -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    "Ошибка загрузки",
-                                    color = Color.Red,
-                                    fontSize = 13.sp
-                                )
-                            }
-                        }
-                        else -> {
-                            Box(
-                                modifier = Modifier.fillMaxSize(),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text("Загрузка...", color = Color.Gray)
-                            }
-                        }
-                    }
-                }
-
-                // Answer input
-                OutlinedTextField(
-                    value = captchaKey,
-                    onValueChange = { captchaKey = it },
-                    label = { Text("Текст с картинки") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                // Buttons
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.End)
-                ) {
-                    TextButton(onClick = onDismiss) {
-                        Text("Отмена")
-                    }
-                    Button(
-                        onClick = { onSubmit(captchaKey.trim()) },
-                        enabled = captchaKey.isNotBlank(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFF4CAF50)
-                        )
-                    ) {
-                        Text("Отправить", color = Color.White)
                     }
                 }
             }
+
+            // Connections count
+            OutlinedTextField(
+                value = numConns,
+                onValueChange = { if (it.isEmpty() || it.all { c -> c.isDigit() }) numConns = it },
+                label = { Text("Подключения (1-16)") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+            )
+
+            // VK tokens
+            HorizontalDivider(color = Color(0xFF2A2A2A))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("VK токены (${vkTokens.size}/16)", fontSize = 12.sp, color = Color(0xFF757575))
+                if (vkTokens.size < 16) {
+                    IconButton(onClick = { vkTokens = vkTokens + "" }, modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
+                    }
+                }
+            }
+            if (vkTokens.isEmpty()) {
+                Text("Ускоряют подключение", fontSize = 10.sp, color = Color(0xFF616161))
+            }
+            vkTokens.forEachIndexed { i, t ->
+                Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        value = t, onValueChange = { v -> vkTokens = vkTokens.toMutableList().also { it[i] = v } },
+                        label = { Text("Токен ${i + 1}") }, singleLine = true, modifier = Modifier.weight(1f),
+                        visualTransformation = PasswordVisualTransformation()
+                    )
+                    IconButton(onClick = { vkTokens = vkTokens.toMutableList().also { it.removeAt(i) } },
+                        modifier = Modifier.size(28.dp)) {
+                        Icon(Icons.Default.Close, null, Modifier.size(16.dp), tint = Color(0xFFEF9A9A))
+                    }
+                }
+            }
+
+            // Export / Delete
+            HorizontalDivider(color = Color(0xFF2A2A2A))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TextButton(onClick = {
+                    clipboard.setText(AnnotatedString(buildProfile().toExportJson()))
+                    Toast.makeText(context, "Скопировано", Toast.LENGTH_SHORT).show()
+                }) { Text("Экспорт", color = Color(0xFF757575), fontSize = 13.sp) }
+
+                if (!isNew) {
+                    TextButton(onClick = { showDeleteConfirm = true }) {
+                        Text("Удалить", color = Color(0xFFEF9A9A), fontSize = 13.sp)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
         }
+    }
+
+    if (showDeleteConfirm && profile != null) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Удалить профиль?") },
+            text = { Text("\"${profile.name.ifBlank { "Без имени" }}\" будет удалён.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteConfirm = false
+                    val wasActive = profile.id == profileManager.getActiveProfileId()
+                    if (wasActive && vpnState != VpnState.Disconnected) onDisconnect()
+                    profileManager.deleteProfile(profile.id)
+                    onDelete()
+                }) { Text("Удалить", color = Color(0xFFEF9A9A)) }
+            },
+            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Отмена") } }
+        )
     }
 }

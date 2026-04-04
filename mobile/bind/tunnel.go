@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/call-vpn/call-vpn/internal/captcha"
 	"github.com/call-vpn/call-vpn/internal/client"
 	internaldtls "github.com/call-vpn/call-vpn/internal/dtls"
 	"github.com/call-vpn/call-vpn/internal/mux"
@@ -139,8 +140,8 @@ type Tunnel struct {
 	// fatal error — set when reconnect gives up permanently
 	fatalErr atomic.Value // string
 
-	// interactive captcha solver
-	captchaSolver *vk.CaptchaSolver
+	// captcha callback (mobile app shows WebView, returns success_token)
+	captchaCb CaptchaCallback
 }
 
 // MaxRecommendedConns is the maximum number of parallel connections
@@ -151,12 +152,13 @@ const MaxRecommendedConns = 8
 // TunnelConfig holds configuration for starting the tunnel.
 type TunnelConfig struct {
 	CallLink    string // call-link ID
-	ServerAddr  string // VPN server address (host:port), empty = relay-to-relay mode
+	ServerAddr  string // VPN server address (host:port), comma-separated for multi-server; empty = relay-to-relay mode
 	NumConns    int    // parallel TURN+DTLS connections
 	UseTCP      bool   // TCP vs UDP for TURN
-	Token       string // auth token for server (empty = no auth)
+	Token       string // auth token for server, comma-separated matching ServerAddr order (empty = no auth)
 	Fingerprint string // server DTLS certificate SHA-256 fingerprint (hex, empty = no pinning)
 	VKTokens    string // comma-separated VK tokens (0-16), passed from Android UI
+	ServerMode  string // "active-backup" (default) or "load-balance"; only relevant when multiple ServerAddr
 }
 
 // ValidateNumConns returns a warning message if NumConns exceeds the
@@ -176,8 +178,12 @@ func NewTunnel() *Tunnel {
 	return &Tunnel{
 		logBuf:        lb,
 		logger:        slog.New(slog.NewTextHandler(io.MultiWriter(lb, os.Stderr), &slog.HandlerOptions{Level: slog.LevelInfo})),
-		captchaSolver: vk.NewCaptchaSolver(),
 	}
+}
+
+// SetCaptchaCallback sets the captcha callback. Must be called before Start().
+func (t *Tunnel) SetCaptchaCallback(cb CaptchaCallback) {
+	t.captchaCb = cb
 }
 
 // ReadLogs returns all buffered log lines as a single string
@@ -221,18 +227,6 @@ func (t *Tunnel) setFatalError(msg string) {
 	t.logger.Error("fatal: " + msg)
 }
 
-// CaptchaChallenge returns a JSON string with captcha_sid and captcha_img
-// if a captcha is pending, or empty string if none.
-// Android should poll this alongside Stage() and FatalError().
-func (t *Tunnel) CaptchaChallenge() string {
-	return t.captchaSolver.Challenge()
-}
-
-// SubmitCaptcha provides the user's captcha answer.
-// Call this after CaptchaChallenge() returned a non-empty challenge.
-func (t *Tunnel) SubmitCaptcha(key string) {
-	t.captchaSolver.Submit(key)
-}
 
 // Start establishes TURN+DTLS connections and starts the mux tunnel.
 // If ServerAddr is empty, uses relay-to-relay mode via signaling.
@@ -278,9 +272,11 @@ func (t *Tunnel) Start(cfg *TunnelConfig) error {
 	if telemost.IsTelemostLink(cleanLinks[0]) {
 		t.svc = telemost.NewService(cleanLinks[0], cfg.Token)
 	} else {
-		svc := vk.NewService(cleanLinks[0])
-		svc.SetCaptchaSolver(t.captchaSolver)
-		t.svc = svc
+		var vkOpts []vk.Option
+		if t.captchaCb != nil {
+			vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: t.captchaCb, direct: captcha.NewDirectSolver()}))
+		}
+		t.svc = vk.NewService(cleanLinks[0], vkOpts...)
 	}
 	t.rootCtx, t.rootCancel = context.WithCancel(context.Background())
 	t.muxReady = make(chan struct{})
@@ -372,12 +368,45 @@ func (t *Tunnel) connectTelemost(ctx context.Context, cfg *TunnelConfig) (*tunne
 	return &tunnelState{m: m, conns: muxConns, cleanups: cleanups, sessionID: sessionID}, nil
 }
 
-// connectDirect creates TURN allocations and DTLS connections to a server
-// listening on a direct UDP address. Returns a tunnelState without mutating t.
+// serverInfo holds a parsed server address and its auth token.
+type serverInfo struct {
+	addr  *net.UDPAddr
+	token string
+}
+
+// parseServers splits comma-separated server addresses and tokens into serverInfo slice.
+func parseServers(addrs, tokens string) ([]serverInfo, error) {
+	addrList := strings.Split(addrs, ",")
+	tokenList := strings.Split(tokens, ",")
+	var servers []serverInfo
+	for i, a := range addrList {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+		addr, err := net.ResolveUDPAddr("udp", a)
+		if err != nil {
+			return nil, fmt.Errorf("resolve server %d (%s): %w", i, a, err)
+		}
+		tok := ""
+		if i < len(tokenList) {
+			tok = strings.TrimSpace(tokenList[i])
+		}
+		servers = append(servers, serverInfo{addr: addr, token: tok})
+	}
+	if len(servers) == 0 {
+		return nil, fmt.Errorf("no valid server addresses")
+	}
+	return servers, nil
+}
+
+// connectDirect creates TURN allocations and DTLS connections to one or more
+// servers. Supports multi-server with active-backup and load-balance modes.
+// Returns a tunnelState without mutating t.
 func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelState, error) {
-	serverAddr, err := net.ResolveUDPAddr("udp", cfg.ServerAddr)
+	servers, err := parseServers(cfg.ServerAddr, cfg.Token)
 	if err != nil {
-		return nil, fmt.Errorf("resolve server: %w", err)
+		return nil, err
 	}
 
 	sessionID := uuid.New()
@@ -395,31 +424,51 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 
 	var muxConns []io.ReadWriteCloser
 	var cleanups []context.CancelFunc
-	for i, alloc := range allocs {
-		dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, serverAddr, t.fpBytes)
-		if err != nil {
-			t.logger.Warn("DTLS-over-TURN failed", "index", i, "err", err)
-			continue
-		}
-		cleanups = append(cleanups, cleanup)
 
-		if cfg.Token != "" {
-			if err := mux.WriteAuthToken(dtlsConn, cfg.Token); err != nil {
-				t.logger.Warn("write auth token failed", "index", i, "err", err)
-				cleanup()
-				continue
+	mode := cfg.ServerMode
+	if mode == "" {
+		mode = "active-backup"
+	}
+
+	if mode == "load-balance" && len(servers) > 1 {
+		// Load balance: distribute connections across servers round-robin.
+		t.logger.Info("multi-server load-balance", "servers", len(servers), "conns", len(allocs))
+		for i, alloc := range allocs {
+			srv := servers[i%len(servers)]
+			conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+			if conn != nil {
+				muxConns = append(muxConns, conn)
+				cleanups = append(cleanups, cleanup)
 			}
 		}
-
-		var sid [16]byte
-		copy(sid[:], sessionID[:])
-		if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-			t.logger.Warn("write session id failed", "index", i, "err", err)
-			cleanup()
-			continue
+	} else if len(servers) > 1 {
+		// Active-backup: try primary server first, fall back to next on failure.
+		t.logger.Info("multi-server active-backup", "servers", len(servers), "conns", len(allocs))
+		for _, srv := range servers {
+			t.logger.Info("trying server", "addr", srv.addr.String())
+			for i, alloc := range allocs {
+				conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+				if conn != nil {
+					muxConns = append(muxConns, conn)
+					cleanups = append(cleanups, cleanup)
+				}
+			}
+			if len(muxConns) > 0 {
+				t.logger.Info("server connected", "addr", srv.addr.String(), "conns", len(muxConns))
+				break
+			}
+			t.logger.Warn("server failed, trying next", "addr", srv.addr.String())
 		}
-
-		muxConns = append(muxConns, dtlsConn)
+	} else {
+		// Single server.
+		srv := servers[0]
+		for i, alloc := range allocs {
+			conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+			if conn != nil {
+				muxConns = append(muxConns, conn)
+				cleanups = append(cleanups, cleanup)
+			}
+		}
 	}
 
 	if len(muxConns) == 0 {
@@ -435,6 +484,33 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 		"active", len(muxConns), "target", cfg.NumConns,
 		"session_id", sessionID.String())
 	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
+}
+
+// dialDirectConn establishes a single DTLS-over-TURN connection to a server.
+func (t *Tunnel) dialDirectConn(ctx context.Context, index int, alloc *turn.Allocation, srv serverInfo, sessionID uuid.UUID) (io.ReadWriteCloser, context.CancelFunc) {
+	dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, srv.addr, t.fpBytes)
+	if err != nil {
+		t.logger.Warn("DTLS-over-TURN failed", "index", index, "server", srv.addr.String(), "err", err)
+		return nil, nil
+	}
+
+	if srv.token != "" {
+		if err := mux.WriteAuthToken(dtlsConn, srv.token); err != nil {
+			t.logger.Warn("write auth token failed", "index", index, "err", err)
+			cleanup()
+			return nil, nil
+		}
+	}
+
+	var sid [16]byte
+	copy(sid[:], sessionID[:])
+	if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
+		t.logger.Warn("write session id failed", "index", index, "err", err)
+		cleanup()
+		return nil, nil
+	}
+
+	return dtlsConn, cleanup
 }
 
 // deduplicateTokens removes duplicate VK tokens, logging a warning for each duplicate.
@@ -484,8 +560,11 @@ func (t *Tunnel) connectMultiRelay(ctx context.Context, cfg *TunnelConfig, links
 		if telemost.IsTelemostLink(link) {
 			services[i] = telemost.NewService(link, cfg.Token)
 		} else {
-			svc := vk.NewService(link)
-			svc.SetCaptchaSolver(t.captchaSolver)
+			var vkOpts []vk.Option
+			if t.captchaCb != nil {
+				vkOpts = append(vkOpts, vk.WithCaptchaSolver(&callbackSolver{cb: t.captchaCb, direct: captcha.NewDirectSolver()}))
+			}
+			svc := vk.NewService(link, vkOpts...)
 			services[i] = svc
 		}
 	}
