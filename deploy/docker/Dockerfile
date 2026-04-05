@@ -5,6 +5,9 @@ RUN apk add --no-cache git
 
 WORKDIR /src
 COPY go.mod go.sum ./
+# The main module replaces github.com/wlynxg/anet with this local module,
+# so it must exist before `go mod download` runs.
+COPY internal/anetfix ./internal/anetfix
 RUN go mod download
 
 COPY . .
