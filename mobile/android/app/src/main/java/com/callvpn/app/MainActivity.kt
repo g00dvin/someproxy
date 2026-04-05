@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
@@ -285,6 +286,14 @@ fun AppNavigation(
     var currentScreen by remember { mutableStateOf(Screen.Main) }
     var editingProfile by remember { mutableStateOf<Profile?>(null) }
     var isNewProfile by remember { mutableStateOf(false) }
+
+    // Handle Android system back button/gesture
+    BackHandler(enabled = currentScreen != Screen.Main) {
+        currentScreen = when (currentScreen) {
+            Screen.Logs, Screen.Apps -> Screen.Settings
+            else -> Screen.Main
+        }
+    }
 
     when (currentScreen) {
         Screen.Main -> MainScreen(
@@ -770,7 +779,10 @@ fun AppsScreen(onBack: () -> Unit) {
         ) {
             FilterChip(
                 selected = routingMode == "blacklist",
-                onClick = { routingMode = "blacklist"; manager.setRoutingMode("blacklist") },
+                onClick = {
+                    routingMode = "blacklist"; manager.setRoutingMode("blacklist")
+                    selectedPackages = manager.getSelectedPackages()
+                },
                 label = { Text("Чёрный список", fontSize = 12.sp) },
                 colors = FilterChipDefaults.filterChipColors(
                     selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)
@@ -778,7 +790,10 @@ fun AppsScreen(onBack: () -> Unit) {
             )
             FilterChip(
                 selected = routingMode == "whitelist",
-                onClick = { routingMode = "whitelist"; manager.setRoutingMode("whitelist") },
+                onClick = {
+                    routingMode = "whitelist"; manager.setRoutingMode("whitelist")
+                    selectedPackages = manager.getSelectedPackages()
+                },
                 label = { Text("Белый список", fontSize = 12.sp) },
                 colors = FilterChipDefaults.filterChipColors(
                     selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)

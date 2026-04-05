@@ -415,6 +415,28 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 	svc := t.svc
 	t.mu.Unlock()
 
+	mode := cfg.ServerMode
+	if mode == "" {
+		mode = "active-backup"
+	}
+
+	t.logger.Info("connectDirect starting",
+		"servers", len(servers), "mode", mode, "conns", cfg.NumConns)
+	for i, srv := range servers {
+		t.logger.Info("  server config", "index", i, "addr", srv.addr.String(), "has_token", srv.token != "")
+	}
+
+	if mode == "load-balance" && len(servers) > 1 {
+		return t.connectDirectLoadBalance(ctx, cfg, servers, svc, sessionID)
+	}
+	if len(servers) > 1 {
+		return t.connectDirectActiveBackup(ctx, cfg, servers, svc, sessionID)
+	}
+	return t.connectDirectSingle(ctx, cfg, servers[0], svc, sessionID)
+}
+
+// connectDirectSingle connects all allocations to a single server.
+func (t *Tunnel) connectDirectSingle(ctx context.Context, cfg *TunnelConfig, srv serverInfo, svc provider.Service, sessionID uuid.UUID) (*tunnelState, error) {
 	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
 	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
 	if err != nil {
@@ -424,70 +446,121 @@ func (t *Tunnel) connectDirect(ctx context.Context, cfg *TunnelConfig) (*tunnelS
 
 	var muxConns []io.ReadWriteCloser
 	var cleanups []context.CancelFunc
-
-	mode := cfg.ServerMode
-	if mode == "" {
-		mode = "active-backup"
-	}
-
-	if mode == "load-balance" && len(servers) > 1 {
-		// Load balance: distribute connections across servers round-robin.
-		t.logger.Info("multi-server load-balance", "servers", len(servers), "conns", len(allocs))
-		for i, alloc := range allocs {
-			srv := servers[i%len(servers)]
-			conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
-			if conn != nil {
-				muxConns = append(muxConns, conn)
-				cleanups = append(cleanups, cleanup)
-			}
-		}
-	} else if len(servers) > 1 {
-		// Active-backup: try primary server first, fall back to next on failure.
-		t.logger.Info("multi-server active-backup", "servers", len(servers), "conns", len(allocs))
-		for _, srv := range servers {
-			t.logger.Info("trying server", "addr", srv.addr.String())
-			for i, alloc := range allocs {
-				conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
-				if conn != nil {
-					muxConns = append(muxConns, conn)
-					cleanups = append(cleanups, cleanup)
-				}
-			}
-			if len(muxConns) > 0 {
-				t.logger.Info("server connected", "addr", srv.addr.String(), "conns", len(muxConns))
-				break
-			}
-			t.logger.Warn("server failed, trying next", "addr", srv.addr.String())
-		}
-	} else {
-		// Single server.
-		srv := servers[0]
-		for i, alloc := range allocs {
-			conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
-			if conn != nil {
-				muxConns = append(muxConns, conn)
-				cleanups = append(cleanups, cleanup)
-			}
+	for i, alloc := range allocs {
+		conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+		if conn != nil {
+			muxConns = append(muxConns, conn)
+			cleanups = append(cleanups, cleanup)
 		}
 	}
 
 	if len(muxConns) == 0 {
 		mgr.CloseAll()
-		for _, c := range cleanups {
-			c()
-		}
-		return nil, fmt.Errorf("no DTLS connections established")
+		return nil, fmt.Errorf("no DTLS connections to %s", srv.addr)
 	}
 
 	m := mux.New(t.logger)
 	t.logger.Info("tunnel connected (direct)",
-		"active", len(muxConns), "target", cfg.NumConns,
-		"session_id", sessionID.String())
+		"server", srv.addr.String(), "active", len(muxConns),
+		"target", cfg.NumConns, "session_id", sessionID.String())
 	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
+}
+
+// connectDirectLoadBalance distributes connections across servers round-robin.
+func (t *Tunnel) connectDirectLoadBalance(ctx context.Context, cfg *TunnelConfig, servers []serverInfo, svc provider.Service, sessionID uuid.UUID) (*tunnelState, error) {
+	t.logger.Info("load-balance mode", "servers", len(servers), "conns", cfg.NumConns)
+
+	mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
+	allocs, err := mgr.Allocate(ctx, cfg.NumConns)
+	if err != nil {
+		mgr.CloseAll()
+		return nil, fmt.Errorf("allocate TURN: %w", err)
+	}
+
+	var muxConns []io.ReadWriteCloser
+	var cleanups []context.CancelFunc
+	serverConnCounts := make(map[string]int)
+
+	for i, alloc := range allocs {
+		srv := servers[i%len(servers)]
+		conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+		if conn != nil {
+			muxConns = append(muxConns, conn)
+			cleanups = append(cleanups, cleanup)
+			serverConnCounts[srv.addr.String()]++
+		}
+	}
+
+	for addr, count := range serverConnCounts {
+		t.logger.Info("load-balance server", "addr", addr, "conns", count)
+	}
+
+	if len(muxConns) == 0 {
+		mgr.CloseAll()
+		return nil, fmt.Errorf("no DTLS connections established across %d servers", len(servers))
+	}
+
+	m := mux.New(t.logger)
+	t.logger.Info("tunnel connected (load-balance)",
+		"active", len(muxConns), "target", cfg.NumConns,
+		"servers_used", len(serverConnCounts), "session_id", sessionID.String())
+	return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
+}
+
+// connectDirectActiveBackup tries each server in order with fresh TURN allocations.
+// Stops at the first server that gets at least one connection.
+func (t *Tunnel) connectDirectActiveBackup(ctx context.Context, cfg *TunnelConfig, servers []serverInfo, svc provider.Service, sessionID uuid.UUID) (*tunnelState, error) {
+	t.logger.Info("active-backup mode", "servers", len(servers), "conns", cfg.NumConns)
+
+	var lastErr error
+	for si, srv := range servers {
+		t.logger.Info("active-backup: trying server", "index", si, "addr", srv.addr.String())
+		t.setStage(fmt.Sprintf("Сервер %d/%d: %s", si+1, len(servers), srv.addr.String()))
+
+		mgr := turn.NewManager(svc, cfg.UseTCP, t.logger)
+		allocs, err := mgr.Allocate(ctx, cfg.NumConns)
+		if err != nil {
+			mgr.CloseAll()
+			lastErr = fmt.Errorf("server %s: allocate TURN: %w", srv.addr, err)
+			t.logger.Warn("active-backup: TURN allocation failed", "server", srv.addr.String(), "err", err)
+			continue
+		}
+
+		var muxConns []io.ReadWriteCloser
+		var cleanups []context.CancelFunc
+		for i, alloc := range allocs {
+			conn, cleanup := t.dialDirectConn(ctx, i, alloc, srv, sessionID)
+			if conn != nil {
+				muxConns = append(muxConns, conn)
+				cleanups = append(cleanups, cleanup)
+			}
+		}
+
+		if len(muxConns) == 0 {
+			mgr.CloseAll()
+			for _, c := range cleanups {
+				c()
+			}
+			lastErr = fmt.Errorf("server %s: no DTLS connections", srv.addr)
+			t.logger.Warn("active-backup: server failed", "addr", srv.addr.String())
+			continue
+		}
+
+		m := mux.New(t.logger)
+		t.logger.Info("tunnel connected (active-backup)",
+			"server", srv.addr.String(), "index", si,
+			"active", len(muxConns), "target", cfg.NumConns,
+			"session_id", sessionID.String())
+		return &tunnelState{mgr: mgr, m: m, conns: muxConns, cleanups: cleanups}, nil
+	}
+
+	return nil, fmt.Errorf("all %d servers failed: %w", len(servers), lastErr)
 }
 
 // dialDirectConn establishes a single DTLS-over-TURN connection to a server.
 func (t *Tunnel) dialDirectConn(ctx context.Context, index int, alloc *turn.Allocation, srv serverInfo, sessionID uuid.UUID) (io.ReadWriteCloser, context.CancelFunc) {
+	t.logger.Info("dialing DTLS", "index", index, "server", srv.addr.String(), "relay", alloc.RelayAddr.String())
+
 	dtlsConn, cleanup, err := internaldtls.DialOverTURN(ctx, alloc.RelayConn, srv.addr, t.fpBytes)
 	if err != nil {
 		t.logger.Warn("DTLS-over-TURN failed", "index", index, "server", srv.addr.String(), "err", err)
@@ -496,7 +569,7 @@ func (t *Tunnel) dialDirectConn(ctx context.Context, index int, alloc *turn.Allo
 
 	if srv.token != "" {
 		if err := mux.WriteAuthToken(dtlsConn, srv.token); err != nil {
-			t.logger.Warn("write auth token failed", "index", index, "err", err)
+			t.logger.Warn("write auth token failed", "index", index, "server", srv.addr.String(), "err", err)
 			cleanup()
 			return nil, nil
 		}
@@ -505,11 +578,12 @@ func (t *Tunnel) dialDirectConn(ctx context.Context, index int, alloc *turn.Allo
 	var sid [16]byte
 	copy(sid[:], sessionID[:])
 	if err := mux.WriteSessionID(dtlsConn, sid); err != nil {
-		t.logger.Warn("write session id failed", "index", index, "err", err)
+		t.logger.Warn("write session id failed", "index", index, "server", srv.addr.String(), "err", err)
 		cleanup()
 		return nil, nil
 	}
 
+	t.logger.Info("DTLS connection established", "index", index, "server", srv.addr.String())
 	return dtlsConn, cleanup
 }
 

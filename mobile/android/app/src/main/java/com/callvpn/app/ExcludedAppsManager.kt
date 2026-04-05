@@ -24,18 +24,24 @@ class ExcludedAppsManager(context: Context) {
 
     /** In blacklist mode: apps excluded from VPN. In whitelist mode: apps included in VPN. */
     fun getSelectedPackages(): Set<String> {
-        val json = prefs.getString(KEY_EXCLUDED, null)
-            ?: return DEFAULT_PACKAGES.toSet()
+        val mode = getRoutingMode()
+        val json = prefs.getString(if (mode == "whitelist") KEY_WHITELIST else KEY_EXCLUDED, null)
+            ?: return if (mode == "whitelist") emptySet() else DEFAULT_PACKAGES.toSet()
         return try {
             val arr = JSONArray(json)
             val set = mutableSetOf<String>()
             for (i in 0 until arr.length()) {
                 set.add(arr.getString(i))
             }
-            // Always include forced packages in blacklist mode
-            if (getRoutingMode() == "blacklist") set + FORCED_PACKAGES else set
+            if (mode == "blacklist") {
+                // Always include forced packages in blacklist mode
+                set + FORCED_PACKAGES
+            } else {
+                // In whitelist mode, never include forced packages (they must bypass VPN)
+                set - FORCED_PACKAGES
+            }
         } catch (_: Exception) {
-            DEFAULT_PACKAGES.toSet()
+            if (mode == "whitelist") emptySet() else DEFAULT_PACKAGES.toSet()
         }
     }
 
@@ -43,10 +49,12 @@ class ExcludedAppsManager(context: Context) {
     fun getExcludedPackages(): Set<String> = getSelectedPackages()
 
     fun setSelectedPackages(packages: Set<String>) {
+        val mode = getRoutingMode()
         val arr = JSONArray()
-        val effective = if (getRoutingMode() == "blacklist") packages + FORCED_PACKAGES else packages
+        val effective = if (mode == "blacklist") packages + FORCED_PACKAGES else packages - FORCED_PACKAGES
         effective.forEach { arr.put(it) }
-        prefs.edit().putString(KEY_EXCLUDED, arr.toString()).apply()
+        val key = if (mode == "whitelist") KEY_WHITELIST else KEY_EXCLUDED
+        prefs.edit().putString(key, arr.toString()).apply()
     }
 
     /** Legacy compat */
@@ -56,6 +64,7 @@ class ExcludedAppsManager(context: Context) {
 
     companion object {
         private const val KEY_EXCLUDED = "excluded_packages_json"
+        private const val KEY_WHITELIST = "whitelist_packages_json"
         private const val KEY_ROUTING_MODE = "app_routing_mode"
 
         /** Apps that MUST always be excluded — user cannot include them in VPN. */
