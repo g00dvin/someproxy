@@ -17,11 +17,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,6 +34,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ClipboardManager
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -417,7 +420,18 @@ fun MainScreen(
 
             Spacer(modifier = Modifier.height(40.dp))
 
-            // Connect button
+            // Connect button with pulse animation during connecting
+            val pulseAnim = rememberInfiniteTransition(label = "pulse")
+            val pulseScale by pulseAnim.animateFloat(
+                initialValue = 1f, targetValue = 1.06f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(800, easing = EaseInOut),
+                    repeatMode = RepeatMode.Reverse
+                ), label = "scale"
+            )
+            val btnModifier = if (vpnState == VpnState.Connecting)
+                Modifier.size(160.dp).scale(pulseScale) else Modifier.size(160.dp)
+
             OutlinedButton(
                 onClick = {
                     when (vpnState) {
@@ -425,7 +439,7 @@ fun MainScreen(
                         else -> onDisconnect()
                     }
                 },
-                modifier = Modifier.size(160.dp),
+                modifier = btnModifier,
                 shape = CircleShape,
                 enabled = vpnState != VpnState.Disconnected || activeProfile != null,
                 colors = ButtonDefaults.outlinedButtonColors(containerColor = buttonColor),
@@ -464,6 +478,11 @@ fun MainScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
+                            // Connection status dot for active profile
+                            if (isActive && vpnState != VpnState.Disconnected) {
+                                val dotColor = if (vpnState == VpnState.Connected) Color(0xFF81C784) else Color(0xFFFFB74D)
+                                Surface(modifier = Modifier.size(8.dp), shape = CircleShape, color = dotColor) {}
+                            }
                             Text(
                                 if (profile.isTelemostLink()) "Y" else "VK", fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
@@ -553,9 +572,6 @@ fun MainScreen(
                 }
             }
 
-            // Version
-            Spacer(modifier = Modifier.height(32.dp))
-            Text("v${BuildConfig.VERSION_NAME}", fontSize = 11.sp, color = Color(0xFF616161))
             Spacer(modifier = Modifier.height(16.dp))
         }
     }
@@ -610,12 +626,51 @@ fun SettingsScreen(onBack: () -> Unit, onLogs: () -> Unit, onApps: () -> Unit, v
             Text("Настройки", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0))
         }
 
+        val appsManager = remember { ExcludedAppsManager(context) }
+        var whitelistEnabled by remember { mutableStateOf(appsManager.isWhitelistEnabled()) }
+
         Column(
             modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            // App routing
-            SettingsItem(title = "Маршрутизация приложений", subtitle = "Белый / чёрный список", onClick = onApps)
+            val isVpnActive = vpnState != VpnState.Disconnected
+
+            // Hint when VPN is active
+            if (isVpnActive) {
+                Text(
+                    "Отключите VPN для изменения настроек",
+                    fontSize = 11.sp, color = Color(0xFFFFB74D),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp)
+                )
+            }
+
+            // Whitelist toggle
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp, horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Белый список приложений", fontSize = 14.sp,
+                        color = if (isVpnActive) Color(0xFF757575) else Color(0xFFE0E0E0))
+                    Text("VPN только для выбранных приложений", fontSize = 11.sp, color = Color(0xFF757575))
+                }
+                Switch(
+                    checked = whitelistEnabled,
+                    onCheckedChange = { whitelistEnabled = it; appsManager.setWhitelistEnabled(it) },
+                    enabled = !isVpnActive,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF616161),
+                        uncheckedThumbColor = Color(0xFF9E9E9E), uncheckedTrackColor = Color(0xFF2A2A2A)
+                    )
+                )
+            }
+            HorizontalDivider(color = Color(0xFF2A2A2A))
+
+            // App selection (only when whitelist enabled)
+            if (whitelistEnabled) {
+                SettingsItem(title = "Выбор приложений", subtitle = "Приложения для работы через VPN", onClick = onApps)
+            }
 
             // Logs
             SettingsItem(title = "Логи", subtitle = "Просмотр и экспорт логов подключения", onClick = onLogs)
@@ -629,13 +684,14 @@ fun SettingsScreen(onBack: () -> Unit, onLogs: () -> Unit, onApps: () -> Unit, v
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("WiFi Hotspot через VPN", fontSize = 14.sp, color = Color(0xFFE0E0E0))
+                        Text("WiFi Hotspot через VPN", fontSize = 14.sp,
+                            color = if (isVpnActive) Color(0xFF757575) else Color(0xFFE0E0E0))
                         Text("Маршрутизация раздачи + TTL 64", fontSize = 11.sp, color = Color(0xFF757575))
                     }
                     Switch(
                         checked = hotspotRouting,
                         onCheckedChange = { hotspotRouting = it; rootManager.hotspotRoutingEnabled = it },
-                        enabled = vpnState == VpnState.Disconnected,
+                        enabled = !isVpnActive,
                         colors = SwitchDefaults.colors(
                             checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF616161),
                             uncheckedThumbColor = Color(0xFF9E9E9E), uncheckedTrackColor = Color(0xFF2A2A2A)
@@ -643,6 +699,15 @@ fun SettingsScreen(onBack: () -> Unit, onLogs: () -> Unit, onApps: () -> Unit, v
                     )
                 }
             }
+
+            // Version
+            Spacer(modifier = Modifier.height(24.dp))
+            Text(
+                "v${BuildConfig.VERSION_NAME}",
+                fontSize = 11.sp, color = Color(0xFF616161),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
+            )
+            Spacer(modifier = Modifier.height(16.dp))
         }
     }
 }
@@ -667,6 +732,30 @@ fun SettingsItem(title: String, subtitle: String, onClick: () -> Unit) {
     HorizontalDivider(color = Color(0xFF2A2A2A))
 }
 
+@Composable
+fun SectionHeader(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String,
+                  count: String? = null, onAdd: (() -> Unit)? = null) {
+    Spacer(modifier = Modifier.height(8.dp))
+    HorizontalDivider(color = Color(0xFF2A2A2A))
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, modifier = Modifier.size(16.dp), tint = Color(0xFF616161))
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(title, fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF9E9E9E))
+        if (count != null) {
+            Text("  $count", fontSize = 12.sp, color = Color(0xFF616161))
+        }
+        Spacer(modifier = Modifier.weight(1f))
+        if (onAdd != null) {
+            IconButton(onClick = onAdd, modifier = Modifier.size(28.dp)) {
+                Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
+            }
+        }
+    }
+}
+
 // ─── Logs Screen ─────────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -674,8 +763,10 @@ fun SettingsItem(title: String, subtitle: String, onClick: () -> Unit) {
 fun LogsScreen(logLines: List<String>, onBack: () -> Unit) {
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
-    val scrollState = rememberScrollState()
-    LaunchedEffect(logLines.size) { scrollState.animateScrollTo(scrollState.maxValue) }
+    val listState = rememberLazyListState()
+    LaunchedEffect(logLines.size) {
+        if (logLines.isNotEmpty()) listState.animateScrollToItem(logLines.size - 1)
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -710,10 +801,12 @@ fun LogsScreen(logLines: List<String>, onBack: () -> Unit) {
                 Text("Нет записей", fontSize = 13.sp, color = Color(0xFF616161))
             }
         } else {
-            Column(
-                modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(horizontal = 12.dp, vertical = 8.dp)
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
-                for (line in logLines) {
+                items(logLines.size) { index ->
+                    val line = logLines[index]
                     val c = when {
                         line.contains("level=ERROR") || line.startsWith("ERROR:") -> Color(0xFFEF9A9A)
                         line.contains("level=WARN") -> Color(0xFFFFCC80)
@@ -733,8 +826,7 @@ fun LogsScreen(logLines: List<String>, onBack: () -> Unit) {
 fun AppsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val manager = remember { ExcludedAppsManager(context) }
-    var routingMode by remember { mutableStateOf(manager.getRoutingMode()) }
-    var selectedPackages by remember { mutableStateOf(manager.getSelectedPackages()) }
+    var selectedPackages by remember { mutableStateOf(manager.getWhitelistPackages()) }
     var allApps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var searchQuery by remember { mutableStateOf("") }
@@ -746,6 +838,7 @@ fun AppsScreen(onBack: () -> Unit) {
                 pm.getInstalledApplications(0).mapNotNull { appInfo ->
                     try {
                         if (pm.getLaunchIntentForPackage(appInfo.packageName) == null) return@mapNotNull null
+                        if (appInfo.packageName in ExcludedAppsManager.FORCED_PACKAGES) return@mapNotNull null
                         AppInfo(appInfo.packageName, try { appInfo.loadLabel(pm).toString() } catch (_: Exception) { appInfo.packageName })
                     } catch (_: Exception) { null }
                 }.sortedBy { it.label.lowercase() }
@@ -764,47 +857,34 @@ fun AppsScreen(onBack: () -> Unit) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = {
-                manager.setRoutingMode(routingMode)
-                manager.setSelectedPackages(selectedPackages)
-                onBack()
-            }) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
-            Text("Приложения", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0))
-        }
-
-        // Mode selector
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            FilterChip(
-                selected = routingMode == "blacklist",
-                onClick = {
-                    routingMode = "blacklist"; manager.setRoutingMode("blacklist")
-                    selectedPackages = manager.getSelectedPackages()
-                },
-                label = { Text("Чёрный список", fontSize = 12.sp) },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)
+            IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Назад", tint = Color(0xFF9E9E9E)) }
+            Text("Выбор приложений", fontSize = 18.sp, fontWeight = FontWeight.Medium, color = Color(0xFFE0E0E0),
+                modifier = Modifier.weight(1f))
+            // Select all / Deselect all
+            TextButton(onClick = {
+                if (selectedPackages.size == allApps.size) {
+                    selectedPackages = emptySet()
+                } else {
+                    selectedPackages = allApps.map { it.packageName }.toSet()
+                }
+                manager.setWhitelistPackages(selectedPackages)
+            }) {
+                Text(
+                    if (selectedPackages.size == allApps.size && allApps.isNotEmpty()) "Снять все" else "Выбрать все",
+                    fontSize = 12.sp, color = Color(0xFF90CAF9)
                 )
-            )
-            FilterChip(
-                selected = routingMode == "whitelist",
-                onClick = {
-                    routingMode = "whitelist"; manager.setRoutingMode("whitelist")
-                    selectedPackages = manager.getSelectedPackages()
-                },
-                label = { Text("Белый список", fontSize = 12.sp) },
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = Color(0xFF2A2A2A), selectedLabelColor = Color(0xFFE0E0E0)
-                )
-            )
+            }
         }
 
         Text(
-            if (routingMode == "blacklist") "VPN для всех, кроме отмеченных" else "VPN только для отмеченных",
+            "Выбрано: ${selectedPackages.size}",
+            fontSize = 12.sp, color = Color(0xFF9E9E9E), fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp)
+        )
+        Text(
+            "Отмеченные приложения будут работать через VPN",
             fontSize = 11.sp, color = Color(0xFF757575),
-            modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp)
+            modifier = Modifier.padding(horizontal = 24.dp, vertical = 2.dp)
         )
 
         // Search
@@ -823,14 +903,13 @@ fun AppsScreen(onBack: () -> Unit) {
         } else {
             LazyColumn(modifier = Modifier.fillMaxSize()) {
                 items(filtered, key = { it.packageName }) { app ->
-                    val isForced = routingMode == "blacklist" && app.packageName in ExcludedAppsManager.FORCED_PACKAGES
                     val isSelected = app.packageName in selectedPackages
                     Row(
                         modifier = Modifier.fillMaxWidth()
-                            .clickable(enabled = !isForced) {
+                            .clickable {
                                 selectedPackages = if (isSelected) selectedPackages - app.packageName
                                     else selectedPackages + app.packageName
-                                manager.setSelectedPackages(selectedPackages)
+                                manager.setWhitelistPackages(selectedPackages)
                             }
                             .padding(horizontal = 16.dp, vertical = 6.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -840,11 +919,11 @@ fun AppsScreen(onBack: () -> Unit) {
                             Text(app.packageName, fontSize = 10.sp, color = Color(0xFF616161))
                         }
                         Checkbox(
-                            checked = isSelected, enabled = !isForced,
-                            onCheckedChange = if (isForced) null else { checked ->
+                            checked = isSelected,
+                            onCheckedChange = { checked ->
                                 selectedPackages = if (checked) selectedPackages + app.packageName
                                     else selectedPackages - app.packageName
-                                manager.setSelectedPackages(selectedPackages)
+                                manager.setWhitelistPackages(selectedPackages)
                             },
                             colors = CheckboxDefaults.colors(checkedColor = Color(0xFF757575), checkmarkColor = Color.White)
                         )
@@ -920,16 +999,15 @@ fun ProfileEditorScreen(
 
         Column(
             modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Name
+            // ── Basic ──
             OutlinedTextField(
                 value = name, onValueChange = { if (it.length <= 20) name = it },
                 label = { Text("Имя профиля") }, placeholder = { Text("Мой VPN") },
                 singleLine = true, modifier = Modifier.fillMaxWidth()
             )
-
-            // Connection mode
+            Spacer(modifier = Modifier.height(2.dp))
             Text("Тип подключения", fontSize = 12.sp, color = Color(0xFF757575))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = connectionMode == "relay", onClick = { connectionMode = "relay" },
@@ -940,16 +1018,9 @@ fun ProfileEditorScreen(
                     colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF2A2A2A)))
             }
 
-            // Call links
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically) {
-                Text("Ссылки (${callLinks.size}/8)", fontSize = 12.sp, color = Color(0xFF757575))
-                if (callLinks.size < 8) {
-                    IconButton(onClick = { callLinks = callLinks + "" }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
-                    }
-                }
-            }
+            // ── Call links ──
+            SectionHeader(icon = Icons.Default.Link, title = "Ссылки", count = "${callLinks.size}/8",
+                onAdd = if (callLinks.size < 8) {{ callLinks = callLinks + "" }} else null)
             callLinks.forEachIndexed { i, link ->
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     OutlinedTextField(
@@ -966,18 +1037,11 @@ fun ProfileEditorScreen(
                 }
             }
 
-            // Servers (direct mode)
+            // ── Servers (direct mode) ──
             if (connectionMode == "direct") {
-                HorizontalDivider(color = Color(0xFF2A2A2A))
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically) {
-                    Text("Серверы (${servers.size})", fontSize = 12.sp, color = Color(0xFF757575))
-                    IconButton(onClick = { servers = servers + ServerEntry() }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
-                    }
-                }
+                SectionHeader(icon = Icons.Default.Dns, title = "Серверы", count = "${servers.size}",
+                    onAdd = { servers = servers + ServerEntry() })
 
-                // Server mode
                 if (servers.size > 1) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         FilterChip(selected = serverMode == "active-backup",
@@ -1029,7 +1093,8 @@ fun ProfileEditorScreen(
                 }
             }
 
-            // Connections count
+            // ── Connection settings ──
+            SectionHeader(icon = Icons.Default.Tune, title = "Параметры")
             OutlinedTextField(
                 value = numConns,
                 onValueChange = { if (it.isEmpty() || it.all { c -> c.isDigit() }) numConns = it },
@@ -1037,19 +1102,12 @@ fun ProfileEditorScreen(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
             )
 
-            // VK tokens
-            HorizontalDivider(color = Color(0xFF2A2A2A))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically) {
-                Text("VK токены (${vkTokens.size}/16)", fontSize = 12.sp, color = Color(0xFF757575))
-                if (vkTokens.size < 16) {
-                    IconButton(onClick = { vkTokens = vkTokens + "" }, modifier = Modifier.size(28.dp)) {
-                        Icon(Icons.Default.Add, null, modifier = Modifier.size(16.dp), tint = Color(0xFF757575))
-                    }
-                }
-            }
+            // ── VK tokens ──
+            SectionHeader(icon = Icons.Default.Key, title = "VK токены", count = "${vkTokens.size}/16",
+                onAdd = if (vkTokens.size < 16) {{ vkTokens = vkTokens + "" }} else null)
             if (vkTokens.isEmpty()) {
-                Text("Ускоряют подключение", fontSize = 10.sp, color = Color(0xFF616161))
+                Text("Ускоряют подключение", fontSize = 10.sp, color = Color(0xFF616161),
+                    modifier = Modifier.padding(start = 4.dp))
             }
             vkTokens.forEachIndexed { i, t ->
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1065,7 +1123,8 @@ fun ProfileEditorScreen(
                 }
             }
 
-            // Export / Delete
+            // ── Actions ──
+            Spacer(modifier = Modifier.height(4.dp))
             HorizontalDivider(color = Color(0xFF2A2A2A))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 TextButton(onClick = {

@@ -40,3 +40,5 @@ require (
 )
 
 replace github.com/pion/dtls/v3 => github.com/Fokir/dtls/v3 v3.1.2-browser
+
+replace github.com/wlynxg/anet v0.0.5 => ./internal/anetfix

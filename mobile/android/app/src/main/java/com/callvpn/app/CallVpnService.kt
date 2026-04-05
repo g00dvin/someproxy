@@ -281,25 +281,35 @@ class CallVpnService : VpnService() {
                 .setMtu(1280)
                 .setBlocking(true)
 
-            // Per-app VPN routing based on user's selected mode.
+            // Per-app VPN routing.
             val appsManager = ExcludedAppsManager(this@CallVpnService)
-            val routingMode = appsManager.getRoutingMode()
-            val selectedApps = appsManager.getSelectedPackages()
+            val whitelistEnabled = appsManager.isWhitelistEnabled()
+            android.util.Log.i("CallVPN", "VPN routing: whitelistEnabled=$whitelistEnabled")
 
-            if (routingMode == "whitelist") {
-                // VPN ONLY for selected apps; never include ourselves or forced-excluded apps
-                val allowed = selectedApps - ExcludedAppsManager.FORCED_PACKAGES
-                for (pkg in allowed) {
-                    try {
-                        builder.addAllowedApplication(pkg)
-                    } catch (_: Exception) { /* package not installed, skip */ }
+            if (whitelistEnabled) {
+                val allowed = appsManager.getWhitelistPackages()
+                android.util.Log.i("CallVPN", "whitelist packages (${allowed.size}): $allowed")
+                if (allowed.isEmpty()) {
+                    // Whitelist enabled but empty — VPN for all, exclude forced only
+                    android.util.Log.i("CallVPN", "whitelist empty, excluding forced packages only")
+                    for (pkg in ExcludedAppsManager.FORCED_PACKAGES) {
+                        try { builder.addDisallowedApplication(pkg) }
+                        catch (_: Exception) {}
+                    }
+                } else {
+                    var addedCount = 0
+                    for (pkg in allowed) {
+                        try { builder.addAllowedApplication(pkg); addedCount++ }
+                        catch (e: Exception) { android.util.Log.w("CallVPN", "whitelist: skip $pkg") }
+                    }
+                    android.util.Log.i("CallVPN", "whitelist: added $addedCount allowed apps")
                 }
             } else {
-                // VPN for all EXCEPT selected apps (blacklist, default)
-                for (pkg in selectedApps) {
-                    try {
-                        builder.addDisallowedApplication(pkg)
-                    } catch (_: Exception) { /* package not installed, skip */ }
+                // Default mode: VPN for all apps, exclude only forced packages
+                android.util.Log.i("CallVPN", "default mode: excluding ${ExcludedAppsManager.FORCED_PACKAGES.size} forced packages")
+                for (pkg in ExcludedAppsManager.FORCED_PACKAGES) {
+                    try { builder.addDisallowedApplication(pkg) }
+                    catch (_: Exception) {}
                 }
             }
 
